@@ -1,0 +1,960 @@
+#include "serve/api.hpp"
+
+#include <cctype>
+
+#include <algorithm>
+#include <cmath>
+#include <random>
+#include <stdexcept>
+
+#include "tokenizer/chat_template.hpp"
+
+namespace ragon::serve {
+namespace {
+
+const std::string kThinkEnd = "</think>";
+const std::string kCallOpen = "<tool_call>";
+const std::string kCallClose = "</tool_call>";
+const std::string kFunctionOpen = "<function=";
+const std::string kParameterOpen = "<parameter=";
+
+// Longest suffix of `s` that is a proper prefix of `tag` (text that might still become the tag).
+size_t partial_tag(const std::string& s, const std::string& tag) {
+  for (size_t n = std::min(s.size(), tag.size() - 1); n > 0; --n)
+    if (s.compare(s.size() - n, n, tag, 0, n) == 0) return n;
+  return 0;
+}
+
+std::string strip(const std::string& s) {
+  size_t a = s.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return {};
+  return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
+}
+
+template <typename T>
+T get_or(const json& body, const char* key, T dflt) {
+  if (!body.contains(key) || body[key].is_null()) return dflt;
+  return body[key].get<T>();
+}
+
+// The messages as production's chat endpoint hands them to the template: a tool message whose content is
+// a list of text parts becomes their text joined by spaces, and a final assistant message with string
+// content is sent as a user message (SGLang's handling when continue_final_message is off).
+json production_messages(const json& messages) {
+  if (!messages.is_array()) return messages;
+  json out = messages;
+  for (json& m : out) {
+    if (!m.is_object() || m.value("role", "") != "tool" || !m.contains("content") || !m["content"].is_array()) continue;
+    bool text_only = true;
+    for (const json& p : m["content"]) text_only = text_only && (p.is_string() || (p.is_object() && p.value("type", "") == "text"));
+    if (!text_only) continue;
+    std::string joined;
+    bool first = true;
+    for (const json& p : m["content"]) {
+      joined += (first ? "" : " ") + (p.is_string() ? p.get<std::string>() : p.contains("text") && p["text"].is_string() ? p["text"].get<std::string>() : "");
+      first = false;
+    }
+    m["content"] = joined;
+  }
+  if (!out.empty() && out.back().is_object() && out.back().value("role", "") == "assistant" &&
+      out.back().contains("content") && out.back()["content"].is_string())
+    out.back() = json{{"role", "user"}, {"content", out.back()["content"]}};
+  return out;
+}
+
+// The tools as production's server hands them to the chat template: each one validated into its
+// `Tool`/`Function` models and dumped again, which fixes the keys and their order:
+// {"type", "function": {"description", "name", "parameters", "strict"}, "defer_loading"}. A named
+// tool_choice keeps only that tool. Only `function` tools are offered on this route: any other type (a
+// Responses `custom` tool sent to chat completions) is dropped, as the vLLM-compatible surface has no
+// other kind (the Responses route converts custom tools before reaching here).
+json canonical_tools(const json& tools, const json& tool_choice) {
+  std::string only;
+  if (tool_choice.is_object() && tool_choice.contains("function") && tool_choice["function"].is_object())
+    only = tool_choice["function"].value("name", "");
+  json out = json::array();
+  for (const json& t : tools) {
+    if (!t.is_object()) continue;
+    if (t.contains("type") && t["type"].is_string() && t["type"] != "function") continue;
+    const json& f = t.contains("function") && t["function"].is_object() ? t["function"] : t;
+    json fn = json::object();
+    fn["description"] = f.contains("description") && f["description"].is_string() ? f["description"] : json();
+    fn["name"] = f.value("name", "");
+    fn["parameters"] = f.contains("parameters") ? f["parameters"] : json();
+    fn["strict"] = f.contains("strict") && f["strict"].is_boolean() ? f["strict"].get<bool>() : false;
+    const json defer = t.contains("defer_loading") && t["defer_loading"].is_boolean() ? t["defer_loading"] : json();
+    if (!defer.is_null() || (f.contains("defer_loading") && f["defer_loading"].is_boolean()))
+      fn["defer_loading"] = defer.is_null() ? f["defer_loading"] : defer;
+    if (!only.empty() && fn["name"] != only) continue;
+    out.push_back(json{{"type", "function"}, {"function", fn}, {"defer_loading", defer}});
+  }
+  return out;
+}
+
+}  // namespace
+
+uint64_t share_scope_of(const std::string& value) {
+  if (value.empty()) return 0;
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : value) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return h | 1;
+}
+
+std::string new_id(const std::string& prefix) {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  static const char* hex = "0123456789abcdef";
+  std::string id = prefix;
+  for (int i = 0; i < 24; ++i) id += hex[rng() & 15];
+  return id;
+}
+
+std::string dump_json(const json& j) { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+
+bool exceeds_context(size_t prompt_tokens, int max_context) {
+  return prompt_tokens >= static_cast<size_t>(std::max(max_context, 0));
+}
+
+std::string context_overflow_message(size_t prompt_tokens, int max_context) {
+  return "This model's maximum context length is " + std::to_string(max_context) + " tokens. However, your request has " +
+         std::to_string(prompt_tokens) + " input tokens. Please reduce the length of the messages.";
+}
+
+json context_overflow_error(size_t prompt_tokens, int max_context) {
+  return json{{"error",
+               {{"message", context_overflow_message(prompt_tokens, max_context)},
+                {"type", "invalid_request_error"},
+                {"code", kContextLengthExceeded}}}};
+}
+
+std::string stream_error_tail(const json& error, const json& finish_chunk) {
+  return "data: " + dump_json(error) + "\n\ndata: " + dump_json(finish_chunk) + "\n\ndata: [DONE]\n\n";
+}
+
+namespace {
+
+// The largest b <= end such that s[0, b) does not end inside a UTF-8 character (s starts on a boundary).
+// An invalid sequence is left as it is; dump_json replaces it.
+size_t utf8_cut(const std::string& s, size_t end) {
+  size_t lead = end;  // back over continuation bytes to the first byte of the last character
+  while (lead > 0 && end - lead < 4 && (static_cast<unsigned char>(s[lead - 1]) & 0xC0) == 0x80) --lead;
+  if (lead == 0) return end;
+  const unsigned char c = static_cast<unsigned char>(s[lead - 1]);
+  const size_t need = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+  return end - (lead - 1) >= need ? end : lead - 1;
+}
+
+}  // namespace
+
+StopScanner::StopScanner(const std::vector<std::string>& stops) {
+  for (const std::string& s : stops) {
+    if (s.empty()) continue;  // "" would match at once and end every answer before it starts
+    stops_.push_back(s);
+    hold_ = std::max(hold_, s.size() - 1);
+  }
+}
+
+std::string StopScanner::push(const std::string& text) {
+  if (stopped_) return {};
+  pending_ += text;
+  // A stop string never starts in text already emitted: it would have to end in the held-back bytes,
+  // and they are fewer than its length. So the search covers pending_ alone.
+  size_t stop_at = std::string::npos;
+  for (const std::string& s : stops_) stop_at = std::min(stop_at, pending_.find(s));
+  if (stop_at != std::string::npos) {
+    stopped_ = true;
+    std::string out = pending_.substr(0, stop_at);
+    pending_.clear();
+    return out;
+  }
+  const size_t safe = utf8_cut(pending_, pending_.size() - std::min(pending_.size(), hold_));
+  std::string out = pending_.substr(0, safe);
+  pending_.erase(0, safe);
+  return out;
+}
+
+std::string StopScanner::finish() {
+  std::string out;
+  if (!stopped_) out.swap(pending_);
+  return out;
+}
+
+Request parse_request(const json& body, bool chat, bool vision) {
+  if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
+  Request r;
+  r.chat = chat;
+  r.stream = get_or(body, "stream", false);
+  if (body.contains("stream_options") && body["stream_options"].is_object())
+    r.include_usage = body["stream_options"].value("include_usage", false);
+  if (body.contains("max_completion_tokens") && body["max_completion_tokens"].is_number())
+    r.max_tokens = body["max_completion_tokens"];
+  else if (body.contains("max_tokens") && body["max_tokens"].is_number())
+    r.max_tokens = body["max_tokens"];
+  // The checkpoint's generation_config defaults, which the production server also uses.
+  r.sampling.temperature = get_or(body, "temperature", 1.0f);
+  r.sampling.top_p = get_or(body, "top_p", 0.95f);
+  r.sampling.top_k = get_or(body, "top_k", 20);
+  r.sampling.min_p = get_or(body, "min_p", 0.0f);
+  r.sampling.presence_penalty = get_or(body, "presence_penalty", 0.0f);
+  r.sampling.repetition_penalty = get_or(body, "repetition_penalty", 1.0f);
+  if (body.contains("seed") && body["seed"].is_number_integer()) r.sampling.seed = body["seed"].get<uint64_t>();
+  if (body.contains("stop")) {
+    if (body["stop"].is_string()) r.stop.push_back(body["stop"]);
+    else if (body["stop"].is_array())
+      for (const auto& s : body["stop"]) r.stop.push_back(s);
+  }
+  // Logprobs as vLLM validates them: on chat, a boolean `logprobs` and an integer `top_logprobs` that
+  // needs `logprobs: true`; on completions, an integer `logprobs` (null or absent: none).
+  if (chat) {
+    if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+      if (!body["logprobs"].is_boolean()) throw std::invalid_argument("logprobs must be a boolean");
+      r.logprobs = body["logprobs"].get<bool>();
+    }
+    if (body.contains("top_logprobs") && !body["top_logprobs"].is_null()) {
+      if (!body["top_logprobs"].is_number_integer()) throw std::invalid_argument("top_logprobs must be an integer");
+      const auto k = body["top_logprobs"].get<long long>();
+      if (k < 0 || k > kMaxTopLogprobs)
+        throw std::invalid_argument("top_logprobs must be between 0 and " + std::to_string(kMaxTopLogprobs));
+      if (k > 0 && !r.logprobs) throw std::invalid_argument("when using top_logprobs, logprobs must be set to true");
+      r.top_logprobs = static_cast<int>(k);
+    }
+  } else if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+    if (body["logprobs"].is_boolean()) {  // `true` asks for the chosen token's logprob alone
+      r.logprobs = body["logprobs"].get<bool>();
+    } else {
+      if (!body["logprobs"].is_number_integer()) throw std::invalid_argument("logprobs must be an integer");
+      const auto k = body["logprobs"].get<long long>();
+      if (k < 0 || k > kMaxTopLogprobs)
+        throw std::invalid_argument("logprobs must be between 0 and " + std::to_string(kMaxTopLogprobs));
+      r.logprobs = true;
+      r.top_logprobs = static_cast<int>(k);
+    }
+  }
+  if (chat) {
+    if (!body.contains("messages")) throw std::invalid_argument("messages is required");
+    ChatOptions opts;
+    const json kw = body.contains("chat_template_kwargs") ? body["chat_template_kwargs"] : json::object();
+    if (kw.contains("enable_thinking")) opts.enable_thinking = kw["enable_thinking"].get<bool>();
+    if (body.contains("enable_thinking")) opts.enable_thinking = body["enable_thinking"].get<bool>();
+    if (kw.contains("preserve_thinking")) opts.preserve_thinking = kw["preserve_thinking"].get<bool>();
+    if (body.contains("preserve_thinking")) opts.preserve_thinking = body["preserve_thinking"].get<bool>();
+    if (kw.contains("reasoning_effort")) opts.reasoning_effort = kw["reasoning_effort"].get<std::string>();
+    if (body.contains("reasoning_effort") && body["reasoning_effort"].is_string())
+      opts.reasoning_effort = body["reasoning_effort"].get<std::string>();
+    // `none` means thinking off, as `reasoning.effort: "none"` does on /v1/responses (vllm#53284,
+    // vllm#52738): the template knows no such effort and would refuse it.
+    if (opts.reasoning_effort == "none") {
+      opts.reasoning_effort.reset();
+      if (!opts.enable_thinking.has_value()) opts.enable_thinking = false;
+    }
+    if (body.contains("tools") && body["tools"].is_array() && body.value("tool_choice", json("auto")) != "none")
+      r.tools = canonical_tools(body["tools"], body.contains("tool_choice") ? body["tool_choice"] : json("auto"));
+    if (vision) opts.images = &r.image_urls;
+    r.prompt_text = render_chat(production_messages(body["messages"]), r.tools, opts);
+    r.reasoning = !opts.enable_thinking.has_value() || *opts.enable_thinking;
+  } else {
+    if (!body.contains("prompt")) throw std::invalid_argument("prompt is required");
+    const json& p = body["prompt"];
+    if (p.is_string()) r.prompt_text = p;
+    else if (p.is_array() && !p.empty() && p[0].is_number_integer()) r.prompt_ids = p.get<std::vector<int>>();
+    else if (p.is_array() && p.size() == 1 && p[0].is_string()) r.prompt_text = p[0];
+    else throw std::invalid_argument("prompt must be a string or a list of token ids");
+    r.reasoning = false;
+  }
+  if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
+    r.session_key = body["prompt_cache_key"].get<std::string>();
+  if (body.contains("repetition_detection") && !body["repetition_detection"].is_null()) {
+    const json& d = body["repetition_detection"];
+    if (d.is_boolean()) {
+      if (!d.get<bool>()) r.repetition = {0, 0, 0, 0};  // `true`: the server's rule
+    } else if (d.is_object()) {
+      auto field = [&](const char* k, int& out) {
+        if (!d.contains(k) || d[k].is_null()) return;
+        if (!d[k].is_number_integer()) throw std::invalid_argument(std::string("repetition_detection.") + k + " must be an integer");
+        const long long v = d[k].get<long long>();
+        if (v < 0 || v > 1 << 20) throw std::invalid_argument(std::string("repetition_detection.") + k + " is out of range");
+        out = static_cast<int>(v);
+      };
+      field("max_pattern_size", r.repetition.max_pattern_size);
+      field("min_pattern_size", r.repetition.min_pattern_size);
+      field("min_count", r.repetition.min_count);
+      field("max_run", r.repetition.max_run);
+    } else {
+      throw std::invalid_argument("repetition_detection must be an object or a boolean");
+    }
+  }
+  return r;
+}
+
+void validate(const RepetitionDetection& r) {
+  if (r.max_pattern_size < 0 || r.min_pattern_size < 0 || r.min_count < 0 || r.max_run < 0 ||
+      r.min_pattern_size > r.max_pattern_size)
+    throw std::invalid_argument(
+        "repetition_detection: max_pattern_size and min_pattern_size must be >= 0, with min_pattern_size <= "
+        "max_pattern_size (both 0 turn the pattern test off)");
+  if (r.max_pattern_size > 4096) throw std::invalid_argument("repetition_detection: max_pattern_size is at most 4096");
+  if (r.max_pattern_size > 0 && r.min_count < 2)
+    throw std::invalid_argument("repetition_detection: min_count must be >= 2 to detect repetitive patterns");
+  if (r.max_run == 1) throw std::invalid_argument("repetition_detection: max_run must be 0 (off) or >= 2");
+}
+
+RepetitionDetection resolve_repetition(const Request& req, const RepetitionDetection& server) {
+  const RepetitionDetection& q = req.repetition;
+  RepetitionDetection r{q.max_pattern_size >= 0 ? q.max_pattern_size : server.max_pattern_size,
+                        q.min_pattern_size >= 0 ? q.min_pattern_size : server.min_pattern_size,
+                        q.min_count >= 0 ? q.min_count : server.min_count, q.max_run >= 0 ? q.max_run : server.max_run};
+  // A request that sets max_pattern_size alone keeps the server's sizes only where they still fit.
+  if (q.max_pattern_size >= 0 && q.min_pattern_size < 0) r.min_pattern_size = std::min(r.min_pattern_size, r.max_pattern_size);
+  validate(r);
+  return r;
+}
+
+RepetitionDetector::RepetitionDetector(const RepetitionDetection& r) : r_(r) {
+  if (r_.max_pattern_size > 0) {
+    if (r_.min_pattern_size <= 0) r_.min_pattern_size = 1;  // as vLLM: 0 means 1
+    tail_.assign(r_.max_pattern_size, -1);
+    run_.assign(r_.max_pattern_size + 1, 0);
+  }
+}
+
+bool RepetitionDetector::push(int token) {
+  bool hit = false;
+  same_ = token == last_ ? same_ + 1 : 1;
+  last_ = token;
+  if (r_.max_run > 0) hit = same_ >= r_.max_run;
+  const int Pmax = r_.max_pattern_size;
+  if (Pmax > 0) {
+    // run_[P] counts the trailing positions i (within the output) with token[i] == token[i - P]; the output ends in a
+    // block of P tokens repeated min_count times exactly when (min_count - 1) * P of them do (vLLM's tail test).
+    for (int P = 1; P <= Pmax; ++P) {
+      const bool eq = n_ >= P && tail_[(n_ - P) % Pmax] == token;
+      run_[P] = eq ? run_[P] + 1 : 0;
+      // With max_run on, a run of one token (which is a block of any size P repeated) is max_run's to judge: the
+      // block test sees it only when the window holds two different tokens.
+      const bool one_token = r_.max_run > 0 && same_ >= static_cast<long>(r_.min_count) * P;
+      if (P >= r_.min_pattern_size && !one_token && run_[P] >= static_cast<long>(r_.min_count - 1) * P) hit = true;
+    }
+    tail_[n_ % Pmax] = token;
+  }
+  ++n_;
+  return hit;
+}
+
+std::vector<TokenLogprob> top_logprobs(std::span<const float> logits, int chosen, int k) {
+  std::vector<TokenLogprob> out;
+  if (logits.empty()) return out;
+  // log p(i) = (x_i - m) - log(sum_j exp(x_j - m)) with m the row's maximum: the sum is at least 1 (the
+  // maximum's own term), so the argmax's logprob is <= 0 in float as well.
+  const float m = *std::max_element(logits.begin(), logits.end());
+  double sum = 0;
+  for (const float x : logits) sum += std::exp(double(x) - m);
+  const double lse = std::log(sum);
+  auto lp = [&](int i) { return static_cast<float>((double(logits[i]) - m) - lse); };
+  // The k highest logits, by one pass over the row keeping a short list sorted by (logit desc, id asc).
+  std::vector<int> top;
+  top.reserve(size_t(k) + 1);
+  for (int i = 0; i < static_cast<int>(logits.size()); ++i) {
+    if (static_cast<int>(top.size()) == k && !(k > 0 && logits[i] > logits[top.back()])) continue;
+    auto at = top.begin();
+    while (at != top.end() && logits[*at] >= logits[i]) ++at;
+    top.insert(at, i);
+    if (static_cast<int>(top.size()) > k) top.pop_back();
+  }
+  if (chosen >= 0 && chosen < static_cast<int>(logits.size())) out.push_back({chosen, lp(chosen)});
+  for (const int i : top)
+    if (i != chosen) out.push_back({i, lp(i)});
+  return out;
+}
+
+OutputParser::Delta OutputParser::push(const std::string& text) {
+  buf_ += text;
+  return drain(false);
+}
+
+OutputParser::Delta OutputParser::finish() { return drain(true); }
+
+void OutputParser::FenceTracker::feed(const std::string& text) {
+  for (char c : text) {
+    if (c == '\n') {
+      end_line();
+      continue;
+    }
+    if (indent_ && (c == ' ' || c == '\t')) continue;
+    if (indent_) {
+      indent_ = false;
+      if (c == '`' || c == '~') {
+        run_char_ = c;
+        run_len_ = 1;
+        in_run_ = true;
+      } else {
+        tail_ = true;
+      }
+      continue;
+    }
+    if (in_run_ && c == run_char_) {
+      ++run_len_;
+      continue;
+    }
+    in_run_ = false;
+    if (c != ' ' && c != '\t' && c != '\r') tail_ = true;
+  }
+}
+
+void OutputParser::FenceTracker::end_line() {
+  if (run_len_ >= 3) {
+    if (!open_) {  // an opening fence may carry an info string ("```xml")
+      open_ = true;
+      fence_char_ = run_char_;
+      fence_len_ = run_len_;
+    } else if (run_char_ == fence_char_ && run_len_ >= fence_len_ && !tail_) {
+      open_ = false;
+    }
+  }
+  indent_ = true;
+  run_char_ = 0;
+  run_len_ = 0;
+  in_run_ = tail_ = false;
+}
+
+void OutputParser::emit_content(Delta& d, const std::string& text) {
+  d.content += text;
+  fence_.feed(text);
+}
+
+// Which parsed blocks go out as calls. A call to a function the request offered, and, as SGLang's qwen3_coder
+// parser does, a well-formed call to one it did not (`ragon-search`, or `apply_patch` with the tool off: two A/B
+// runs), so that the client answers it as an unsupported call and the model goes on; handed back as text, it was
+// the turn's final answer and the task ended with an empty patch. What stays text: the chat template's own
+// placeholder names (vllm#58147), a name no client could hold (empty, spaces, markup), and a block that named its
+// function in a `<parameter=` tag, unless that name is offered.
+bool OutputParser::callable(const ToolCall& call) const {
+  if (offered(call.name)) return true;
+  if (call.loose) return false;
+  if (call.name.empty() || call.name == "function_name" || call.name == "example_function_name") return false;
+  for (char c : call.name)
+    if (std::isspace(static_cast<unsigned char>(c)) || c == '<' || c == '>' || c == '"' || c == '\'') return false;
+  return true;
+}
+
+bool OutputParser::offered(const std::string& function) const {
+  for (const json& t : tools_) {
+    if (!t.is_object()) continue;
+    const json& fn = t.contains("function") && t["function"].is_object() ? t["function"] : t;
+    if (fn.value("name", "") == function) return true;
+  }
+  return false;
+}
+
+OutputParser::Delta OutputParser::drain(bool final) {
+  Delta d;
+  while (!buf_.empty()) {
+    if (in_reasoning_) {
+      size_t end = buf_.find(kThinkEnd);
+      if (end != std::string::npos) {
+        d.reasoning += buf_.substr(0, end);
+        buf_.erase(0, end + kThinkEnd.size());
+        in_reasoning_ = false;
+        skip_newlines_ = 2;  // the template puts "\n\n" after </think>; it belongs to neither part
+        continue;
+      }
+      const size_t hold = final ? 0 : partial_tag(buf_, kThinkEnd);
+      d.reasoning += buf_.substr(0, buf_.size() - hold);
+      buf_.erase(0, buf_.size() - hold);
+      break;
+    }
+    while (skip_newlines_ > 0 && !buf_.empty() && buf_[0] == '\n') {
+      buf_.erase(0, 1);
+      --skip_newlines_;
+    }
+    if (!buf_.empty()) skip_newlines_ = 0;
+    if (buf_.empty()) break;
+    if (tools_.is_array() && !tools_.empty()) {
+      const size_t open = buf_.find(kCallOpen);
+      if (open == std::string::npos) {
+        const size_t hold = final ? 0 : partial_tag(buf_, kCallOpen);
+        emit_content(d, buf_.substr(0, buf_.size() - hold));
+        buf_.erase(0, buf_.size() - hold);
+        break;
+      }
+      emit_content(d, buf_.substr(0, open));
+      buf_.erase(0, open);
+      // buf_ starts with the marker. It opens a call only outside a code fence and when `<function=`
+      // follows it (after whitespace); otherwise it is quoted text, released at once rather than held
+      // until the end of the answer.
+      // A block the model opened with `<parameter=` where `<function=` belongs (SWE-bench, sympy-19040: the
+      // function's name written as the first parameter's) is read as a call too; parse_call decides.
+      const size_t after = buf_.find_first_not_of(" \t\r\n", kCallOpen.size());
+      const std::string rest = after == std::string::npos ? std::string() : buf_.substr(after, kParameterOpen.size());
+      auto opens = [&](const std::string& tag) { return rest.compare(0, tag.size(), tag) == 0 && rest.size() >= tag.size(); };
+      auto may_open = [&](const std::string& tag) {
+        return rest.size() < tag.size() && tag.compare(0, rest.size(), rest) == 0;
+      };
+      const bool call_follows = opens(kFunctionOpen) || opens(kParameterOpen);
+      const bool may_follow = !call_follows && (may_open(kFunctionOpen) || may_open(kParameterOpen));
+      if (fence_.open() || (!call_follows && !(may_follow && !final))) {
+        emit_content(d, kCallOpen);
+        buf_.erase(0, kCallOpen.size());
+        continue;
+      }
+      if (!call_follows) break;  // too little text yet to tell
+      const size_t close = buf_.find(kCallClose);
+      if (close == std::string::npos) {
+        if (final) {
+          // The answer ended inside the call. One whose `</function>` came before the end is a call the model
+          // stopped short of closing (SWE-bench, sympy-13757: `</function>` and then the end of the turn), as
+          // SGLang reads it; anything shorter is handed back as text.
+          const std::string block = buf_.substr(kCallOpen.size());
+          auto call = block.find("</function>") != std::string::npos ? parse_call(block) : std::nullopt;
+          if (call && callable(*call)) d.tool_calls.push_back(*call);
+          else emit_content(d, buf_);
+          buf_.clear();
+        }
+        break;
+      }
+      const std::string block = buf_.substr(kCallOpen.size(), close - kCallOpen.size());
+      buf_.erase(0, close + kCallClose.size());
+      auto call = parse_call(block);
+      if (call && callable(*call)) d.tool_calls.push_back(*call);
+      else emit_content(d, kCallOpen + block + kCallClose);  // the template's placeholder, or no call at all
+      continue;
+    }
+    d.content += buf_;
+    buf_.clear();
+  }
+  if (!d.tool_calls.empty()) {
+    // Text between or after calls is whitespace in practice; drop it rather than send stray newlines.
+    if (strip(d.content).empty()) d.content.clear();
+  }
+  return d;
+}
+
+std::optional<ToolCall> OutputParser::parse_call(const std::string& block) const {
+  const std::string fopen = "<function=";
+  ToolCall call;
+  size_t f = block.find(fopen);
+  if (f == std::string::npos) {
+    // `<tool_call>\n<parameter=NAME>` with `</function>` later: the function's name in the wrong tag.
+    const size_t first = block.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos || block.compare(first, kParameterOpen.size(), kParameterOpen) != 0 ||
+        block.find("</function>") == std::string::npos)
+      return std::nullopt;
+    f = first;
+    call.loose = true;
+  }
+  size_t fend = block.find('>', f);
+  if (fend == std::string::npos) return std::nullopt;
+  const size_t name_at = f + (call.loose ? kParameterOpen.size() : fopen.size());
+  call.name = strip(block.substr(name_at, fend - name_at));
+  json args = json::object();
+  size_t pos = fend + 1;
+  const std::string popen = "<parameter=", pclose = "</parameter>";
+  while (true) {
+    size_t p = block.find(popen, pos);
+    if (p == std::string::npos) break;
+    size_t pend = block.find('>', p);
+    if (pend == std::string::npos) break;
+    const std::string name = strip(block.substr(p + popen.size(), pend - p - popen.size()));
+    // A value ends at its </parameter>. One the model left open ends where the next parameter starts on
+    // a line of its own, as the template writes them (vllm#57699), so it cannot swallow its neighbour;
+    // markup inside a value that is not at a line start stays part of the value. A last value left open
+    // ends at </function>.
+    const size_t close = block.find(pclose, pend);
+    const size_t next = block.find("\n" + popen, pend);
+    size_t vend = std::min(close, next);
+    if (vend == std::string::npos) vend = block.find("</function>", pend);
+    if (vend == std::string::npos) vend = block.size();
+    std::string value = block.substr(pend + 1, vend - pend - 1);
+    if (!value.empty() && value.front() == '\n') value.erase(0, 1);
+    if (!value.empty() && value.back() == '\n') value.pop_back();
+    const std::string converted = convert_value(call.name, name, value);
+    json parsed = json::parse(converted, nullptr, false);
+    args[name] = parsed.is_discarded() ? json(value) : parsed;
+    pos = vend == close ? close + pclose.size() : vend;
+  }
+  call.arguments = args.dump();
+  return call;
+}
+
+std::string OutputParser::convert_value(const std::string& function, const std::string& param,
+                                        const std::string& raw) const {
+  std::string type = "string";
+  for (const json& t : tools_) {
+    const json& fn = t.contains("function") ? t["function"] : t;
+    if (fn.value("name", "") != function) continue;
+    if (fn.contains("parameters") && fn["parameters"].contains("properties") &&
+        fn["parameters"]["properties"].contains(param)) {
+      const json& prop = fn["parameters"]["properties"][param];
+      if (prop.contains("type") && prop["type"].is_string()) type = prop["type"];
+      else if (prop.contains("type") && prop["type"].is_array() && !prop["type"].empty()) type = prop["type"][0];
+      else type = "object";
+    }
+  }
+  if (type == "string") return json(raw).dump();
+  json parsed = json::parse(strip(raw), nullptr, false);
+  if (!parsed.is_discarded()) return parsed.dump();
+  return json(raw).dump();
+}
+
+}  // namespace ragon::serve
+
+namespace ragon::serve {
+namespace {
+
+std::string text_of_parts(const json& parts) {
+  std::string out;
+  if (parts.is_string()) return parts.get<std::string>();
+  if (!parts.is_array()) return out;
+  for (const json& p : parts)
+    if (p.is_object() && p.contains("text") && p["text"].is_string()) out += p["text"].get<std::string>();
+  return out;
+}
+
+std::string call_id_of(const json& item) {
+  return item.contains("call_id") && item["call_id"].is_string() && !item["call_id"].get<std::string>().empty()
+             ? item["call_id"].get<std::string>()
+             : item.value("id", "");
+}
+
+// One Responses input item as a chat message, or null to drop it.
+json normalize_item(const json& item, bool vision) {
+  const std::string type = item.value("type", "message");
+  if (type == "custom_tool_call") {
+    // Replayed as the one-parameter function call it was offered as, so the turn renders as the model
+    // wrote it and the prefix cache still matches.
+    json args = json::object();
+    args[kCustomToolInput] = item.contains("input") && item["input"].is_string() ? item["input"] : json("");
+    return json{{"role", "assistant"},
+                {"tool_calls", json::array({json{{"id", call_id_of(item)},
+                                                 {"type", "function"},
+                                                 {"function", {{"name", item.value("name", "")}, {"arguments", args.dump()}}}}})}};
+  }
+  if (type == "function_call") {
+    std::string args = "{}";
+    if (item.contains("arguments")) {
+      const json& raw = item["arguments"];
+      if (raw.is_string()) {
+        json parsed = json::parse(raw.get<std::string>(), nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) args = raw.get<std::string>();
+      } else if (raw.is_object()) {
+        args = raw.dump();
+      }
+    }
+    return json{{"role", "assistant"},
+                {"tool_calls", json::array({json{{"id", call_id_of(item)},
+                                                 {"type", "function"},
+                                                 {"function", {{"name", item.value("name", "")}, {"arguments", args}}}}})}};
+  }
+  if (type == "function_call_output" || type == "custom_tool_call_output") {
+    const json& out = item.contains("output") ? item["output"] : json("");
+    // With vision, a list holding images stays a list of parts, so the images render in the tool message
+    // (VISION §20.6: production flattens it to its text and drops the images, so `view_image` never reaches the
+    // model there). Without images, or without vision, the concatenated text as before.
+    bool has_image = false;
+    if (vision && out.is_array())
+      for (const json& p : out)
+        has_image = has_image || (p.is_object() && (p.value("type", "") == "input_image" || p.value("type", "") == "image_url"));
+    if (has_image) {
+      json parts = json::array();
+      for (const json& p : out) {
+        if (!p.is_object()) continue;
+        const std::string pt = p.value("type", "");
+        if (pt == "input_image" || pt == "image_url") parts.push_back(p);
+        else if (p.contains("text") && p["text"].is_string()) parts.push_back({{"type", "text"}, {"text", p["text"]}});
+      }
+      return json{{"role", "tool"}, {"tool_call_id", item.value("call_id", "")}, {"content", parts}};
+    }
+    return json{{"role", "tool"}, {"tool_call_id", item.value("call_id", "")}, {"content", text_of_parts(out)}};
+  }
+  if (type == "reasoning") {
+    std::string text;
+    auto collect = [&](const char* key) {
+      if (!item.contains(key) || !item[key].is_array()) return;
+      for (const json& e : item[key]) {
+        if (e.is_object() && e.contains("text") && e["text"].is_string() && !e["text"].get<std::string>().empty()) {
+          if (!text.empty()) text += "\n";
+          text += e["text"].get<std::string>();
+        }
+      }
+    };
+    collect("summary");
+    if (text.empty()) collect("content");
+    if (text.empty()) return json();
+    return json{{"role", "assistant"}, {"reasoning_content", text}};
+  }
+  if (type != "message") return json();  // built-in tool calls this server never offered
+  std::string role = item.value("role", "user");
+  if (role == "developer") role = "system";
+  json msg = {{"role", role}};
+  // Content stays a list of parts when it is one (the template concatenates their text): input_text and
+  // output_text parts become text parts, anything else is kept for the template to accept or refuse.
+  if (item.contains("content") && !item["content"].is_null()) {
+    const json& c = item["content"];
+    if (!c.is_array()) {
+      msg["content"] = c;
+    } else {
+      json parts = json::array();
+      for (const json& p : c) {
+        const std::string pt = p.is_object() ? p.value("type", "") : "";
+        if (pt == "input_text" || pt == "output_text")
+          parts.push_back({{"type", "text"}, {"text", p.contains("text") && p["text"].is_string() ? p["text"] : json("")}});
+        else
+          parts.push_back(p);
+      }
+      msg["content"] = parts;
+    }
+  }
+  return msg;
+}
+
+bool empty_content(const json& m) {
+  return !m.contains("content") || m["content"].is_null() || (m["content"].is_string() && m["content"].get<std::string>().empty());
+}
+
+json as_parts(const json& c) {
+  if (c.is_array()) return c;
+  if (c.is_string() && !c.get<std::string>().empty()) return json::array({json{{"type", "text"}, {"text", c}}});
+  return json::array();
+}
+
+}  // namespace
+
+Request parse_responses_request(const json& body, bool vision) {
+  if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
+  json messages = json::array();
+  if (body.contains("instructions") && body["instructions"].is_string() && !body["instructions"].get<std::string>().empty())
+    messages.push_back({{"role", "system"}, {"content", body["instructions"]}});
+  if (!body.contains("input")) throw std::invalid_argument("input is required");
+  if (body["input"].is_string()) {
+    messages.push_back({{"role", "user"}, {"content", body["input"]}});
+  } else if (body["input"].is_array()) {
+    for (const json& item : body["input"]) {
+      json m = normalize_item(item, vision);
+      if (!m.is_null()) messages.push_back(std::move(m));
+    }
+  } else {
+    throw std::invalid_argument("input must be a string or a list of items");
+  }
+  // One assistant turn arrives as several items (reasoning, message, function calls): merge them.
+  json merged = json::array();
+  for (json& m : messages) {
+    if (m["role"] == "assistant" && !merged.empty() && merged.back()["role"] == "assistant") {
+      json& prev = merged.back();
+      // As production merges them: two strings join with a blank line, anything else as parts.
+      if (!empty_content(m)) {
+        if (empty_content(prev)) {
+          prev["content"] = m["content"];
+        } else if (prev["content"].is_string() && m["content"].is_string()) {
+          prev["content"] = prev["content"].get<std::string>() + "\n\n" + m["content"].get<std::string>();
+        } else {
+          json parts = as_parts(prev["content"]);
+          for (const json& p : as_parts(m["content"])) parts.push_back(p);
+          prev["content"] = parts;
+        }
+      }
+      if (m.contains("tool_calls")) {
+        if (!prev.contains("tool_calls")) prev["tool_calls"] = json::array();
+        for (const json& c : m["tool_calls"]) prev["tool_calls"].push_back(c);
+      }
+      if (m.contains("reasoning_content")) {
+        const std::string nr = m["reasoning_content"];
+        prev["reasoning_content"] = prev.contains("reasoning_content")
+                                        ? prev["reasoning_content"].get<std::string>() + "\n" + nr
+                                        : nr;
+      }
+      continue;
+    }
+    merged.push_back(std::move(m));
+  }
+  // Every system chunk goes into one leading system message, joined by blank lines: a string content is
+  // one chunk (even an empty one), a list contributes each part's text as a chunk of its own.
+  std::vector<std::string> chunks;
+  json others = json::array();
+  for (json& m : merged) {
+    if (m["role"] == "system") {
+      const json c = m.contains("content") ? m["content"] : json();
+      if (c.is_string()) chunks.push_back(c.get<std::string>());
+      else if (c.is_array())
+        for (const json& p : c)
+          if (p.is_object() && p.contains("text") && p["text"].is_string()) chunks.push_back(p["text"].get<std::string>());
+    } else {
+      others.push_back(std::move(m));
+    }
+  }
+  json final_messages = json::array();
+  if (!chunks.empty()) {
+    std::string system;
+    for (size_t i = 0; i < chunks.size(); ++i) system += (i ? "\n\n" : "") + chunks[i];
+    final_messages.push_back({{"role", "system"}, {"content", system}});
+  }
+  for (json& m : others) final_messages.push_back(std::move(m));
+
+  json chat = json::object();
+  chat["messages"] = final_messages;
+  json tools = json::array();
+  std::vector<std::string> custom;
+  if (body.contains("tools") && body["tools"].is_array()) {
+    for (const json& t : body["tools"]) {
+      if (!t.is_object()) continue;
+      const std::string type = t.value("type", "");
+      if (type == "custom") {
+        // A custom (freeform) tool, as Codex offers apply_patch under some model families: the model has
+        // no freeform format, so it is offered as a function with the one string parameter `input`. Its
+        // description is rendered with the grammar from `format` appended (without it the model wrote a
+        // unified diff where apply_patch's syntax was wanted, 2026-11-01); the grammar is not enforced
+        // (API §4).
+        json fn = {{"name", t.value("name", "")}};
+        std::string description = t.contains("description") && t["description"].is_string() ? t["description"] : "";
+        if (t.contains("format") && t["format"].is_object() && t["format"].value("type", "") == "grammar" &&
+            t["format"].contains("definition") && t["format"]["definition"].is_string()) {
+          const std::string syntax = t["format"].value("syntax", "");
+          description += (description.empty() ? "" : "\n\n") + std::string("The input must follow this ") +
+                         (syntax.empty() ? "" : syntax + " ") + "grammar:\n" + t["format"]["definition"].get<std::string>();
+        }
+        fn["description"] = description.empty() ? json() : json(description);
+        json prop = json::object();
+        prop["type"] = "string";
+        prop["description"] = "The tool's input, as free text";
+        json props = json::object();
+        props[kCustomToolInput] = prop;
+        fn["parameters"] = json::object();
+        fn["parameters"]["type"] = "object";
+        fn["parameters"]["properties"] = props;
+        fn["parameters"]["required"] = json::array({kCustomToolInput});
+        fn["strict"] = json();
+        tools.push_back({{"type", "function"}, {"function", fn}});
+        custom.push_back(fn["name"].get<std::string>());
+        continue;
+      }
+      if (type != "function") continue;
+      json fn = {{"name", t.value("name", "")}};
+      fn["description"] = t.contains("description") ? t["description"] : json();
+      fn["parameters"] = t.contains("parameters") ? t["parameters"] : json();
+      fn["strict"] = t.contains("strict") ? t["strict"] : json();
+      tools.push_back({{"type", "function"}, {"function", fn}});
+    }
+  }
+  if (!tools.empty() && body.value("tool_choice", json("auto")) != "none") chat["tools"] = tools;
+  for (const char* k : {"stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                        "repetition_penalty", "seed", "stop", "chat_template_kwargs", "repetition_detection"})
+    if (body.contains(k)) chat[k] = body[k];
+  if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number()) chat["max_tokens"] = body["max_output_tokens"];
+  if (body.contains("reasoning") && body["reasoning"].is_object() && body["reasoning"].contains("effort") &&
+      body["reasoning"]["effort"].is_string()) {
+    const std::string effort = body["reasoning"]["effort"];
+    if (effort == "none") {
+      if (!chat.contains("chat_template_kwargs")) chat["chat_template_kwargs"] = json::object();
+      if (!chat["chat_template_kwargs"].contains("enable_thinking")) chat["chat_template_kwargs"]["enable_thinking"] = false;
+    } else {
+      chat["reasoning_effort"] = effort;
+    }
+  }
+  Request r = parse_request(chat, true, vision);
+  r.custom_tools = std::move(custom);
+  if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
+    r.session_key = body["prompt_cache_key"].get<std::string>();
+  return r;
+}
+
+std::string custom_tool_input(const std::string& arguments) {
+  const json args = json::parse(arguments, nullptr, false);
+  if (args.is_object()) {
+    if (args.contains(kCustomToolInput) && args[kCustomToolInput].is_string()) return args[kCustomToolInput];
+    if (args.empty()) return "";  // a call with no parameters: an empty input, not the text "{}"
+    if (args.size() == 1 && args.begin()->is_string()) return args.begin().value();
+  }
+  return arguments;
+}
+
+bool ResponseItems::custom(const std::string& name) const {
+  return std::find(custom_tools_.begin(), custom_tools_.end(), name) != custom_tools_.end();
+}
+
+void ResponseItems::close_reasoning() {
+  if (!reasoning_open_) return;
+  reasoning_open_ = false;
+  json item = {{"type", "reasoning"}, {"id", reasoning_id_}, {"summary", json::array()},
+               {"content", json::array({json{{"type", "reasoning_text"}, {"text", reasoning_}}})}};
+  output_.push_back(item);
+  emit_("response.output_item.done", {{"output_index", reasoning_index_}, {"item", item}});
+}
+
+void ResponseItems::close_message() {
+  if (!message_open_) return;
+  message_open_ = false;
+  json item = {{"type", "message"}, {"id", message_id_}, {"role", "assistant"}, {"status", "completed"},
+               {"content", json::array({json{{"type", "output_text"}, {"text", content_}, {"annotations", json::array()}}})}};
+  output_.push_back(item);
+  emit_("response.output_item.done", {{"output_index", message_index_}, {"item", item}});
+}
+
+void ResponseItems::close() {
+  close_reasoning();
+  close_message();
+}
+
+void ResponseItems::deliver(const OutputParser::Delta& d) {
+  if (!d.reasoning.empty()) {
+    close_message();
+    if (!reasoning_open_) {
+      reasoning_open_ = true;
+      reasoning_.clear();
+      reasoning_id_ = new_id("rs_");
+      reasoning_index_ = static_cast<int>(output_.size());
+      emit_("response.output_item.added",
+            {{"output_index", reasoning_index_},
+             {"item", {{"type", "reasoning"}, {"id", reasoning_id_}, {"summary", json::array()}, {"content", json::array()}}}});
+    }
+    reasoning_ += d.reasoning;
+    emit_("response.reasoning_text.delta",
+          {{"item_id", reasoning_id_}, {"output_index", reasoning_index_}, {"content_index", 0}, {"delta", d.reasoning}});
+  }
+  // Whitespace after a tool call separates calls (SGLang's rule): no item, no delta.
+  const bool after_call = !output_.empty() && !message_open_ && !reasoning_open_ &&
+                          (output_.back()["type"] == "function_call" || output_.back()["type"] == "custom_tool_call");
+  if (!d.content.empty() && !(after_call && strip(d.content).empty())) {
+    close_reasoning();
+    if (!message_open_) {
+      message_open_ = true;
+      content_.clear();
+      message_id_ = new_id("msg_");
+      message_index_ = static_cast<int>(output_.size());
+      emit_("response.output_item.added",
+            {{"output_index", message_index_},
+             {"item", {{"type", "message"}, {"id", message_id_}, {"role", "assistant"}, {"status", "in_progress"}, {"content", json::array()}}}});
+    }
+    content_ += d.content;
+    emit_("response.output_text.delta",
+          {{"item_id", message_id_}, {"output_index", message_index_}, {"content_index", 0}, {"delta", d.content}});
+  }
+  for (const ToolCall& c : d.tool_calls) {
+    close();
+    const int index = static_cast<int>(output_.size());
+    if (custom(c.name)) {
+      // A custom (freeform) tool call: the item is added with its `input` present and empty (Codex parses the item
+      // only with that field), the whole input is one custom_tool_call_input.delta keyed by item_id and call_id,
+      // then the done events.
+      const std::string input = custom_tool_input(c.arguments);
+      json item = {{"type", "custom_tool_call"}, {"id", new_id("ctc_")}, {"call_id", new_id("call_")},
+                   {"name", c.name}, {"input", ""}, {"status", "in_progress"}};
+      emit_("response.output_item.added", {{"output_index", index}, {"item", item}});
+      emit_("response.custom_tool_call_input.delta",
+            {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"delta", input}});
+      emit_("response.custom_tool_call_input.done",
+            {{"item_id", item["id"]}, {"output_index", index}, {"call_id", item["call_id"]}, {"input", input}});
+      item["input"] = input;
+      item["status"] = "completed";
+      output_.push_back(item);
+      emit_("response.output_item.done", {{"output_index", index}, {"item", item}});
+      continue;
+    }
+    json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
+                 {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
+    emit_("response.output_item.added", {{"output_index", index}, {"item", item}});
+    output_.push_back(item);
+    emit_("response.output_item.done", {{"output_index", index}, {"item", item}});
+  }
+}
+
+}  // namespace ragon::serve

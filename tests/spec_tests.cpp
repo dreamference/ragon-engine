@@ -1,0 +1,372 @@
+// Host-side speculation checks (no GPU):
+//   - the rejection-sampling accept rule leaves the output distribution exactly the target's: a toy
+//     model whose next-token distribution depends only on the position is decoded speculatively many
+//     times, with random draft distributions and with deterministic (lookup) proposals, and the joint
+//     distribution of the first tokens is compared with the target's by a chi-square test;
+//   - the context lookup's proposals.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <map>
+#include <random>
+#include <vector>
+
+#include "core/accept.hpp"
+#include "core/lookup.hpp"
+#include "core/tree.hpp"
+
+namespace {
+
+constexpr int kVocab = 6, kLen = 3, kTrials = 300000;
+
+ragon::Dist random_dist(std::mt19937_64& rng, bool sparse) {
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  ragon::Dist d;
+  double sum = 0;
+  for (int t = 0; t < kVocab; ++t) {
+    if (sparse && u(rng) < 0.4) continue;  // some tokens impossible (as after top-k / top-p)
+    const double w = u(rng) + 0.05;
+    d.push_back({t, w});
+    sum += w;
+  }
+  if (d.empty()) d.push_back({0, sum = 1.0});
+  for (auto& [t, w] : d) w /= sum;
+  return d;
+}
+
+double prob(const ragon::Dist& d, int t) {
+  for (const auto& [x, p] : d)
+    if (x == t) return p;
+  return 0;
+}
+
+// Decodes kLen tokens speculatively with drafts of length `E`; `lookup`: drafts are fixed tokens (q = 1).
+bool check_accept(bool lookup, int E, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::vector<ragon::Dist> target(kLen + E + 1), draftq(kLen + E + 1);
+  for (auto& d : target) d = random_dist(rng, true);
+  for (auto& d : draftq) d = random_dist(rng, false);
+  std::map<std::vector<int>, long> counts;
+  for (int trial = 0; trial < kTrials; ++trial) {
+    std::vector<int> out;
+    while (static_cast<int>(out.size()) < kLen) {
+      const int pos = static_cast<int>(out.size());
+      std::vector<int> drafts(E);
+      for (int i = 0; i < E; ++i)
+        drafts[i] = lookup ? (pos * 7 + i * 3 + trial % 2) % kVocab : ragon::draw(draftq[pos + i], rng);
+      std::vector<ragon::Dist> P(target.begin() + pos, target.begin() + pos + E + 1);
+      auto q = [&](int i, int t) { return lookup ? (t == drafts[i] ? 1.0 : 0.0) : prob(draftq[pos + i], t); };
+      const auto [acc, next] = ragon::accept_sampled(P, drafts, q, rng);
+      out.insert(out.end(), drafts.begin(), drafts.begin() + acc);
+      out.push_back(next);
+    }
+    out.resize(kLen);
+    counts[out]++;
+  }
+  // Chi-square of the joint distribution of the kLen tokens against the product of the target's.
+  double chi = 0;
+  int cells = 0;
+  std::vector<int> seq(kLen, 0);
+  for (int idx = 0; idx < std::pow(kVocab, kLen); ++idx) {
+    int r = idx;
+    double expected = kTrials;
+    for (int j = 0; j < kLen; ++j) {
+      seq[j] = r % kVocab;
+      r /= kVocab;
+      expected *= prob(target[j], seq[j]);
+    }
+    const long seen = counts.count(seq) ? counts[seq] : 0;
+    if (expected == 0) {
+      if (seen != 0) {
+        std::printf("accept (%s, E=%d): impossible sequence emitted %ld times FAIL\n", lookup ? "lookup" : "drafter", E, seen);
+        return false;
+      }
+      continue;
+    }
+    chi += (seen - expected) * (seen - expected) / expected;
+    ++cells;
+  }
+  // 99.9% quantile of chi-square with k degrees of freedom (Wilson-Hilferty).
+  const double k = cells - 1, z = 3.09;
+  const double limit = k * std::pow(1 - 2 / (9 * k) + z * std::sqrt(2 / (9 * k)), 3);
+  const bool ok = chi < limit;
+  std::printf("accept (%s, E=%d): chi-square %.1f over %d cells (99.9%% limit %.1f) %s\n", lookup ? "lookup" : "drafter",
+              E, chi, cells, limit, ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// Tree verification's accept rule (BACKLOG 26, core/tree.hpp): a toy target whose next-token distribution depends on
+// the whole prefix, a chain drawn from a draft that depends on the position and the predecessor, extra nodes (siblings
+// of chain rows, some with children of their own) chosen at random; the joint distribution of the first kLen tokens
+// must be the target's (chi-square), and the greedy walk must emit the target's argmax continuation.
+uint64_t hash_prefix(const std::vector<int>& v) {
+  uint64_t h = 1469598103934665603ull;
+  for (int t : v) h = (h ^ uint64_t(t + 1)) * 1099511628211ull;
+  return h;
+}
+
+bool check_tree(int E, int extra, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::map<uint64_t, ragon::Dist> tcache, qcache;
+  auto target = [&](const std::vector<int>& prefix) -> const ragon::Dist& {
+    const uint64_t h = hash_prefix(prefix);
+    auto it = tcache.find(h);
+    if (it != tcache.end()) return it->second;
+    std::mt19937_64 r(h ^ seed);
+    return tcache[h] = random_dist(r, true);
+  };
+  auto draftq = [&](int pos, int prev) -> const ragon::Dist& {
+    const uint64_t h = uint64_t(pos) * 131 + prev + 7;
+    auto it = qcache.find(h);
+    if (it != qcache.end()) return it->second;
+    std::mt19937_64 r(h * 977 + seed);
+    return qcache[h] = random_dist(r, false);
+  };
+  std::map<std::vector<int>, long> counts;
+  bool greedy_ok = true;
+  std::uniform_int_distribution<int> tok(0, kVocab - 1);
+  for (int trial = 0; trial < kTrials; ++trial) {
+    std::vector<int> out;
+    int anchor = 0;
+    while (static_cast<int>(out.size()) < kLen) {
+      // The tree: the anchor (the last emitted token, or 0), the chain drawn from q, then `extra` random nodes.
+      ragon::DraftTree t;
+      t.E = E;
+      auto add = [&](int par, int token) {
+        t.parent.push_back(par);
+        t.depth.push_back(par < 0 ? 0 : t.depth[par] + 1);
+        t.token.push_back(token);
+        t.pick.push_back(0);
+        t.children.emplace_back();
+        if (par >= 0) t.children[par].push_back(t.rows() - 1);
+      };
+      add(-1, anchor);
+      std::vector<int> chain;
+      for (int e = 0; e < E; ++e) {
+        const int d = ragon::draw(draftq(static_cast<int>(out.size()) + e, e ? chain.back() : anchor), rng);
+        chain.push_back(d);
+        add(e, d);
+      }
+      for (int x = 0; x < extra; ++x) {
+        std::uniform_int_distribution<int> pick(0, t.rows() - 1);
+        const int par = pick(rng);
+        if (t.depth[par] >= E) continue;
+        const int token = tok(rng);
+        bool dup = false;
+        for (int c : t.children[par]) dup = dup || t.token[c] == token;
+        if (!dup) add(par, token);
+      }
+      // Each row's target distribution: given the emitted prefix and the row's path.
+      std::vector<ragon::Dist> P(t.rows());
+      std::vector<int> argmax(t.rows());
+      for (int r = 0; r < t.rows(); ++r) {
+        std::vector<int> pre = out;
+        std::vector<int> path;
+        for (int a = r; a > 0; a = t.parent[a]) path.push_back(t.token[a]);
+        pre.insert(pre.end(), path.rbegin(), path.rend());
+        P[r] = target(pre);
+        argmax[r] = P[r][0].first;
+        for (const auto& [x, pr] : P[r])
+          if (pr > prob(P[r], argmax[r])) argmax[r] = x;
+      }
+      auto q = [&](int e, int token) {
+        return prob(draftq(static_cast<int>(out.size()) + e, e ? chain[e - 1] : anchor), token);
+      };
+      if (trial < 2000) {  // greedy: the argmax walk
+        int next = 0;
+        const std::vector<int> path = ragon::accept_tree_greedy(t, argmax.data(), next);
+        // Along the path each child's token is its parent row's argmax, and next is the last row's.
+        for (size_t j = 1; j < path.size(); ++j) greedy_ok &= t.token[path[j]] == argmax[path[j - 1]];
+        greedy_ok &= next == argmax[path.back()];
+        for (int c : t.children[path.back()]) greedy_ok &= t.token[c] != next;
+      }
+      int next = 0;
+      const std::vector<int> path = ragon::accept_tree_sampled(t, P, q, rng, next);
+      for (size_t j = 1; j < path.size(); ++j) out.push_back(t.token[path[j]]);
+      out.push_back(next);
+      anchor = next;
+    }
+    out.resize(kLen);
+    counts[out]++;
+  }
+  double chi = 0;
+  int cells = 0;
+  std::vector<int> seq(kLen, 0);
+  for (int idx = 0; idx < std::pow(kVocab, kLen); ++idx) {
+    int r = idx;
+    for (int j = 0; j < kLen; ++j) {
+      seq[j] = r % kVocab;
+      r /= kVocab;
+    }
+    double expected = kTrials;
+    std::vector<int> pre;
+    for (int j = 0; j < kLen; ++j) {
+      expected *= prob(target(pre), seq[j]);
+      pre.push_back(seq[j]);
+    }
+    const long seen = counts.count(seq) ? counts[seq] : 0;
+    if (expected == 0) {
+      if (seen != 0) {
+        std::printf("tree accept (E=%d, +%d): impossible sequence emitted %ld times FAIL\n", E, extra, seen);
+        return false;
+      }
+      continue;
+    }
+    chi += (seen - expected) * (seen - expected) / expected;
+    ++cells;
+  }
+  const double k = cells - 1, z = 3.09;
+  const double limit = k * std::pow(1 - 2 / (9 * k) + z * std::sqrt(2 / (9 * k)), 3);
+  const bool ok = chi < limit && greedy_ok;
+  std::printf("tree accept (E=%d, +%d nodes): chi-square %.1f over %d cells (99.9%% limit %.1f), greedy walk %s %s\n", E,
+              extra, chi, cells, limit, greedy_ok ? "ok" : "WRONG", ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// BACKLOG 26, follow-up 3: the sampled tree's rule at a node is the multi-draft rule (recursive rejection sampling, as in
+// SpecInfer) for its proposals. The chain's token x is drawn from q and the siblings y_1 .. y_S are fixed tokens (point
+// masses). Recursive rejection sampling accepts x with min(1, p(x) / q(x)), else goes on with the residual
+// R = max(0, p - q) / Z; then accepts each y_i with probability p_i(y_i), p_i being R with y_1 .. y_{i-1} removed and
+// renormalised, and at the end draws from what is left. accept_tree_sampled() instead draws once from R and continues into
+// the sibling holding the draw. The two give every outcome (x, each y_i, each other token) the same probability; this
+// checks it exactly, from the probabilities, on random p, q and sibling sets (the chi-square of check_tree checks the
+// emitted distribution).
+bool check_sibling_rule(uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  double worst = 0;
+  for (int trial = 0; trial < 2000; ++trial) {
+    const ragon::Dist p = random_dist(rng, true), q = random_dist(rng, false);
+    for (int x = 0; x < kVocab; ++x) {
+      const double qx = prob(q, x);
+      if (qx == 0) continue;
+      const double a = std::min(1.0, prob(p, x) / qx);
+      std::vector<double> R(kVocab);
+      double Z = 0;
+      for (int t = 0; t < kVocab; ++t) Z += R[t] = std::max(0.0, prob(p, t) - prob(q, t));
+      if (Z <= 0) continue;
+      for (double& r : R) r /= Z;
+      std::vector<int> sib;
+      for (int t = 0; t < kVocab; ++t)
+        if (t != x && std::uniform_real_distribution<double>(0, 1)(rng) < 0.5) sib.push_back(t);
+      std::shuffle(sib.begin(), sib.end(), rng);
+      // Recursive rejection sampling over the siblings, outcome by outcome.
+      std::vector<double> rrs(kVocab, 0.0), draw(kVocab, 0.0);
+      std::vector<double> cur = R;
+      double reach = 1 - a;  // probability of reaching the siblings
+      for (int y : sib) {
+        double tot = 0;
+        for (double c : cur) tot += c;
+        if (tot <= 0) break;
+        const double py = cur[y] / tot;
+        rrs[y] += reach * py;
+        reach *= 1 - py;
+        cur[y] = 0;
+      }
+      double tot = 0;
+      for (double c : cur) tot += c;
+      for (int t = 0; t < kVocab; ++t)
+        if (tot > 0) rrs[t] += reach * cur[t] / tot;
+      // The engine's rule: one draw from R, continuing into the sibling that holds it, else emitting it.
+      for (int t = 0; t < kVocab; ++t) draw[t] = (1 - a) * R[t];
+      for (int t = 0; t < kVocab; ++t) worst = std::max(worst, std::fabs(rrs[t] - draw[t]));
+    }
+  }
+  const bool ok = worst < 1e-12;
+  std::printf("sibling rule: recursive rejection sampling over point-mass siblings against one residual draw, largest "
+              "difference %.2g %s\n", worst, ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// build_tree and describe_tree on random drafter outputs: the chain is rows 0 .. E, parents precede children, every
+// row's variant path holds it at its depth, and each gdn path advances parent to child with leaves after their parent,
+// writing every row exactly once.
+bool check_tree_desc(uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::uniform_real_distribution<float> u(-4.f, 4.f);
+  bool ok = true;
+  for (int trial = 0; trial < 2000 && ok; ++trial) {
+    const int E = 1 + trial % 15, K16 = 16;
+    std::vector<int> cand(size_t(E) * K16);
+    for (size_t i = 0; i < cand.size(); ++i) cand[i] = int(i % K16) * 100 + int(i / K16);  // distinct per position
+    std::vector<float> scores(size_t(E) * K16 * K16);
+    for (float& x : scores) x = u(rng);
+    std::vector<int> toks, picks;
+    for (int e = 0, prev = 0; e < E; ++e) {
+      const float* sc = scores.data() + (size_t(e) * K16 + (e ? prev : 0)) * K16;
+      int pick = 0;
+      for (int k = 1; k < K16; ++k)
+        if (sc[k] > sc[pick]) pick = k;
+      toks.push_back(cand[size_t(e) * K16 + pick]);
+      picks.push_back(pick);
+      prev = pick;
+    }
+    ragon::TreeShape shape;
+    shape.nodes = int(rng() % 32);
+    shape.width = 1 + int(rng() % 4);
+    shape.temp = 0.5 + (rng() % 3);
+    shape.chain = trial % 3 == 0 ? 1 + int(rng() % E) : 1000;
+    const int Ec = std::min(E, shape.chain);
+    const ragon::DraftTree t = ragon::build_tree(7, cand.data(), scores.data(), E, K16, toks, picks, shape);
+    ragon::kernels::TreeDesc d;
+    ragon::describe_tree(t, d);
+    const int n = t.rows();
+    ok &= n <= ragon::kernels::kMaxStreamRows && n >= Ec + 1 && t.E == Ec;
+    for (int r = 1; r <= Ec; ++r) ok &= t.parent[r] == r - 1;
+    for (int r = 1; r < n; ++r) ok &= t.parent[r] < r && t.depth[r] == t.depth[t.parent[r]] + 1 && t.depth[r] <= E;
+    for (int r = 0; r < n; ++r) ok &= d.var[r] >= 0 && d.var[r] < d.nvar && d.path[d.var[r]][t.depth[r]] == r;
+    std::vector<int> writes(n, 0);
+    for (int p = 0; p < d.ngdn; ++p) {
+      int last = -1;  // the last advanced row
+      for (int i = 0; i < d.gdn_len[p]; ++i) {
+        const int st = d.gdn_step[p][i], r = st & 0xff;
+        if (st & ragon::kernels::TreeDesc::kWrite) ++writes[r];
+        if (st & ragon::kernels::TreeDesc::kLeaf) {
+          ok &= t.children[r].empty() && t.parent[r] == last;
+        } else {
+          ok &= t.parent[r] == last;
+          last = r;
+        }
+      }
+    }
+    for (int r = 0; r < n; ++r) ok &= writes[r] == 1;
+  }
+  std::printf("tree descriptions %s\n", ok ? "ok" : "FAIL");
+  return ok;
+}
+
+bool check_lookup() {
+  bool ok = true;
+  // "a b c d e f a b c" -> the last "a b c" occurred at 0; propose "d e f a" (max 4), match 3.
+  std::vector<int> s = {1, 2, 3, 4, 5, 6, 1, 2, 3};
+  auto p = ragon::lookup_propose(s, 4);
+  ok &= p.tokens == std::vector<int>({4, 5, 6, 1}) && p.match == 3;
+  // A longer agreement before the n-gram counts in `match`; the most recent occurrence wins.
+  s = {9, 1, 2, 3, 7, 0, 9, 1, 2, 3, 8, 9, 1, 2, 3};
+  p = ragon::lookup_propose(s, 2);
+  ok &= p.tokens == std::vector<int>({8, 9}) && p.match == 4;
+  // No earlier occurrence: no proposal.
+  p = ragon::lookup_propose({1, 2, 3, 4, 5}, 4);
+  ok &= p.tokens.empty();
+  // The proposal stops at the end of the sequence.
+  p = ragon::lookup_propose({5, 5, 5, 5}, 8);
+  ok &= p.tokens == std::vector<int>({5}) && p.match == 3;
+  std::printf("lookup proposals %s\n", ok ? "ok" : "FAIL");
+  return ok;
+}
+
+}  // namespace
+
+int main() {
+  bool ok = check_lookup();
+  ok &= check_accept(false, 1, 1);
+  ok &= check_accept(false, 3, 2);
+  ok &= check_accept(true, 2, 3);
+  ok &= check_accept(true, 4, 4);
+  ok &= check_tree_desc(11);
+  ok &= check_sibling_rule(13);
+  ok &= check_tree(1, 3, 5);
+  ok &= check_tree(3, 6, 6);
+  ok &= check_tree(4, 12, 7);
+  std::printf(ok ? "all spec tests passed\n" : "SPEC TESTS FAILED\n");
+  return ok ? 0 : 1;
+}

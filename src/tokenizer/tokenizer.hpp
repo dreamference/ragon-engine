@@ -1,0 +1,73 @@
+// Qwen's tokenizer in C++: byte-level BPE, NFC normalization, the Split pre-tokenizer pattern from
+// tokenizer.json, and added tokens matched before anything else (as the reference tokenizer does).
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace ragon {
+
+// The pre-tokenizer pattern production's server tokenizes with. Its tokenizer class (transformers 5's
+// Qwen2Tokenizer) replaces the checkpoint's Split pattern with this older Qwen2 one, which has no \p{M}:
+// combining marks (Devanagari vowel signs, for example) split from the letters before them. For text
+// without combining marks the two patterns give the same tokens.
+inline constexpr const char* kProductionPretokenizer =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
+    "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+class Tokenizer {
+ public:
+  // `pattern` replaces tokenizer.json's Split pattern when it is not empty (kProductionPretokenizer
+  // tokenizes as production does).
+  explicit Tokenizer(const std::string& tokenizer_json_path, const std::string& pattern = "");
+  ~Tokenizer();
+  Tokenizer(const Tokenizer&) = delete;
+  Tokenizer& operator=(const Tokenizer&) = delete;
+
+  std::vector<int> encode(std::string_view text) const;
+  // The bytes a token stands for (special tokens decode to their text).
+  std::string token_bytes(int id) const;
+  std::string decode(const std::vector<int>& ids) const;
+  int token_id(const std::string& token) const;  // -1 if absent
+  bool is_special(int id) const;
+  int vocab_size() const { return static_cast<int>(id_to_token_.size()); }
+
+ private:
+  void encode_segment(std::string_view text, std::vector<int>& out) const;
+  void bpe(const std::string& piece, std::vector<int>& out) const;
+
+  std::unordered_map<std::string, int> vocab_;
+  std::vector<std::string> id_to_token_;
+  std::unordered_map<std::string, int> merge_rank_;  // "a b" -> rank
+  std::vector<std::pair<std::string, int>> added_;    // sorted longest first
+  std::vector<bool> special_;
+  std::string byte_to_unicode_[256];
+  std::unordered_map<std::string, uint8_t> unicode_to_byte_;
+  void* regex_ = nullptr;  // pcre2_code*
+  // The BPE results of pieces seen before. encode() runs on every HTTP worker thread at once (ragon-serve tokenizes
+  // each request on the thread that received it), so the cache is read under a shared lock and filled under an
+  // exclusive one: unguarded, two requests tokenized together corrupted the map and crashed the server (node-b,
+  // 2026-11-04, four agent streams). The ids are what the BPE gives with or without the cache.
+  mutable std::unordered_map<std::string, std::vector<int>> cache_;
+  mutable std::shared_mutex cache_mu_;
+};
+
+// Turns tokens into text as they are generated, holding back bytes until they form whole UTF-8
+// characters.
+class StreamDecoder {
+ public:
+  explicit StreamDecoder(const Tokenizer& t) : tok_(t) {}
+  std::string push(int id);
+  std::string flush();
+
+ private:
+  const Tokenizer& tok_;
+  std::string pending_;
+};
+
+}  // namespace ragon
