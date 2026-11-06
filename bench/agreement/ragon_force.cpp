@@ -1,14 +1,17 @@
 // ragon_force: the engine side of the agreement study (bench/agreement/run.sh), built by hand against any
 // ragon-engine build's libraries so older builds can be scored too:
 //   nvcc -std=c++20 -O2 -gencode arch=compute_121a,code=sm_121a -I$SRC/src ragon_force.cpp \
-//        $SRC/build/libling_core.a $SRC/build/libling_tokenizer.a -lpcre2-8 -licuuc -o ragon-force
+//        $SRC/build/libling_core.a $SRC/build/libling_tokenizer.a -lcuda -lpcre2-8 -licuuc -lpng16 -lwebp -o ragon-force
 //   ragon-force tokenize MODEL < prompts.jsonl            -> {"ids": [...]} per line (prompt strings, JSON)
 //   ragon-force score MODEL K < cases.jsonl               -> per case: engine top-K log-probs at each forced position
 //        case: {"prompt": [ids], "cont": [ids]}; position j scores the token after prompt + cont[:j]
 //   ragon-force gen MODEL MAXTOK < cases.jsonl            -> greedy continuation of {"prompt": [ids]}: {"ids", "text"}
+// RAGON_LORA=LIBRARY/NAME: score and generate with that adapter (LORA §3, one GPU slot) instead of the base.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <numeric>
 #include <string>
@@ -52,7 +55,17 @@ int main(int argc, char** argv) {
   }
   ragon::EngineOptions opts;
   opts.max_context = 40000;
+  const char* lora = std::getenv("RAGON_LORA");
+  if (lora) opts.lora_slots = 1;
   ragon::Engine engine(model, opts);
+  if (lora) {
+    const std::filesystem::path p = std::filesystem::path(lora).lexically_normal();
+    ragon::LoraLibrary lib(p.parent_path().string(), 1, engine.lora_shape(), engine.lora_draft_shape());
+    const auto adapter = lib.load(p.filename().string(), p.string());
+    engine.lora_upload(0, *adapter);
+    engine.activate_session(0, "", false, ragon::lora_scope(0, adapter.get()), 0);
+    std::fprintf(stderr, "ragon-force: adapter %s (%zu bytes)\n", adapter->name.c_str(), adapter->bytes());
+  }
   const int im_end = tok.token_id("<|im_end|>");
   if (mode == "score") {
     const int K = std::stoi(argv[3]);
