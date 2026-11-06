@@ -1,0 +1,41 @@
+# The adapters' reference (bar.steps reads it): a scratch SGLang with production's flags and rand-split, the fixture
+# prompts' greedy continuations with the adapter and on the base, twice each for the reference's own repeatability.
+# Copies the outputs to LORA_REF (default ~/lora-ref).
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+A=$HOME/lora-agree; REF=${LORA_REF:-$HOME/lora-ref}; mkdir -p $REF
+# SGLang wraps only the modules --lora-target-modules names, and its choices name no DeltaNet module, so the flag is
+# `all`; serve.py's --set takes one value, so the command is printed and the flag appended.
+SGARGS="lora-sg --port 30000 --add enable-lora --set max-lora-rank 16 --set max-loras-per-batch 2
+    --set lora-paths rand-split=/root/.cache/dreamference/lora-lib/rand-split"
+SG() {
+  local cmd=$(python3 $SRC/bench/sglang/serve.py $SGARGS "$@" --print | tail -n 1)
+  docker rm -f lora-sg > /dev/null 2>&1
+  eval "$cmd --lora-target-modules all"
+}
+sg_wait() {
+  for i in $(seq 1 200); do
+    curl -sf -m 3 localhost:30000/v1/models > /dev/null && return 0
+    [ "$(docker inspect -f '{{.State.Running}}' lora-sg 2>/dev/null)" = true ] || return 1
+    sleep 5
+  done
+  return 1
+}
+# Production's flags first; if SGLang refuses LoRA with them, without DFlash and torch.compile (greedy output is the
+# target's either way).
+sg_up() {
+  SG && sg_wait && return 0
+  docker logs lora-sg 2>&1 | tail -n 40; echo "=== again without speculation and torch.compile"
+  SG --drop speculative-algorithm --drop speculative-draft-model-path --drop speculative-num-draft-tokens \
+      --drop enable-torch-compile --drop torch-compile-max-bs && sg_wait
+}
+ref() {
+  local U=http://127.0.0.1:30000 P="python3 $SRC/bench/agreement/prod.py"
+  set -e
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P gen $A/ids.jsonl $REF/ref-lora.jsonl 48 1
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P gen $A/ids.jsonl $REF/ref-lora-run2.jsonl 48 1
+  RAGON_REF_URL=$U $P gen $A/ids.jsonl $REF/ref-base.jsonl 48 1
+  RAGON_REF_URL=$U $P gen $A/ids.jsonl $REF/ref-base-run2.jsonl 48 1
+}
+step sg-up sg_up
+step ref ref
+docker logs lora-sg > $V/sg.log 2>&1; docker rm -f lora-sg > /dev/null 2>&1
