@@ -41,3 +41,12 @@ python3 bench/micro/decode_clocks.py --url http://127.0.0.1:8000 --duration 600 
 It prints min / median / max per column, the throttle masks seen with their counts, and the tokens generated. Each stream finishes its last request after the deadline, so a run overshoots by up to one request. The CSV is for inspection and is not committed.
 
 Item 5 is read from a ragon-serve instance (`GET /spec_stats` before and after a replay, `bench/replay/spec_report.py BEFORE.json AFTER.json`). It needs the model loaded (M1 §How to run), so it is a replay job for a GPU without the reference server, not a probe.
+
+## The FP4 decode crossover (not one of the five)
+
+Can decode use the FP4 tensor cores? `fp4_decode_bench.cu` runs the engine's GEMM groups at a sweep of row counts on both paths the engine has (FP16 after unpacking, today's decode; block-scaled NVFP4 and FP8, the prefill path), and prints time, GB/s, TFLOPS, what the path change does to the numbers, the step, and the crossover. `fp4_decode.sh` is the one command, under the hosts' GPU lock: it stops nothing and refuses a busy GPU or a running SWE-bench unit.
+
+```bash
+ninja -C build ragon-fp4-decode-bench
+bench/micro/fp4_decode.sh /tmp/fp4-decode            # or: OUT_DIR ROWS RUNS
+```
