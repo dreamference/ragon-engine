@@ -1,0 +1,30 @@
+# The adapters' bar, agreement (bar.sh): the engine teacher-forced on the reference's greedy continuations with the
+# reference's top-20 scored (ragon_force score, LORA §6 item 3), the agent prompts' first answers, and the free-running
+# continuations as information. rand-split is the form SGLang serves; the base is the same comparison's floor.
+source $(dirname ${BASH_SOURCE[0]})/common.sh
+A=$HOME/lora-agree; REF=${LORA_REF:-$HOME/lora-ref}
+python3 - $A $REF $V <<'PY'
+import json, sys
+A, REF, V = sys.argv[1:]
+ids = [json.loads(l)["ids"] for l in open(f"{A}/ids.jsonl")]
+for name in ("lora", "base"):
+    gen = [json.loads(l) for l in open(f"{REF}/ref-{name}.jsonl")]
+    ref = [json.loads(l) for l in open(f"{REF}/force-{name}.jsonl")]
+    with open(f"{V}/cases-{name}.jsonl", "w") as f:
+        for p, g, r in zip(ids, gen, ref):
+            f.write(json.dumps({"prompt": p, "cont": g["cont"], "want": [[c[0] for c in pos] for pos in r["top"]]}) + "\n")
+for src, out in ((f"{A}/ids.jsonl", "cases.jsonl"), (f"{A}/ids-long.jsonl", "cases-long.jsonl")):
+    with open(f"{V}/{out}", "w") as f:
+        for l in open(src):
+            f.write(json.dumps({"prompt": json.loads(l)["ids"]}) + "\n")
+PY
+force_base() { $B/ragon-force score $M 20 < $V/cases-base.jsonl > $V/eng-base.jsonl; }
+force_lora() { RAGON_LORA=$LIB/rand-split $B/ragon-force score $M 20 < $V/cases-lora.jsonl > $V/eng-lora.jsonl; }
+long_lora() { RAGON_LORA=$LIB/rand-split $B/ragon-force gen $M 400 < $V/cases-long.jsonl > $V/long-lora.jsonl; }
+gen_base() { $B/ragon-force gen $M 48 < $V/cases.jsonl > $V/gen-base.jsonl; }
+gen_lora() { RAGON_LORA=$LIB/rand-split $B/ragon-force gen $M 48 < $V/cases.jsonl > $V/gen-lora.jsonl; }
+step force-base force_base
+step force-lora force_lora
+step long-lora long_lora
+step gen-base gen_base
+step gen-lora gen_lora

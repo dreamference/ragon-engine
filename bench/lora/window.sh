@@ -38,7 +38,8 @@ step() {
     if [ $w -ge $left ]; then pkill -TERM -P $p; sleep 2; kill -TERM $p 2>/dev/null; fi
   done
   wait $p
-  echo "$(date -u +%T) $name exit $?"
+  local rc=$?  # before the echo's $(date) overwrites it
+  echo "$(date -u +%T) $name exit $rc"
 }
 source $STEPS
 # m0 comes back only if nobody else waits for the lock (the next holder would stop it again): the other processes

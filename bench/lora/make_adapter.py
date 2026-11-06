@@ -91,9 +91,10 @@ def write_adapter(model_dir, out, args, targets, drafter, rng):
         "bias": "none",
         "use_rslora": False,
         "use_dora": False,
-        # SGLang names the split projections' module in_proj_qkvz and wraps only the modules target_modules names:
-        # "all-linear" with --lora-target-modules all wraps them all (the engine reads the keys, not this list).
-        "target_modules": "all-linear" if "gdn-split" in targets and not drafter else sorted(names),
+        # SGLang names the split projections' module in_proj_qkvz and wraps only the modules target_modules names (the
+        # engine reads the keys, not this list).
+        "target_modules": sorted({"in_proj_qkvz" if "gdn-split" in targets and n.startswith("in_proj_") else n
+                                  for n in names}),
         "base_model_name_or_path": os.path.basename(os.path.normpath(model_dir)),
     }
     json.dump(conf, open(os.path.join(out, "adapter_config.json"), "w"), indent=2)

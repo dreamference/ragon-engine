@@ -1,15 +1,6 @@
-# The adapters' bar (bar.sh): speed from the zero adapter between two runs of the base (the same tokens, so the ratios
-# are the engine's cost alone; the base itself drifts between runs by about what the bar allows), correctness from rand-split against the reference (ref.steps; rand-split is the form SGLang serves).
+# The adapters' bar, speed (bar.sh): the zero adapter against the base, the same tokens, so the ratios are the engine's
+# cost alone; the base twice around it, because it drifts between runs.
 source $(dirname ${BASH_SOURCE[0]})/common.sh
-A=$HOME/lora-agree; REF=${LORA_REF:-$HOME/lora-ref}
-python3 -c "
-import json, sys
-for l in open(sys.argv[1]): print(json.dumps({'prompt': json.loads(l)['ids']}))" $A/ids.jsonl > $V/cases.jsonl
-gen_base() { $B/ragon-force gen $M 48 < $V/cases.jsonl > $V/gen-base.jsonl; }
-gen_lora() { RAGON_LORA=$LIB/rand-split $B/ragon-force gen $M 48 < $V/cases.jsonl > $V/gen-lora.jsonl; }
 step base al base $B
 step zero al zero $B $BASE+zero --lora-library $LIB --lora-paths zero
 step base2 al base2 $B
-step gen-base gen_base
-step gen-lora gen_lora
-step verdict python3 $SRC/bench/lora/bar.py $V $REF

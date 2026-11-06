@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The adapters' bar (LORA §6) in one command, in a GPU window (window.sh): the same long agent workload on the base and on
-# the zero adapter, greedy continuations of the fixture prompts on the base and on rand-split, and bar.py's verdict.
+# The adapters' bar (LORA §6) in one command, in two GPU windows (window.sh; one would pass its 40 minutes): the same long
+# agent workload on the base and on the zero adapter (bar.steps), then the fixture prompts on rand-split and on the base
+# (agree.steps), and bar.py's verdict.
 #
 #     GPU_LOCK=... bench/lora/bar.sh [OUT_DIR]
 #
@@ -10,4 +11,7 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-$HOME/lora-bar/$(date -u +%Y%m%d-%H%M)}
 mkdir -p "$out"
-exec "$here/window.sh" lora-bar "the adapters' bar" "$here/bar.steps" "$out"
+"$here/window.sh" lora-bar "the adapters' bar: speed" "$here/bar.steps" "$out" || exit
+"$here/window.sh" lora-bar "the adapters' bar: agreement" "$here/agree.steps" "$out" || exit
+python3 "$here/bar.py" "$out" "${LORA_REF:-$HOME/lora-ref}" | tee "$out/verdict.log"
+exit "${PIPESTATUS[0]}"
