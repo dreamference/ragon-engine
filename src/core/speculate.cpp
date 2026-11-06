@@ -445,29 +445,32 @@ void Engine::set_step_graphs(bool on) {
 
 void Engine::clear_graphs() {
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
-  for (Session& s : sessions_) {
-    if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
-    s.draft_graph = nullptr;
-    if (s.draft_graph_sparse) cudaGraphExecDestroy(s.draft_graph_sparse);
-    s.draft_graph_sparse = nullptr;
-    for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
-    s.verify_graphs.clear();
-    for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
-    s.tree_verify_graphs.clear();
-    for (cudaGraphExec_t g : s.commit_graphs)
-      if (g) cudaGraphExecDestroy(g);
-    s.commit_graphs.clear();
-    for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
-    s.batch_commit_graphs.clear();
-    for (auto& [k, g] : s.state_commit_graphs) cudaGraphExecDestroy(g);
-    s.state_commit_graphs.clear();
-  }
+  for (Session& s : sessions_) clear_session_graphs(s);
   for (auto& [order, bg] : batch_graphs_) {
     if (bg.draft) cudaGraphExecDestroy(bg.draft);
     for (auto& [k, g] : bg.draft_sparse) cudaGraphExecDestroy(g);
     for (auto& [k, g] : bg.verify) cudaGraphExecDestroy(g);
   }
   batch_graphs_.clear();
+}
+
+void Engine::clear_session_graphs(Session& s) {
+  if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
+  if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
+  s.draft_graph = nullptr;
+  if (s.draft_graph_sparse) cudaGraphExecDestroy(s.draft_graph_sparse);
+  s.draft_graph_sparse = nullptr;
+  for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
+  s.verify_graphs.clear();
+  for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
+  s.tree_verify_graphs.clear();
+  for (cudaGraphExec_t g : s.commit_graphs)
+    if (g) cudaGraphExecDestroy(g);
+  s.commit_graphs.clear();
+  for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
+  s.batch_commit_graphs.clear();
+  for (auto& [k, g] : s.state_commit_graphs) cudaGraphExecDestroy(g);
+  s.state_commit_graphs.clear();
 }
 
 cudaGraphExec_t Engine::capture(const std::function<void()>& body, cudaStream_t st) {
@@ -548,9 +551,17 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     kernels::gemm_bf16(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                        stream_);
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
+  Session* const self[1] = {s_};
+  const int nrows[1] = {rows};
+  const kernels::LoraRows lrows = lora_draft_rows(self, nrows);  // LORA §3: the session's adapter on k and v
+  kernels::LoraOuts kv;
+  kv.y[1] = dk_;
+  kv.y[2] = dv_;
+  kv.ld[1] = kv.ld[2] = dkv;
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
     linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, rows, kv, dkv);
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
   }
@@ -576,6 +587,17 @@ void Engine::draft_launch(int B, bool sparse) {
   const int K16 = d.selector_top_k;
   check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, B * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, B, H, dres_, stream_);
+  Session* const self[1] = {s_};
+  const int nrows[1] = {B};
+  const kernels::LoraRows lrows = lora_draft_rows(self, nrows);  // LORA §3: the session's adapter on q, k, v and o
+  kernels::LoraOuts qkv, o;
+  qkv.y[0] = dq_;
+  qkv.y[1] = dk_;
+  qkv.y[2] = dv_;
+  qkv.ld[0] = dq;
+  qkv.ld[1] = qkv.ld[2] = dkv;
+  o.y[0] = dh2_;
+  o.ld[0] = H;
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
     // Pre-norm with the residual added in (SGLang's fused add + RMSNorm); the drafter's norms are plain.
@@ -585,11 +607,13 @@ void Engine::draft_launch(int B, bool sparse) {
     linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dh2_, H, B, qkv, dq);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_attention(dq_, s_->dkc[l], s_->dvc[l], ring_, dk_, dv_, dpos(), B, d.sliding_window - 1, d.heads,
                              d.kv_heads, dattn_, stream_);
     linear_fp4(L.o, dattn_, B, dh2_);
+    lora_draft_site(lrows, l, LoraSite::O, dattn_, dq, B, o, H);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, B, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, B, H, d.eps, false, stream_);
@@ -634,6 +658,22 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
   if (use_dev_pos_) sb.pos_dev = pos_dev_;
   check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, R * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, R, H, dres_, stream_);
+  Session* seqs[kernels::kMaxSeqs] = {};
+  int nrows[kernels::kMaxSeqs] = {};
+  for (int i = 0; i < n; ++i) {
+    seqs[i] = plans[i].s;
+    nrows[i] = B;
+  }
+  // LORA §3: each sequence's adapter on its own block of rows (draft_launch's sites).
+  const kernels::LoraRows lrows = lora_draft_rows(std::span(seqs, n), std::span(nrows, n));
+  kernels::LoraOuts qkv, o;
+  qkv.y[0] = dq_;
+  qkv.y[1] = dk_;
+  qkv.y[2] = dv_;
+  qkv.ld[0] = dq;
+  qkv.ld[1] = qkv.ld[2] = dkv;
+  o.y[0] = dh2_;
+  o.ld[0] = H;
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
     kernels::SeqPtrs<const __nv_bfloat16> kc, vc;
@@ -648,11 +688,13 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
     linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dh2_, H, R, qkv, dq);
     kernels::draft_qk_rope_seqs(dq_, d.heads, dq, L.q_norm, sb, d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
     kernels::draft_attention_seqs(dq_, kc, vc, ring_, dk_, dv_, sb, d.sliding_window - 1, d.heads, d.kv_heads, dattn_,
                                   stream_);
     linear_fp4(L.o, dattn_, R, dh2_);
+    lora_draft_site(lrows, l, LoraSite::O, dattn_, dq, R, o, H);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, R, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, R, H, d.eps, false, stream_);
@@ -965,6 +1007,10 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
     pin_->rdelta = s_->rope_delta;  // the rope delta after the prompt's images (VISION §20.3 (b))
     check(cudaMemcpyAsync(rdelta_dev_, &pin_->rdelta, sizeof(int), cudaMemcpyHostToDevice, stream_), "rope delta");
+    if (lora_seq_dev_) {  // and its adapter's slot (LORA §3)
+      pin_->lora_slot[0] = s_->lora_slot;
+      check(cudaMemcpyAsync(lora_seq_dev_, pin_->lora_slot, sizeof(int), cudaMemcpyHostToDevice, stream_), "lora slot");
+    }
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
   if (tree_step(p, sp.use_lookup, row_logits != nullptr, B)) {  // BACKLOG 26: the chain and its tree
@@ -1146,7 +1192,8 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     sp.anchor = seqs[i].anchor;
     plan_begin(sp, B);
     any_lookup = any_lookup || sp.use_lookup;
-    order[i] = seqs[i].session;
+    // A session on an adapter as -1 - its index: its graphs have the adapter launches, the base's do not (LORA §3).
+    order[i] = sp.s->lora_slot >= 0 ? -1 - seqs[i].session : seqs[i].session;
   }
   // 1. The drafter over every sequence's block at once (stage 4), then each sequence's lattice walk; a batch with a
   // lookup chain (whose rows replace the drafter's) drafts per sequence, eagerly, as stage 3 did. With step graphs
@@ -1160,6 +1207,11 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     for (int i = 0; i < n; ++i) pin_->seq_rdelta[i] = plans[i].s->rope_delta;
     check(cudaMemcpyAsync(rdelta_dev_, pin_->seq_rdelta, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
           "rope deltas");
+    if (lora_seq_dev_) {
+      for (int i = 0; i < n; ++i) pin_->lora_slot[i] = plans[i].s->lora_slot;
+      check(cudaMemcpyAsync(lora_seq_dev_, pin_->lora_slot, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+            "lora slots");
+    }
   }
   if (together) {
     for (int i = 0; i < n; ++i) {

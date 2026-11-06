@@ -53,7 +53,10 @@ add_library(ragon_core STATIC
   src/core/sampling.cpp
   src/core/model.cu
   src/core/engine.cpp
+  src/core/engine_lora.cpp
   src/core/prefix_kv.cpp
+  src/core/lora.cpp
+  src/core/lora_kernels.cu
   src/core/kv_pool.cpp
   src/core/vision.cu
 )
@@ -154,6 +157,12 @@ target_link_libraries(ragon-kv-pool-tests PRIVATE ragon_core)
 add_test(NAME kv_pool COMMAND ragon-kv-pool-tests)
 add_executable(ragon-prefix-kv-tests tests/prefix_kv_tests.cpp)
 target_link_libraries(ragon-prefix-kv-tests PRIVATE ragon_core)
+add_executable(ragon-lora-tests tests/lora_tests.cpp)
+target_link_libraries(ragon-lora-tests PRIVATE ragon_core)
+add_test(NAME lora COMMAND ragon-lora-tests)
+add_executable(ragon-lora-kernel-tests tests/lora_kernel_tests.cu)
+target_link_libraries(ragon-lora-kernel-tests PRIVATE ragon_core)
+add_test(NAME lora_kernels COMMAND ragon-lora-kernel-tests)
 
 add_executable(ragon-api-tests tests/api_tests.cpp)
 target_link_libraries(ragon-api-tests PRIVATE ragon_api)
