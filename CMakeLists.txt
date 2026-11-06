@@ -122,6 +122,9 @@ target_link_libraries(ragon-paged-tests PRIVATE ragon_core)
 # The paged-attention microbenchmark (bench/micro/paged_attn_bench.cu): flat against paged KV at the engine's geometry.
 add_executable(ragon-paged-attn-bench bench/micro/paged_attn_bench.cu)
 target_link_libraries(ragon-paged-attn-bench PRIVATE ragon_core)
+# The crossover of decode's FP16 path and the FP4 tensor cores (bench/micro/fp4_decode_bench.cu, bench/micro/fp4_decode.sh).
+add_executable(ragon-fp4-decode-bench bench/micro/fp4_decode_bench.cu)
+target_link_libraries(ragon-fp4-decode-bench PRIVATE ragon_core)
 add_test(NAME paged COMMAND ragon-paged-tests)
 add_test(NAME paged_head_major COMMAND ragon-paged-tests head-major)
 add_executable(ragon-stream-tests tests/stream_tests.cu)
