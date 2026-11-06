@@ -4,7 +4,7 @@
     bar.py RUN_DIR REF_DIR
 
 Speed: the zero adapter against the base, decode tok/s at least 0.95x and prefill time per 1,000 new tokens at most
-1.25x, with every turn's tokens the same (else the ratios compare different work). Agreement: rand-strong teacher-forced on
+1.25x, with every turn's tokens the same (else the ratios compare different work). Agreement: rand-x32 teacher-forced on
 the reference's greedy continuation, the agreement gate's lines (MILESTONES) with the tolerance of VISION §20.5 item 5.
 The strict flips are not significantly above the reference's own decode against its own prefill (one-sided Fisher,
 alpha 0.05), none concentrates late or on long prompts, the worst gap is at most 1.75 nats or the reference's own and the
