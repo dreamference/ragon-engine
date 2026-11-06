@@ -4,12 +4,13 @@
     bar.py RUN_DIR REF_DIR
 
 Speed: the zero adapter against the base, decode tok/s at least 0.95x and prefill time per 1,000 new tokens at most
-1.25x, with every turn's tokens the same (else the ratios compare different work). Agreement: rand-split teacher-forced on
+1.25x, with every turn's tokens the same (else the ratios compare different work). Agreement: rand-strong teacher-forced on
 the reference's greedy continuation, the agreement gate's lines (MILESTONES) with the tolerance of VISION §20.5 item 5.
 The strict flips are not significantly above the reference's own decode against its own prefill (one-sided Fisher,
 alpha 0.05), none concentrates late or on long prompts, the worst gap is at most 1.75 nats or the reference's own and the
 top-5 misses at most its own, and the tool names on the agent prompts match at least as often as it matches itself. The
-base's same lines are the floor. Free-running identity is no line: the reference does not reproduce itself, which the
+engine without the adapter on the same cases, the control, has to fail the flip line, or the gate has no power over the
+adapter. Free-running identity is no line: the reference does not reproduce itself, which the
 verdict shows. Prints the verdict and writes it to RUN_DIR/bar.json; exits 1 unless the bar is met.
 """
 import json, math, re, subprocess, sys
@@ -114,7 +115,7 @@ def main():
     zero_same = same == total
     prompts = [r["prompt"] for r in load(run / "cases-lora.jsonl")]
     lora_gate = gate(run / "eng-lora.jsonl", ref / "force-lora.jsonl", ref / "ref-lora.jsonl", prompts)
-    base_gate = gate(run / "eng-base.jsonl", ref / "force-base.jsonl", ref / "ref-base.jsonl", prompts)
+    control = gate(run / "eng-control.jsonl", ref / "force-lora.jsonl", ref / "ref-lora.jsonl", prompts)
     long_ref, long_ref2 = load(ref / "long-lora.jsonl"), load(ref / "long-lora-run2.jsonl")
     tools, tools_self = same_tools(load(run / "long-lora.jsonl"), long_ref), same_tools(long_ref2, long_ref)
     verdict = {
@@ -122,12 +123,12 @@ def main():
         "prefill_ratio": round(prefill, 4), "prefill_ok": prefill <= PREFILL_MAX,
         "base_drift": round(abs(base1["decode_tps"] - base2["decode_tps"]) / decode_base, 4),
         "zero_is_base": zero_same, "zero_compare": turns,
-        "lora_gate": lora_gate, "base_floor": base_gate,
+        "lora_gate": lora_gate, "control": control, "control_fails": not control["flips_ok"],
         "tool_names": {"engine": tools, "reference_itself": tools_self, "of": len(long_ref)},
         "reference_vs_itself": agreement(tokens(ref / "ref-lora.jsonl"), tokens(ref / "ref-lora-run2.jsonl")),
     }
     verdict["agrees"] = bool(lora_gate["flips_ok"] and lora_gate["gap_ok"] and lora_gate["top5_ok"]
-                             and lora_gate["concentration_ok"] and tools >= tools_self)
+                             and lora_gate["concentration_ok"] and verdict["control_fails"] and tools >= tools_self)
     verdict["met"] = bool(verdict["decode_ok"] and verdict["prefill_ok"] and zero_same and verdict["agrees"])
     (run / "bar.json").write_text(json.dumps(verdict, indent=1) + "\n")
     print(json.dumps(verdict, indent=1))

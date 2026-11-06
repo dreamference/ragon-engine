@@ -82,7 +82,9 @@ Budget: 0.5 to 1 ms per distinct adapter per step.
 4. **Speed**, with one adapter against the base: decode at least 0.95x, prefill time at most 1.25x.
 
 `bench/lora/bar.sh` judges items 2, 3 (against SGLang, teacher-forced; free-running identity is no line, because SGLang
-does not reproduce itself) and 4 in one command; the numbers stay out of this repository.
+does not reproduce itself) and 4 in one command; the numbers stay out of this repository. Item 3 runs on an adapter
+strong enough to clear the two servers' noise, and the engine without the adapter on the same cases has to fail the
+gate: on a weak adapter the gate passes with or without it.
 
 ## 7. Tests
 

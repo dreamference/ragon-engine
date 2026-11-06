@@ -1,13 +1,14 @@
-# The adapters' reference (agree.steps and bar.py read it): a scratch SGLang with production's flags and rand-split: the
-# fixture prompts' greedy continuations with the adapter and on the base, twice each for the reference's own repeatability,
-# each of the first runs teacher-forced from a cold cache (the agreement gate's reference and its self-noise), and the
-# agent prompts' first answers with the adapter, twice.
-# Copies the outputs to LORA_REF (default ~/lora-ref).
+# The adapters' reference (agree.steps and bar.py read it): a scratch SGLang with production's flags and rand-strong (a
+# rand-split whose effect clears the noise, in LIB and in the library SGLang mounts):
+#     make_adapter.py MODEL_DIR rand-strong --b-std 0.016 --targets attn,gdn-split
+# The fixture prompts' greedy continuations with the adapter, twice for the reference's own repeatability, the first
+# teacher-forced from a cold cache (the agreement gate's reference and its self-noise), and the agent prompts' first
+# answers, twice. Copies the outputs to LORA_REF (default ~/lora-ref-strong).
 source $(dirname ${BASH_SOURCE[0]})/common.sh
-A=$HOME/lora-agree; REF=${LORA_REF:-$HOME/lora-ref}; mkdir -p $REF
+A=$HOME/lora-agree; REF=${LORA_REF:-$HOME/lora-ref-strong}; mkdir -p $REF
 # As a node launches it: the modules come from the adapter's config, every key must land (strict).
 SGARGS="lora-sg --port 30000 --add enable-lora --add lora-strict-loading --set max-lora-rank 16 --set max-loras-per-batch 2
-    --set lora-paths rand-split=/root/.cache/dreamference/lora-lib/rand-split"
+    --set lora-paths rand-strong=/root/.cache/dreamference/lora-lib/rand-strong"
 SG() {
   docker rm -f lora-sg > /dev/null 2>&1
   python3 $SRC/bench/sglang/serve.py $SGARGS "$@"
@@ -31,16 +32,12 @@ sg_up() {
 ref() {
   local U=http://127.0.0.1:30000 P="python3 $SRC/bench/agreement/prod.py"
   set -e
-  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P gen $A/ids.jsonl $REF/ref-lora.jsonl 48 1
-  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P gen $A/ids.jsonl $REF/ref-lora-run2.jsonl 48 1
-  RAGON_REF_URL=$U $P gen $A/ids.jsonl $REF/ref-base.jsonl 48 1
-  RAGON_REF_URL=$U $P gen $A/ids.jsonl $REF/ref-base-run2.jsonl 48 1
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-strong $P gen $A/ids.jsonl $REF/ref-lora.jsonl 48 1
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-strong $P gen $A/ids.jsonl $REF/ref-lora-run2.jsonl 48 1
   RAGON_REF_URL=$U $P flush
-  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P force $A/ids.jsonl $REF/ref-lora.jsonl $REF/force-lora.jsonl 1
-  RAGON_REF_URL=$U $P flush
-  RAGON_REF_URL=$U $P force $A/ids.jsonl $REF/ref-base.jsonl $REF/force-base.jsonl 1
-  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P gen $A/ids-long.jsonl $REF/long-lora.jsonl 400 1
-  RAGON_REF_URL=$U RAGON_REF_LORA=rand-split $P gen $A/ids-long.jsonl $REF/long-lora-run2.jsonl 400 1
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-strong $P force $A/ids.jsonl $REF/ref-lora.jsonl $REF/force-lora.jsonl 1
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-strong $P gen $A/ids-long.jsonl $REF/long-lora.jsonl 400 1
+  RAGON_REF_URL=$U RAGON_REF_LORA=rand-strong $P gen $A/ids-long.jsonl $REF/long-lora-run2.jsonl 400 1
 }
 step sg-up sg_up
 step ref ref
