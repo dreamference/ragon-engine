@@ -561,7 +561,7 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
     linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, rows);
-    lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, rows, kv, dkv);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, rows, kv);
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
   }
@@ -607,13 +607,13 @@ void Engine::draft_launch(int B, bool sparse) {
     linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, B, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, B, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, B);
-    lora_draft_site(lrows, l, LoraSite::Qkv, dh2_, H, B, qkv, dq);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dh2_, H, B, qkv);
     kernels::draft_qk_rope(dq_, B, d.heads, dq, L.q_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope(dk_, B, d.kv_heads, dkv, L.k_norm, dpos(), d.rope_theta, d.eps, stream_);
     kernels::draft_attention(dq_, s_->dkc[l], s_->dvc[l], ring_, dk_, dv_, dpos(), B, d.sliding_window - 1, d.heads,
                              d.kv_heads, dattn_, stream_);
     linear_fp4(L.o, dattn_, B, dh2_);
-    lora_draft_site(lrows, l, LoraSite::O, dattn_, dq, B, o, H);
+    lora_draft_site(lrows, l, LoraSite::O, dattn_, dq, B, o);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, B, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, B * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, B, H, d.eps, false, stream_);
@@ -688,13 +688,13 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
     linear_draft_kproj(L.attn_kproj, L.attn_kproj4, dh_, R, dcoef_);
     kernels::grouped_conv(dh_, dcoef_, L.attn_base, 0, dh2_, R, H, d.conv_groups, B, stream_);
     linear_fp4_multi({{&L.q, dq_}, {&L.k, dk_}, {&L.v, dv_}}, dh2_, R);
-    lora_draft_site(lrows, l, LoraSite::Qkv, dh2_, H, R, qkv, dq);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dh2_, H, R, qkv);
     kernels::draft_qk_rope_seqs(dq_, d.heads, dq, L.q_norm, sb, d.rope_theta, d.eps, stream_);
     kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
     kernels::draft_attention_seqs(dq_, kc, vc, ring_, dk_, dv_, sb, d.sliding_window - 1, d.heads, d.kv_heads, dattn_,
                                   stream_);
     linear_fp4(L.o, dattn_, R, dh2_);
-    lora_draft_site(lrows, l, LoraSite::O, dattn_, dq, R, o, H);
+    lora_draft_site(lrows, l, LoraSite::O, dattn_, dq, R, o);
     kernels::grouped_conv(dh2_, dcoef_, L.attn_base, 1, dout_, R, H, d.conv_groups, B, stream_);
     kernels::add_inplace(dres_, dout_, R * H, stream_);
     kernels::rmsnorm(dres_, L.post_norm, dh_, R, H, d.eps, false, stream_);

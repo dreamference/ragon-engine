@@ -540,9 +540,10 @@ class Engine {
   void linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, float*>> ws, const float* x, int M,
                         bool x_ready = false);
   void linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
-                        bool x_ready = false);
+                        bool x_ready = false, const kernels::LoraGemm* lora = nullptr);
   // h_ += x . W^T (the out-projections into the residual stream; the prefill GEMM adds in its epilogue).
-  void linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready = false);
+  void linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready = false,
+                           const kernels::LoraGemm* lora = nullptr);
   // The prefill path (quantized activations, prefill_gemm.cu) or the rows path (stream_gemm.cu)?
   bool quantized(int M) const { return quantized_ || M > kRowsMax; }
   static constexpr int kRowsMax = 32;  // kernels::kMaxStreamRows
@@ -757,6 +758,7 @@ class Engine {
   std::vector<__nv_bfloat16*> lora_pool_;
   size_t lora_slot_bytes_ = 0;
   kernels::LoraSiteDev* lora_sites_ = nullptr;
+  std::vector<kernels::LoraSiteDev> lora_table_;  // lora_sites_'s host copy
   int* lora_seq_dev_ = nullptr;
   float* lora_t_ = nullptr;  // the shrink's output, [max(prefill_chunk, kMaxStreamRows)][kLoraRankRows]
   // The diagnosis probe (RAGON_LORA_SITES, RAGON_LORA_DRAFT_SITES): the sites that launch, one bit per LoraSite.
@@ -775,12 +777,16 @@ class Engine {
   // The batch's rows on adapters, from the segments' sessions; n == 0 when none is on one (nothing to launch).
   kernels::LoraRows lora_rows(std::span<const Seg> segs) const;
   // One site's shrink and expand for the rows on adapters: x is FP32 [M][ldx]; the outputs as LoraSite names them.
+  // The prefill path's site: the shrink now, into parts for the GEMMs that write its outputs (their epilogue adds the
+  // expand), so it runs before them. Every part empty: nothing to add.
+  void lora_prefill_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
+                         kernels::LoraGemm (&parts)[kernels::kLoraOuts]);
   void lora_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
-                 const kernels::LoraOuts& outs, int max_n);
+                 const kernels::LoraOuts& outs);
   // The drafter's: its rows (sessions s[i] with rows[i] rows each, in order) and a site of its layer.
   kernels::LoraRows lora_draft_rows(std::span<Session* const> s, std::span<const int> rows) const;
   void lora_draft_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
-                       const kernels::LoraOuts& outs, int max_n);
+                       const kernels::LoraOuts& outs);
 
   EngineOptions opts_;
   std::unique_ptr<Model> model_;

@@ -1,6 +1,7 @@
 // The engine's LoRA pool (specs/DREAMFERENCE_RAGON_ENGINE_LORA.md §2 and §3): the GPU slots, each one buffer sized for
 // a rank-16 adapter on every site, the descriptor table the kernels read, and a site's shrink and expand for the rows
 // of the sequences on an adapter. A batch with no such row launches nothing, so the base path is main's bit for bit.
+#include <chrono>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +43,7 @@ void Engine::lora_alloc() {
   for (int s = 0; s < opts_.lora_slots; ++s) lora_pool_.push_back(alloc<__nv_bfloat16>(elems));
   lora_sites_ = reinterpret_cast<kernels::LoraSiteDev*>(
       alloc<uint8_t>(size_t(opts_.lora_slots) * c.layers * kLoraSites * sizeof(kernels::LoraSiteDev)));
+  lora_table_.assign(size_t(opts_.lora_slots) * c.layers * kLoraSites, kernels::LoraSiteDev{});
   if (const char* e = std::getenv("RAGON_LORA_SITES")) lora_site_mask_ = static_cast<unsigned>(std::atoi(e));
   if (const char* e = std::getenv("RAGON_LORA_DRAFT_SITES")) lora_draft_mask_ = static_cast<unsigned>(std::atoi(e));
   if (const char* e = std::getenv("RAGON_LORA_MK")) lora_mk_ = std::atoi(e) != 0;
@@ -68,7 +70,7 @@ SlotLayout lay_out(const LoraWeights& w, int layers, __nv_bfloat16* pool, size_t
   for (const LoraSiteWeights& sw : w.sites) {
     if (sw.layer < 0 || sw.layer >= layers || static_cast<int>(sw.site) >= kLoraSites)
       throw std::runtime_error("lora: " + name + ": a site outside the model");
-    if (sw.blocks * w.rank > kernels::kLoraRankRows || sw.segs.size() > size_t(kernels::kLoraSegs) || sw.K % 4)
+    if (sw.blocks * w.rank > lora_a_rows(sw.site) || sw.segs.size() > size_t(kernels::kLoraSegs) || sw.K % 16)
       throw std::runtime_error("lora: " + name + ": a site the kernels cannot take");
     l.a_at.push_back(used);
     used += aligned(sw.a.size());
@@ -131,6 +133,9 @@ void Engine::lora_upload(int slot, const LoraAdapter& adapter) {
   // The layouts first, so an adapter that does not fit changes nothing. The drafter's table is written whatever the
   // adapter carries: an adapter without drafter/ empties it, so the slot's last adapter's drafter part is never read.
   const SlotLayout target = lay_out(adapter.target, c.layers, lora_pool_[su], lora_slot_bytes_, adapter.name);
+  for (const LoraSiteWeights& sw : adapter.target.sites)  // the prefill GEMM adds a segment's rows per 8 outputs
+    for (const LoraSegment& g : sw.segs)
+      if (g.n0 % 8 || g.n1 % 8) throw std::runtime_error("lora: " + adapter.name + ": a segment the kernels cannot take");
   const int dlayers = lora_dsites_ ? draft_->config().layers : 0;
   const LoraWeights none;
   const LoraWeights& dw = adapter.has_drafter && dlayers > 0 ? adapter.drafter : none;
@@ -141,7 +146,21 @@ void Engine::lora_upload(int slot, const LoraAdapter& adapter) {
   side_join();
   check(cudaDeviceSynchronize(), "upload");
   copy_in(adapter.target, target, lora_pool_[su], lora_sites_ + su * c.layers * kLoraSites);
+  std::copy(target.table.begin(), target.table.end(),
+            lora_table_.begin() + static_cast<ptrdiff_t>(su * c.layers * kLoraSites));
   if (dlayers > 0) copy_in(dw, draft, lora_dpool_[su], lora_dsites_ + su * dlayers * kLoraSites);
+}
+
+void Engine::lora_prefill_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
+                               kernels::LoraGemm (&parts)[kernels::kLoraOuts]) {
+  for (kernels::LoraGemm& p : parts) p = kernels::LoraGemm{};
+  if (rows.n == 0 || !(lora_site_mask_ >> static_cast<unsigned>(site) & 1u)) return;
+  const size_t layers = static_cast<size_t>(model_->config().layers), at = size_t(layer) * kLoraSites + static_cast<size_t>(site);
+  // A prompt is one sequence (forward_rows), so one slot, and n > 0 says it has one.
+  const kernels::LoraSiteDev& d = lora_table_[size_t(rows.slot[0]) * layers * kLoraSites + at];
+  if (!d.a) return;
+  kernels::lora_shrink_prefill(x, ldx, M, rows, lora_sites_ + at, static_cast<int>(layers) * kLoraSites, lora_t_, stream_);
+  kernels::lora_gemm_parts(d, lora_t_, parts);
 }
 
 LoraModelShape Engine::lora_shape() const {
@@ -204,12 +223,25 @@ kernels::LoraRows Engine::lora_rows(std::span<const Seg> segs) const {
 }
 
 void Engine::lora_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
-                       const kernels::LoraOuts& outs, int max_n) {
+                       const kernels::LoraOuts& outs) {
   if (rows.n == 0 || !(lora_site_mask_ >> static_cast<unsigned>(site) & 1u)) return;
   const int stride = model_->config().layers * kLoraSites;
   const kernels::LoraSiteDev* d = lora_sites_ + size_t(layer) * kLoraSites + static_cast<size_t>(site);
-  kernels::lora_shrink(x, ldx, M, rows, d, stride, opts_.lora_slots, lora_t_, stream_);
-  kernels::lora_expand(lora_t_, M, rows, d, stride, opts_.lora_slots, outs, max_n, stream_);
+  // RAGON_PROFILE=1: the two kernels apart, under "lora_decode/<kernel>".
+  std::chrono::steady_clock::time_point t0;
+  if (profile_) t0 = std::chrono::steady_clock::now();
+  auto lap = [&](const char* phase) {
+    if (!profile_) return;
+    check(cudaStreamSynchronize(stream_), phase);
+    const auto now = std::chrono::steady_clock::now();
+    phase_seconds_[std::string("lora_decode/") + phase] +=
+        std::chrono::duration<double>(now - t0).count();
+    t0 = now;
+  };
+  kernels::lora_shrink(x, ldx, M, rows, d, stride, lora_a_rows(site), lora_t_, stream_);
+  lap("shrink");
+  kernels::lora_expand(lora_t_, M, rows, d, stride, outs, stream_);
+  lap("expand");
 }
 
 kernels::LoraRows Engine::lora_draft_rows(std::span<Session* const> s, std::span<const int> rows) const {
@@ -225,12 +257,12 @@ kernels::LoraRows Engine::lora_draft_rows(std::span<Session* const> s, std::span
 }
 
 void Engine::lora_draft_site(const kernels::LoraRows& rows, int layer, LoraSite site, const float* x, int ldx, int M,
-                             const kernels::LoraOuts& outs, int max_n) {
+                             const kernels::LoraOuts& outs) {
   if (rows.n == 0 || !(lora_draft_mask_ >> static_cast<unsigned>(site) & 1u)) return;
   const int stride = draft_->config().layers * kLoraSites;
   const kernels::LoraSiteDev* d = lora_dsites_ + size_t(layer) * kLoraSites + static_cast<size_t>(site);
-  kernels::lora_shrink(x, ldx, M, rows, d, stride, opts_.lora_slots, lora_t_, stream_);
-  kernels::lora_expand(lora_t_, M, rows, d, stride, opts_.lora_slots, outs, max_n, stream_);
+  kernels::lora_shrink(x, ldx, M, rows, d, stride, lora_a_rows(site), lora_t_, stream_);
+  kernels::lora_expand(lora_t_, M, rows, d, stride, outs, stream_);
 }
 
 }  // namespace ragon

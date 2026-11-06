@@ -28,6 +28,7 @@
 #include <string>
 
 #include "core/elem.cuh"
+#include "core/lora_kernels.cuh"
 
 namespace ragon::kernels {
 namespace {
@@ -112,6 +113,8 @@ struct GemmArgs {
   // B26: a coded blob's raw scales (128 bytes per (tile, chunk) block), for w and w2; nullptr: the blob carries them.
   const uint8_t* wsf = nullptr;
   const uint8_t* wsf2 = nullptr;
+  // The LORA instantiations: an adapter's expand in the epilogue. Last, for the same reason.
+  LoraGemm lora{};
 };
 
 // The weight row behind row r of a block's B tile (block n0 = blockIdx.y * BN). Plain: row n0 + r. SwiGLU:
@@ -341,7 +344,66 @@ __device__ __forceinline__ void epilogue(const GemmArgs& p, const float (&acc)[4
   }
 }
 
-template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false>
+// The epilogue with an adapter's y += scale * B t (LORA §3): the rows of a warp's fragment, one MMA per 16 of them, added
+// before the single write, so the adapter costs no second pass over a chunk's y. t's four row groups are read once, while
+// the warp's fragments stay in one segment; everything but the stores is the same for every row.
+template <int BN, int STAGES>
+__device__ __forceinline__ void epilogue_lora(const GemmArgs& p, const float (&acc)[4][Shape<BN, STAGES>::kNF][4], int m0,
+                                              int n0, int lane, int wm, int wn) {
+  constexpr int NF = Shape<BN, STAGES>::kNF, WN = BN / 4;
+  const int g = lane >> 2, t = lane & 3;
+  const LoraGemm& l = p.lora;
+  const int r0 = m0 + wm * 64;
+  uint32_t a[4][4] = {};
+  int t_off = -1;
+#pragma unroll
+  for (int j = 0; j < NF; ++j) {
+    const int col = n0 + wn * WN + 8 * j;
+    int sg = 0;
+    while (sg < l.nsegs && (col < l.segs[sg].n0 || col >= l.segs[sg].n1)) ++sg;
+    float d[4][4] = {};
+    if (sg < l.nsegs) {
+      const LoraGemm::Seg& seg = l.segs[sg];
+      if (seg.t_off != t_off) {
+        t_off = seg.t_off;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int ra = r0 + 16 * i + g, rb = ra + 8;
+          const float* ta = l.t + static_cast<size_t>(ra) * kLoraRankRows + t_off;
+          const float* tb = l.t + static_cast<size_t>(rb) * kLoraRankRows + t_off;
+          a[i][0] = ra < p.M ? elem::pack_bf16x2(ta + 2 * t) : 0u;
+          a[i][1] = rb < p.M ? elem::pack_bf16x2(tb + 2 * t) : 0u;
+          a[i][2] = ra < p.M ? elem::pack_bf16x2(ta + 8 + 2 * t) : 0u;
+          a[i][3] = rb < p.M ? elem::pack_bf16x2(tb + 8 + 2 * t) : 0u;
+        }
+      }
+      const __nv_bfloat16* b = l.b + seg.b_off + static_cast<size_t>(col + g - seg.n0) * l.rank;
+      const uint32_t b0 = lora_b_pair(b, 2 * t, l.rank), b1 = lora_b_pair(b, 2 * t + 8, l.rank);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) lora_mma(d[i], a[i][0], a[i][1], a[i][2], a[i][3], b0, b1);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int row = r0 + 16 * i + g + 8 * h;
+        if (row >= p.M) continue;
+        // The base's arithmetic, then the adapter's term: every B zero leaves the base's bits.
+        float2 v = make_float2(acc[i][j][2 * h] * p.alpha, acc[i][j][2 * h + 1] * p.alpha);
+        float2* dst = reinterpret_cast<float2*>(p.y + static_cast<size_t>(row) * p.ldy + col + 2 * t);
+        if (p.accumulate) {
+          const float2 o = *dst;
+          v.x += o.x;
+          v.y += o.y;
+        }
+        v.x += d[i][2 * h] * l.scale;
+        v.y += d[i][2 * h + 1] * l.scale;
+        *dst = v;
+      }
+  }
+}
+
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false, bool LORA = false>
 __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
   using S = Shape<BN, STAGES>;
   constexpr int NF = S::kNF;
@@ -372,7 +434,8 @@ __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
     compute_stage<FP4, BN, STAGES>(smem + (kt % STAGES) * S::kStageBytes, acc, lane, wm, wn);
   }
   cp_wait<0>();
-  epilogue<BN, STAGES, SWIGLU, OUT_BF16>(p, acc, m0, n0, lane, wm, wn);
+  if constexpr (LORA) epilogue_lora<BN, STAGES>(p, acc, m0, n0, lane, wm, wn);
+  else epilogue<BN, STAGES, SWIGLU, OUT_BF16>(p, acc, m0, n0, lane, wm, wn);
 }
 
 // ---- Activation quantization, as production's kernels do it (activations are BF16 there, so each value is
@@ -568,17 +631,17 @@ void check_launch(const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false>
+template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false, bool LORA = false>
 void launch_shape(const GemmArgs& p, cudaStream_t s) {
   using S = Shape<BN, STAGES>;
   static bool configured = false;
   if (!configured) {
-    cudaFuncSetAttribute(prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16>,
+    cudaFuncSetAttribute(prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16, LORA>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSmemBytes);
     configured = true;
   }
   const dim3 grid((p.M + kBM - 1) / kBM, (SWIGLU ? 2 * p.N : p.N) / BN);
-  prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16><<<grid, kThreads, S::kSmemBytes, s>>>(p);
+  prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16, LORA><<<grid, kThreads, S::kSmemBytes, s>>>(p);
 }
 
 // RAGON_GEMM_SHAPE (experiments): 0 automatic, 1: 128 x 128 x 4 stages, 2: 128 x 256 x 3 stages.
@@ -590,15 +653,15 @@ int gemm_shape() {
   return v;
 }
 
-template <bool FP4, bool OUT_BF16 = false>
+template <bool FP4, bool OUT_BF16 = false, bool LORA = false>
 void launch_gemm(const GemmArgs& p, cudaStream_t s) {
   if (p.N % 128 != 0 || p.K % 128 != 0) throw std::runtime_error("prefill_gemm: N % 128 and K % 128 must be 0");
   if (p.M < 1) return;
   int shape = gemm_shape();
   // 128 x 256 tiles (measured +12-25% on the NVFP4 matrices at 512-2,048 rows) when they still give two waves.
   if (shape == 0) shape = (p.M + kBM - 1) / kBM * (p.N / 256) >= 96 ? 2 : 1;
-  if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 3, false, OUT_BF16>(p, s);
-  else launch_shape<FP4, 128, 4, false, OUT_BF16>(p, s);
+  if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 3, false, OUT_BF16, LORA>(p, s);
+  else launch_shape<FP4, 128, 4, false, OUT_BF16, LORA>(p, s);
   check_launch(FP4 ? "prefill_gemm_nvfp4" : "prefill_gemm_fp8");
 }
 
@@ -706,6 +769,17 @@ void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uin
 void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
                       bool accumulate, cudaStream_t s) {
   launch_gemm<false>(GemmArgs{xq, nullptr, w, alpha, y, ldy, M, N, K, accumulate}, s);
+}
+
+void prefill_gemm_fp8_lora(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
+                           bool accumulate, const LoraGemm& lora, cudaStream_t s) {
+  if (lora.nsegs == 0) {
+    prefill_gemm_fp8(xq, M, w, alpha, y, ldy, N, K, accumulate, s);
+    return;
+  }
+  GemmArgs p{xq, nullptr, w, alpha, y, ldy, M, N, K, accumulate};
+  p.lora = lora;
+  launch_gemm<false, false, true>(p, s);
 }
 
 void prefill_gemm_fp8_bf16out(const uint8_t* xq, int M, const uint8_t* w, float alpha, __nv_bfloat16* y, int ldy, int N,

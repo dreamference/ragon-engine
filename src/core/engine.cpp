@@ -1213,13 +1213,16 @@ void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, 
 }
 
 void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
-                              bool x_ready) {
+                              bool x_ready, const kernels::LoraGemm* lora) {
   if (quantized(M)) {
     for (const auto& [w, y] : ws) {
       if (!(x_ready && xq_is(w->in_scale, false))) kernels::quant_act_fp8(x, M, w->K, w->in_scale, xq_, stream_);
       set_xq(w->in_scale, false);
       x_ready = true;
-      kernels::prefill_gemm_fp8(xq_, M, w->w, w->in_scale * w->scale, y, w->N, w->N, w->K, false, stream_);
+      if (lora)
+        kernels::prefill_gemm_fp8_lora(xq_, M, w->w, w->in_scale * w->scale, y, w->N, w->N, w->K, false, *lora++, stream_);
+      else
+        kernels::prefill_gemm_fp8(xq_, M, w->w, w->in_scale * w->scale, y, w->N, w->N, w->K, false, stream_);
     }
     return;
   }
@@ -1233,7 +1236,7 @@ void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, 
   kernels::stream_gemm_multi(false, xh_, xinv_, M, t, n, K, stream_);
 }
 
-void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready) {
+void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready, const kernels::LoraGemm* lora) {
   const int H = model_->config().hidden;
   if (!quantized(M)) {
     linear_fp8(w, x, M, t1_);
@@ -1242,7 +1245,10 @@ void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool
   }
   if (!(x_ready && xq_is(w.in_scale, false))) kernels::quant_act_fp8(x, M, w.K, w.in_scale, xq_, stream_);
   set_xq(w.in_scale, false);
-  kernels::prefill_gemm_fp8(xq_, M, w.w, w.in_scale * w.scale, h_, H, w.N, w.K, true, stream_);
+  if (lora)
+    kernels::prefill_gemm_fp8_lora(xq_, M, w.w, w.in_scale * w.scale, h_, H, w.N, w.K, true, *lora, stream_);
+  else
+    kernels::prefill_gemm_fp8(xq_, M, w.w, w.in_scale * w.scale, h_, H, w.N, w.K, true, stream_);
 }
 
 bool Engine::norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M, float in_scale, bool nvfp4, bool f32) {
@@ -1375,6 +1381,15 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     const int slot = layer_slot_[li];
+    // An adapter on the prefill path: the site's shrink, before the GEMMs whose epilogue adds its expand.
+    kernels::LoraGemm lora_parts[kernels::kLoraOuts];
+    const auto prefill_site = [&](LoraSite site, const float* x, int ldx, const char* phase) -> const kernels::LoraGemm* {
+      if (!lora_on || !quantized_) return nullptr;
+      mark(phase);
+      lora_prefill_site(lrows, li, site, x, ldx, M, lora_parts);
+      mark("lora");
+      return lora_parts;
+    };
     const kernels::MkTail post_tail{h_, L.post_norm, xn_, xh_, xinv_, c.eps};
     bool post_normed = false;
     bool span_done = false, pre_normed_next = false;  // stage 4 (RAGON_MK_SPAN): this layer's mixer and FFN in one launch
@@ -1437,8 +1452,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     if (mk_attn) {
     } else if (L.full) {
       NvtxRange r("attention");
-      linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half);
-      if (lora_on) {
+      linear_fp8_multi({{&L.q, q_gate_}, {&L.k, k_}, {&L.v, v_}}, xn_, M, xn_half, prefill_site(LoraSite::Qkv, xn_, H, "attn_proj"));
+      if (lora_on && !quantized_) {
+        mark("attn_proj");
         kernels::LoraOuts outs;
         outs.y[0] = q_gate_;
         outs.ld[0] = 2 * qsize;
@@ -1446,7 +1462,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         outs.ld[1] = c.kv_heads * c.head_dim;
         outs.y[2] = v_;
         outs.ld[2] = c.kv_heads * c.head_dim;
-        lora_site(lrows, li, LoraSite::Qkv, xn_, H, M, outs, std::max(2 * qsize, c.kv_heads * c.head_dim));
+        lora_site(lrows, li, LoraSite::Qkv, xn_, H, M, outs);
+        mark("lora");
       }
       if (!quantized_) kernels::l2_prefetch_weights(L.o.w, false, false, L.o.N, L.o.K, hint_attn, stream_);
       mark("attn_proj");
@@ -1490,12 +1507,14 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);
       }
       mark("attn_core");
-      linear_fp8_residual(L.o, attn_, M, quantized_);
-      if (lora_on) {
+      linear_fp8_residual(L.o, attn_, M, quantized_, prefill_site(LoraSite::O, attn_, qsize, "attn_proj"));
+      if (lora_on && !quantized_) {
+        mark("attn_proj");
         kernels::LoraOuts outs;
         outs.y[0] = h_;
         outs.ld[0] = H;
-        lora_site(lrows, li, LoraSite::O, attn_, qsize, M, outs, H);
+        lora_site(lrows, li, LoraSite::O, attn_, qsize, M, outs);
+        mark("lora");
       }
       mark("attn_proj");
     } else if (bf16_gdn) {
@@ -1610,7 +1629,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           // RAGON_LORA_MK: the Gdn site's shrink of xn now, its expand in the in_qkv and in_z tiles (no tail with an
           // adapter, so the Out site's delta goes after the kernel, as the unfused path adds it).
           const kernels::LoraSiteDev* d = lora_sites_ + size_t(li) * kLoraSites + static_cast<size_t>(LoraSite::Gdn);
-          kernels::lora_shrink(xn_, H, M, lrows, d, c.layers * kLoraSites, opts_.lora_slots, lora_t_, stream_);
+          kernels::lora_shrink(xn_, H, M, lrows, d, c.layers * kLoraSites, lora_a_rows(LoraSite::Gdn), lora_t_, stream_);
           p.lora_rows = &lrows;
           p.lora_site = d;
           p.lora_stride = c.layers * kLoraSites;
@@ -1627,7 +1646,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           kernels::LoraOuts outs;
           outs.y[0] = h_;
           outs.ld[0] = H;
-          lora_site(lrows, li, LoraSite::Out, normed_, Vs, M, outs, H);
+          lora_site(lrows, li, LoraSite::Out, normed_, Vs, M, outs);
         }
         mark("gdn_proj");
       } else if (fork) {
@@ -1659,14 +1678,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       } else {
       // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
       float* qkv_out = verify ? v_pre_[slot] : quantized_ ? t2_ : mixed;
-      linear_fp8_multi({{&L.in_qkv, qkv_out}, {&L.in_z, z_}}, xn_, M, xn_half);
-      if (lora_on) {
+      linear_fp8_multi({{&L.in_qkv, qkv_out}, {&L.in_z, z_}}, xn_, M, xn_half, prefill_site(LoraSite::Gdn, xn_, H, "gdn_proj"));
+      if (lora_on && !quantized_) {
+        mark("gdn_proj");
         kernels::LoraOuts outs;
         outs.y[0] = qkv_out;
         outs.ld[0] = C;
         outs.y[1] = z_;
         outs.ld[1] = Vs;
-        lora_site(lrows, li, LoraSite::Gdn, xn_, H, M, outs, std::max(C, Vs));
+        lora_site(lrows, li, LoraSite::Gdn, xn_, H, M, outs);
+        mark("lora");
       }
       if (!quantized_) kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
       if (quantized_) {  // tensor cores, row-invariant for any M
@@ -1731,12 +1752,14 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       } else {
         kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
       }
-      linear_fp8_residual(L.out, normed_, M, quantized_);
-      if (lora_on) {
+      linear_fp8_residual(L.out, normed_, M, quantized_, prefill_site(LoraSite::Out, normed_, Vs, "gdn_proj"));
+      if (lora_on && !quantized_) {
+        mark("gdn_proj");
         kernels::LoraOuts outs;
         outs.y[0] = h_;
         outs.ld[0] = H;
-        lora_site(lrows, li, LoraSite::Out, normed_, Vs, M, outs, H);
+        lora_site(lrows, li, LoraSite::Out, normed_, Vs, M, outs);
+        mark("lora");
       }
       mark("gdn_proj");
       }  // not forked

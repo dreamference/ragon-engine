@@ -38,6 +38,11 @@ enum class LoraSite : uint8_t { Qkv = 0, O = 1, Gdn = 2, Out = 3 };
 constexpr int kLoraSites = 4;
 constexpr int kLoraMaxRank = 16;
 constexpr int kLoraMaxBlocks = 4;  // A blocks of one site (the split form: in_proj_q, _k, _v and _z)
+
+// A rows a site can have: q, k and v; the Gdn site's split form; one projection.
+constexpr int lora_a_rows(LoraSite site) {
+  return kLoraMaxRank * (site == LoraSite::Qkv ? 3 : site == LoraSite::Gdn ? kLoraMaxBlocks : 1);
+}
 constexpr int kLoraMaxSegs = 4;    // B segments of one site
 constexpr int kLoraMaxOuts = 3;    // outputs of one site
 

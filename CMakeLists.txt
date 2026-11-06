@@ -87,6 +87,9 @@ target_link_libraries(ragon_api PUBLIC ragon_core ragon_tokenizer PkgConfig::IMA
 # ragon-run: token ids or text in, tokens out; the correctness and speed harness.
 add_executable(ragon-run tools/ragon_run.cpp)
 target_link_libraries(ragon-run PRIVATE ragon_api)
+# ragon-force: the engine side of the agreement study and of the adapters' bar (bench/lora/bar.sh).
+add_executable(ragon-force bench/agreement/ragon_force.cpp)
+target_link_libraries(ragon-force PRIVATE ragon_api)
 
 # ragon-template: the chat template, and the Responses-to-prompt conversion, without a model.
 add_executable(ragon-template tools/ragon_template.cpp)
