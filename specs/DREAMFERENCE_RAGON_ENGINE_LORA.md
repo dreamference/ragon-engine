@@ -79,8 +79,10 @@ Budget: 0.5 to 1 ms per distinct adapter per step.
 3. **Agreement with an adapter**, against SGLang with the same adapter (the reference) and transformers with PEFT
    (the second opinion): the agreement gate's lines with the vision tower's tolerance
    ([VISION §20.5](./DREAMFERENCE_RAGON_ENGINE_VISION.md), items 3 and 5).
-4. **Speed**, with one adapter against the base: decode at least 0.95x, prefill time at most 1.25x. `bench/lora/bar.sh`
-   measures it in one command; the numbers stay out of this repository.
+4. **Speed**, with one adapter against the base: decode at least 0.95x, prefill time at most 1.25x.
+
+`bench/lora/bar.sh` judges items 2, 3 (against SGLang, teacher-forced; free-running identity is no line, because SGLang
+does not reproduce itself) and 4 in one command; the numbers stay out of this repository.
 
 ## 7. Tests
 
