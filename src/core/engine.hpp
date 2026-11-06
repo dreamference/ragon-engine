@@ -22,6 +22,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -345,6 +346,7 @@ class Engine {
     const SamplingParams* params = nullptr;  // as speculate()'s
     std::vector<float>* row_logits = nullptr;
     std::vector<int> out;      // as speculate() returns: the accepted drafts, then the next token
+    int rows = 0;              // the rows it verified in a batch: its block, or its tree (a batch of one: not set)
     std::exception_ptr error;  // a non-finite row (NonFiniteLogits): nothing committed, the session reset
   };
   // Whether session i's next speculative step can join a batch: speculation possible for p and room for a full
@@ -530,6 +532,7 @@ class Engine {
   struct Seg {
     Session* s;
     int row0, rows;
+    const kernels::TreeDesc* td = nullptr;  // a batched verify's tree for this sequence (tree_ is the one-row step's)
   };
   void forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs);
   // The rows path's linear layers take x through an FP16 copy; `x_ready` reuses the previous call's copy
@@ -690,7 +693,11 @@ class Engine {
   void plan_draft(StepPlan& sp, int B, bool graph);            // the drafter's block and the lattice walk
   // The lattice walk over the drafter's candidates and scores for this sequence (E rows of each).
   void plan_walk(StepPlan& sp, int B, const int* cand, const float* scores);
+  // BACKLOG 26: the chain and its tree (scores: this sequence's), when the step takes one and it is full and worth its
+  // rows; desc gets its description.
+  void plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc);
   void plan_accept(StepPlan& sp, const float* vals, const int* ids);  // rows' top K -> accepted, next
+  void plan_gather(StepPlan& sp);                                     // a tree's accepted path to the first rows
   void plan_count(StepPlan& sp);                               // the session's counters and shadow records
   // The batch's verify: every plan's rows (pin_->rows) in one pass, then each sequence's top K at its rows.
   void verify_batch_launch(std::span<StepPlan> plans, int V);
@@ -745,7 +752,7 @@ class Engine {
     float scores[kernels::kMaxStreamRows * 16 * 16];
     float topk_vals[kernels::kMaxStreamRows * 64];
     int topk_ids[kernels::kMaxStreamRows * 64];
-    kernels::TreeDesc tree;                     // a tree verify's description (BACKLOG 26)
+    kernels::TreeDesc tree[kernels::kMaxSeqs];  // a tree verify's description per sequence (BACKLOG 26)
     int gather_rows[kernels::kMaxStreamRows];  // its accepted path's rows
     int lora_slot[kernels::kMaxSeqs];          // the step's sequences' adapter slots (-1: the base), for lora_seq_dev_
   };
@@ -903,13 +910,14 @@ class Engine {
   // the decay and the write strength, for up to 32 rows.
   std::vector<float*> v_pre_, v_post_, v_g_, v_beta_;
   float* conv_tmp_ = nullptr;
-  // Tree verification (BACKLOG 26): the device copy of pin_->tree, set as tree_ while a tree verify's pass runs;
+  // Tree verification (BACKLOG 26): the device copies of pin_->tree, one per sequence of a batch; tree_dev_[0] is
+  // set as tree_ while a one-sequence tree verify's pass runs (a batch's sequences carry theirs in Seg::td);
   // tree_grid_ gdn paths launched (fixed per configuration, the unused ones exit at once).
   kernels::TreeDesc* tree_dev_ = nullptr;
   const kernels::TreeDesc* tree_ = nullptr;
   int tree_grid_ = 1;
   int* gather_rows_dev_ = nullptr;
-  bool tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const;
+  bool tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const;
   // The drafter-off guard (BACKLOG 10): its configuration, and whether it applies to requests with p.
   DraftGuardConfig guard_cfg_;
   bool guarded(const SamplingParams& p) const {
@@ -1001,7 +1009,7 @@ class Engine {
     kernels::GatherBuf* gather = nullptr;  // the buffers a tree's accepted path is gathered in (device)
     int ngather = 0;
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
-    std::map<std::pair<int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, count), slot > 0
+    std::map<std::tuple<int, int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, row0, count), slot > 0
     // With commit_overlap, commit_graphs and batch_commit_graphs hold the drafter's context KV only, and these the
     // DeltaNet replay on commit_stream_, keyed by (first row, count).
     std::map<std::pair<int, int>, cudaGraphExec_t> state_commit_graphs;

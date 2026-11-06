@@ -59,7 +59,7 @@
 // the two then take steps in turn, as ragon-serve interleaves two requests. Per sequence the tokens, the state,
 // the drafter's context, the steps and the accepted drafts must equal the run alone. Greedy and sampled
 // (--temperature, default 1, seeded by --seed or 1), and with the pair swapped. Tree verification (BACKLOG 26)
-// stays on, as in ragon-serve: this is the check of the sampled tree beside a prefill (--batch-check runs the chain).
+// stays on, as in ragon-serve: this is the check of the sampled tree beside a prefill (--batch-check, of the tree in a batch).
 // A drafter context that differs only in its last bits leaves greedy tokens alone but moves a sampled draft's q,
 // so the sampled runs see it first; the drafter's context is compared for the greedy ones.
 //
@@ -82,9 +82,8 @@
 // in chunks of --prefill-chunk-contended tokens while the other decodes alone, then the two batched, each way
 // round. Per sequence the tokens, the state, the drafter's context, the steps and the accepted drafts must equal the
 // prompt decoded alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the
-// batch both replay step graphs (the batch path's own since stage 4). A batch verifies the chain, so the check runs
-// with tree verification (BACKLOG 26, on by default) off: the runs alone then take the chain as well, step for step
-// (RAGON_TREE set in the environment still overrides this).
+// batch both replay step graphs (the batch path's own since stage 4). Tree verification (BACKLOG 26) stays on: a
+// batched sequence takes the tree it takes alone, step for step, and the check prints how many it took.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -507,7 +506,6 @@ int main(int argc, char** argv) {
     opts.sparse_head_dir = sparse_head_dir;
     opts.sparse_head_dynamic = sparse_head_dynamic;
     opts.sessions = sessions;
-    if (batch_check) opts.tree_nodes = 0;  // the chain alone, as a batch verifies (see --batch-check above)
     opts.side_prefill = side_prefill;
     opts.vision = !all_images.empty() || !vision_check.empty();
     if (!lora.empty()) opts.lora_slots = 1;
@@ -862,9 +860,10 @@ int main(int argc, char** argv) {
           run_batch({&q[0], &q[1]});
           const ragon::SpecStats& s = engine.session_spec_stats(q[0].session);
           const ragon::SpecStats& o = engine.session_spec_stats(q[1].session);
-          std::printf("batch bench pair %zu: A %zu out, %ld steps (%ld batched); B %zu out, %ld steps (%ld batched); "
-                      "A's step %.1f ms; B's %.1f ms (draft %.1f, verify %.1f, commit %.1f)\n",
-                      pi / 2, q[0].out.size(), s.steps, s.batched_steps, q[1].out.size(), o.steps, o.batched_steps,
+          std::printf("batch bench pair %zu: A %zu out, %ld steps (%ld batched, %ld trees); B %zu out, %ld steps (%ld batched, "
+                      "%ld trees); A's step %.1f ms; B's %.1f ms (draft %.1f, verify %.1f, commit %.1f)\n",
+                      pi / 2, q[0].out.size(), s.steps, s.batched_steps, s.tree_steps, q[1].out.size(), o.steps,
+                      o.batched_steps, o.tree_steps,
                       1e3 * (s.draft_seconds + s.verify_seconds + s.commit_seconds) / s.steps,
                       1e3 * (o.draft_seconds + o.verify_seconds + o.commit_seconds) / o.steps,
                       1e3 * o.draft_seconds / o.steps, 1e3 * o.verify_seconds / o.steps, 1e3 * o.commit_seconds / o.steps);
@@ -915,22 +914,23 @@ int main(int argc, char** argv) {
               run_batch({&q[f], &q[o]});
             }
             Result r[2];
-            long batched[2];
+            long batched[2], trees[2];
             for (int k = 0; k < 2; ++k) {
               r[k] = result_of(q[k]);
               batched[k] = engine.session_spec_stats(q[k].session).batched_steps;
+              trees[k] = engine.session_spec_stats(q[k].session).tree_steps;
             }
             const bool same[2] = {r[0] == alone[0], r[1] == alone[1]};
             failures += !same[0] + !same[1];
-            std::printf("pair %zu, %s, %s%s: A %zu prompt tokens, %zu out, %ld steps (%ld batched) %ld accepted: %s | "
-                        "B %zu prompt tokens, %zu out, %ld steps (%ld batched) %ld accepted: %s\n",
+            std::printf("pair %zu, %s, %s%s: A %zu prompt tokens, %zu out, %ld steps (%ld batched, %ld trees) %ld accepted: "
+                        "%s | B %zu prompt tokens, %zu out, %ld steps (%ld batched, %ld trees) %ld accepted: %s\n",
                         pi / 2, sampled ? "sampled" : "greedy", names[run],
                         run >= 2 ? (" (" + std::to_string(chunks_beside) + " chunks beside " +
                                     std::to_string(steps_beside) + " steps)").c_str()
                                  : "",
-                        P[0]->size(), r[0].tokens.size(), r[0].steps, batched[0], r[0].accepted,
+                        P[0]->size(), r[0].tokens.size(), r[0].steps, batched[0], trees[0], r[0].accepted,
                         same[0] ? "identical" : "DIFFERS", P[1]->size(), r[1].tokens.size(), r[1].steps, batched[1],
-                        r[1].accepted, same[1] ? "identical" : "DIFFERS");
+                        trees[1], r[1].accepted, same[1] ? "identical" : "DIFFERS");
             for (int k = 0; k < 2; ++k)
               if (!same[k]) {
                 size_t i = 0;

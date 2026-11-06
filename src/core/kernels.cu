@@ -478,10 +478,11 @@ __global__ void __launch_bounds__(32)
 
 // tree_gather: block (i, j) moves row rows[j] of buffer i to row j (j ascending is safe in place: rows[j] >= j, and no
 // earlier destination is a later source). One block per buffer, the rows in order.
-__global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int* __restrict__ rows, int n, DevPos pos) {
+__global__ void tree_gather_kernel(const GatherBuf* __restrict__ bufs, const int* __restrict__ rows, int n, DevPos pos,
+                                   int row0) {
   pdl_begin();  // first statement: see launch.cuh
   const GatherBuf b = bufs[blockIdx.x];
-  const size_t off = b.pos_rel ? static_cast<size_t>(pos_value(pos)) : 0;
+  const size_t off = static_cast<size_t>(b.pos_rel ? pos_value(pos) : row0);
   for (int j = 1; j < n; ++j) {
     const int r = rows[j];
     if (r == j) continue;
@@ -840,9 +841,9 @@ void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, c
   }
 }
 
-void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s) {
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s, int row0) {
   if (nbufs <= 0 || n <= 1) return;
-  launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos);
+  launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos, row0);
 }
 
 void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,

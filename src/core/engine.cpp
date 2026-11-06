@@ -1320,11 +1320,17 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // A segment's position. A captured graph (one sequence, the active one) reads it from pos_dev_ (dpos); the
   // batch path runs eagerly at each session's own position.
   auto seg_pos = [&](const Seg& g, int off) {
-    return use_dev_pos_ ? dpos(off) : kernels::DevPos(g.s->pos + off).with_rope(g.s->rope_delta, nullptr);
+    const auto i = &g - segs.data();
+    return use_dev_pos_ ? kernels::DevPos(g.s->pos + off, pos_dev_ + i, off).with_rope(0, rdelta_dev_ + i)
+                        : kernels::DevPos(g.s->pos + off).with_rope(g.s->rope_delta, nullptr);
   };
   // Several sequences (M4 stage 4): the state kernels take them all in one launch, each row at its sequence's
   // position and in its sequence's caches and state; a captured graph reads the positions from pos_dev_[i].
   const bool multi = segs.size() > 1;
+  // A batch with a tree in it (BACKLOG 26) goes sequence by sequence through the state kernels: a tree's rows read
+  // their ancestors, which the joint kernels do not know. A segment's tree is its own, its rows counted from its row0.
+  const bool joint = multi && std::none_of(segs.begin(), segs.end(), [](const Seg& g) { return g.td; });
+  auto seg_tree = [&](const Seg& g) { return !verify ? nullptr : g.td ? g.td : tree_; };
   if (segs.size() > static_cast<size_t>(kernels::kMaxSeqs)) throw std::runtime_error("forward: too many sequences");
   kernels::SeqBatch sb;
   sb.n = static_cast<int>(segs.size());
@@ -1470,7 +1476,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
       // attention over it.
       const int kvsize = c.kv_heads * c.head_dim;
-      if (multi) {
+      if (joint) {
         kernels::SeqPtrs<__nv_bfloat16> kc, vc;
         kernels::SeqPtrs<const __nv_bfloat16> kcr, vcr;
         kernels::SeqPtrs<const uint64_t> pg;
@@ -1484,19 +1490,19 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
                                      use_dev_pos_ ? opts_.max_context : 0, pg);
       }
-      for (const Seg& g : multi ? std::span<const Seg>() : segs) {
+      for (const Seg& g : joint ? std::span<const Seg>() : segs) {
         const size_t r0 = g.row0;
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
                               q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_,
-                              verify ? tree_ : nullptr, mrope, g.s->pages);
+                              seg_tree(g), mrope, g.s->pages);
         // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
         // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
         for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
           const int n = std::min(kAttnSlice, g.rows - q0);
           kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
                                   c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
-                                  use_dev_pos_ ? opts_.max_context : 0, verify ? tree_ : nullptr, g.s->pages);
+                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages);
         }
       }
       if (quantized_) {
@@ -1700,22 +1706,26 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       }
       mark("gdn_proj");
       const bool keep = quantized_ && keep_at > 0 && keep_at < M;
-      if (verify && tree_) {  // a tree (BACKLOG 26): each row's taps are its ancestors', the window left unwritten
-        kernels::gdn_conv_tree(v_pre_[slot], mixed, s_->conv[slot], L.conv, M, C, tree_, stream_);
-      } else if (verify) {
+      if (verify && joint) {  // per sequence (M4 §2), from its own conv window, left unwritten
         check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
               "verify inputs");
-        // Per sequence (M4 §2), from its own conv window, left unwritten.
-        if (multi) {
-          kernels::SeqPtrs<const float> st;
-          for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
-          kernels::gdn_conv_seqs(mixed, st, L.conv, sb, C, stream_);
-        }
-        for (const Seg& sg : multi ? std::span<const Seg>() : segs) {
+        kernels::SeqPtrs<const float> st;
+        for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
+        kernels::gdn_conv_seqs(mixed, st, L.conv, sb, C, stream_);
+      } else if (verify) {
+        for (const Seg& sg : segs) {
+          const size_t r0 = sg.row0;
+          if (const kernels::TreeDesc* td = seg_tree(sg)) {  // a tree (BACKLOG 26): each row's taps are its ancestors'
+            kernels::gdn_conv_tree(v_pre_[slot] + r0 * C, mixed + r0 * C, sg.s->conv[slot], L.conv, sg.rows, C, td, stream_);
+            continue;
+          }
+          check(cudaMemcpyAsync(mixed + r0 * C, v_pre_[slot] + r0 * C, size_t(sg.rows) * C * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream_),
+                "verify inputs");
           check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream_),
                 "verify conv");
-          kernels::gdn_conv(mixed + size_t(sg.row0) * C, conv_tmp_, L.conv, sg.rows, C, stream_);
+          kernels::gdn_conv(mixed + r0 * C, conv_tmp_, L.conv, sg.rows, C, stream_);
         }
       } else if (quantized_) {
         kernels::gdn_conv_prefill(t2_, mixed, s_->conv[slot], L.conv, M, C, stream_,
@@ -1728,16 +1738,18 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
                                        stream_, keep ? keep_target().gdn[slot] : nullptr, keep_at);
-      else if (verify && tree_)  // a tree (BACKLOG 26), from the state, left unwritten
-        kernels::gdn_recurrent_tree(mixed, g, beta, s_->gdn[slot], core_, c.lin_k_heads, c.lin_v_heads, tree_,
-                                    tree_grid_, stream_);
-      else if (multi) {  // a verify: each sequence from its own state, left unwritten
+      else if (joint) {  // a verify: each sequence from its own state, left unwritten
         kernels::SeqPtrs<const float> st;
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
         kernels::gdn_recurrent_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, c.lin_v_heads, stream_);
       } else
         for (const Seg& sg : segs) {  // per sequence, from its own state (a verify leaves it unwritten)
           const size_t r0 = sg.row0;
+          if (const kernels::TreeDesc* td = seg_tree(sg)) {  // a tree (BACKLOG 26)
+            kernels::gdn_recurrent_tree(mixed + r0 * C, g + r0 * c.lin_v_heads, beta + r0 * c.lin_v_heads, sg.s->gdn[slot],
+                                        core_ + r0 * Vs, c.lin_k_heads, c.lin_v_heads, td, tree_grid_, stream_);
+            continue;
+          }
           kernels::gdn_recurrent(mixed + r0 * C, g + r0 * c.lin_v_heads, beta + r0 * c.lin_v_heads, sg.s->gdn[slot],
                                  verify ? nullptr : sg.s->gdn[slot], core_ + r0 * Vs, sg.rows, c.lin_k_heads,
                                  c.lin_v_heads, stream_);

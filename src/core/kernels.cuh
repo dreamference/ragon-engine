@@ -135,8 +135,8 @@ void gdn_conv_tree(const float* pre, float* post, const float* state, const __nv
 void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, const float* state_in, float* out,
                         int H, int HV, const TreeDesc* td, int ngdn, cudaStream_t s);
 // After a tree verify's accept: the accepted path's rows rows[j] (j < n, rows[j] >= j, rows[0] = 0) moved to row j in
-// every buffer of `bufs` (row r of buffer i at base + (r + (pos_rel ? pos : 0)) * stride bytes, row_bytes long), in
-// place, j ascending.
+// every buffer of `bufs` (row r of buffer i at base + (r + (pos_rel ? pos : row0)) * stride bytes, row_bytes long), in
+// place, j ascending. row0: where a batched sequence's rows start in the buffers its batch shares (rows[] are its own).
 // A paged KV buffer (P4): `pages` is its session's page table and row r is at base + pages[r / kKvPageTokens] *
 // page_unit + (r % kKvPageTokens) * stride bytes (page_unit: the bytes of one table unit, an element).
 struct GatherBuf {
@@ -147,7 +147,7 @@ struct GatherBuf {
   const uint64_t* pages = nullptr;
   int page_unit = 0;
 };
-void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s);
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s, int row0 = 0);
 // P4: the KV of positions [from, to) between a session's pages (pool, its device page table) and a flat buffer
 // [layer_kv][kv head][buf_len][D] whose first position is buf_start (the prefix KV store's layout); layer_kv counts
 // every full-attention layer's K and V (2 x layers). to_buf: into the buffer. A copy: the bits are unchanged.

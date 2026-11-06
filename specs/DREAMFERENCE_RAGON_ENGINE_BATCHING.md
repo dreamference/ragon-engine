@@ -103,7 +103,7 @@ At four conversations the default-engine bar's per-conversation floor (34.6 tok/
 
 ### 2.3 Exactness
 
-Engine greedy: 16/16 turns identical to one stream at 2, 3 and 4 streams cold and at 2 and 4 warm and, with `prompt_cache_key`, at 2, 3 and 4 warm (W11; its one-stream run is also 16/16 identical to the cold one-stream run). Seeded sampling: 12-15/16 identical. That is expected and exact: a batched step verifies the 12-row chain while a one-row step verifies the 16-row tree, so the accepted lengths and with them the random draws differ; each draw is still from the exact distribution (SPECULATION §10). SGLang sampled 0-1/16 (its speculative draws are unseeded: not a correctness signal); SGLang greedy is not batch-invariant: cold, 3/16, 2/16 and 2/16 turns identical to its one-stream run at 2, 4 and 8 streams, warm 2/16, 5/16 and 5/16 (and 0/16 identical to the engine's: different kernels, a different model of exactness).
+Engine greedy: 16/16 turns identical to one stream at 2, 3 and 4 streams cold and at 2 and 4 warm and, with `prompt_cache_key`, at 2, 3 and 4 warm (W11; its one-stream run is also 16/16 identical to the cold one-stream run). Seeded sampling: 12-15/16 identical. That was expected and exact: a batched step verified the 12-row chain while a one-row step verified the 16-row tree, so the accepted lengths and with them the random draws differed; each draw is still from the exact distribution (SPECULATION §10). Both verify the tree now (§5.1): `--batch-check`, sampled and greedy, finds a sequence's tokens, state, steps and accepted drafts equal to its run alone; the 12-15/16 above is not re-measured. SGLang sampled 0-1/16 (its speculative draws are unseeded: not a correctness signal); SGLang greedy is not batch-invariant: cold, 3/16, 2/16 and 2/16 turns identical to its one-stream run at 2, 4 and 8 streams, warm 2/16, 5/16 and 5/16 (and 0/16 identical to the engine's: different kernels, a different model of exactness).
 
 ### 2.4 The batched step in place
 
@@ -135,9 +135,9 @@ A second suspect was found after the freeze: the tokenizer's BPE cache (an `unor
 
 A step model that fits W5 and the nsys breakdown: step(N, L) ~= 99 + (N - 1) x c(L) ms, where c(L) ~= 0.37 ms per 1K tokens of the sequence's context (attention) + ~9 (the DeltaNet path outside the megakernel) + 3-5 (more rows through the stream GEMMs and the FFN); c(27K) ~= 22.5 measured. At N = 4 and 32K that is ~170 ms; at the chain's agentlong ~6.2 tokens per step that is ~145 tokens/s aggregate greedy, against SGLang's ~135 while four decode (M0, 148 ms step) and OVERVIEW §7's target of >= 175. Two changes take it there: the DeltaNet path of a batch in one persistent launch (the single stream's megakernel generalised to N, about -6 ms per added sequence) and the tree inside the batch (+8-9% tokens per step on agentlong, BACKLOG 26; the W5 raw-text pair shows +22%, an upper end), ~185 tokens/s.
 
-### 3.2 Why a batch loses the tree
+### 3.2 The tree in a batch
 
-`fit = kMaxStreamRows / draft_block` = 32 / 12 = 2, so a batch of two verifies two 12-row chains and a one-row step verifies the tree (16 rows, 17-24 on main since tree/rows). Three or four sequences do not fit one pass at all today; they take turns in pairs. The stream GEMMs hold 230-240 GB/s only up to about 32 rows (item 31), so going wider needs a 33-64-row tier that is row-invariant (each row's result independent of the others in the tile) to keep the outputs bit for bit.
+`fit = kMaxStreamRows / draft_block` = 32 / 12 = 2, so sequences step in pairs, and since the tree in a batch (§5.1) each verifies its tree: 16 rows at the default shape, 8 of chain and 7 nodes beyond the root, 32 rows for the pair. Before it, a batch of two verified two 12-row chains and only a one-row step verified the tree. Three or four sequences do not fit one pass; they take turns in pairs. The stream GEMMs hold 230-240 GB/s only up to about 32 rows (item 31), so going wider needs a 33-64-row tier that is row-invariant (each row's result independent of the others in the tile) to keep the outputs bit for bit.
 
 ### 3.3 Prefill interference dominates the real workload
 
@@ -189,6 +189,19 @@ The engine is the default when, on node-b, with the agentlong set:
 ### 5.1 The row budget
 
 `kMaxStreamRows` 32 -> 64, with the per-row arrays it sizes (the tree's `depth`/`var`/`path`, `gdn_step`, `kMkFfnWords`, `kMkGdnWords`) and a `stream_gemm` tier for 33-64 rows that is row-invariant; `kMaxSeqs` stays 4 (8 only with P4). The scheduler's `fit` becomes a per-sequence row share by batch size: two sequences x up to 24 tree rows (48), three or four x 16 rows (48-64: the tree at its 16-row shape, or the chain at 12 when a sequence's acceptance says the tree does not pay). The share is a fixed function of the batch size, not of the other sequences' acceptance, so a seeded sequence's draws are identical whenever the batch shape is.
+
+**What runs today, without any of that: the tree in a batch of two.** Two 16-row trees fill the 32 rows the stream GEMMs and the FFN megakernel already take, so `kMaxStreamRows` stays 32 and `fit` stays 2, and P1's cost (the megakernel lost above 32 rows) never arises. Each sequence has its own `TreeDesc`; attention, the DeltaNet conv and the recurrence run per sequence with their trees at a row offset, and `tree_gather` takes the sequence's first row. Verify graphs are captured per session order and verify shape, so up to 4 x the chain's count.
+
+Measured on the engine box, 20 prose requests at four sessions, greedy, main and this alternating twice:
+
+| | main | tree in a batch | |
+|---|---:|---:|---:|
+| accepted drafts per sequence step | 2.577, 2.568 | 3.345, 3.345 | +29.8%, +30.3% |
+| verify ms per sequence step | 91.7, 90.8 | 100.5, 100.0 | +10% |
+| tok/s per request | 19.64, 20.19 | 22.67, 22.08 | +12% on the means |
+| tok/s aggregate | 66.41, 67.63 | 76.31, 75.32 | +13% on the means |
+
+Batched share 0.97-1.00; a batched sequence accepts what it accepts alone (3.35). Code-short at four, batched share 0.46, one run: accepted 5.31 -> 5.56, tok/s per request 28.4 -> 29.1, aggregate 69.2 -> 69.5. Output: 20/20 and 8/8 identical to main at four, at two and across the rounds. One stream, 52 turns: all identical, the same verify passes, 50.27 -> 50.42 tok/s.
 
 ### 5.2 N sequences in one pass
 
@@ -275,7 +288,7 @@ Each phase merges into main once its exactness gate passes and nothing regresses
 | C1 | Scheduling: warm appends first, shortest prime first, the prime's share capped (§5.5) | greedy 16/16 at 2 and 4 warm; §4 items 1-2 measured | **merged 2026-11-04**: shortest prefill first with a 5 s yield cap, and `--side-share 16`. C's TTFT 20.5 -> 1.43 s; four warm conversations' pooled decode 25.7 -> 35.6 tok/s at the same round time; the side stream's SM count stays 40 (§2.2) |
 | C2 | The fused pass: one weight read for a decode verify and a prefill chunk, each path's arithmetic unchanged (§5.5) | memcmp of each fused projection against its two kernels; `--interleave-check`; greedy 16/16 at 2 and 4 warm and cold | decode beside a prime ~130-150 ms instead of 205-313; warm rounds from ~145 s towards ~80 s at four. Prototype (branches `batching/c2-fused-gemm`, `batching/c2-fp8-prefill`, not merged): every fused projection bit-exact (214 + 336 memcmp cases). An L2 prefetch of each FP8 weight tile two chunks ahead takes the FP8 prefill GEMM at 256 rows from 98 to 160 GB/s, exact, with agentlong 16/16 at one stream. Pass estimate 180-188 ms beside 12-16 decode rows; integration into ragon-serve next |
 | P2 | Three and four sequences in one pass: the row share by batch size, graphs per batch size captured at start (§5.2), the batched DeltaNet path in the persistent kernel | `--batch-check` at 3 and 4; greedy 16/16; no memory growth after start beyond 1 GB at 4 sessions | four decoding at ~145 -> ~185 tokens/s instead of pairs in turn (144 ms a step each) |
-| P1 | The tree inside a batch of two: 2 x up to 24 rows, `kMaxStreamRows` 64 and the 33-64-row tier | `--batch-check` with trees; greedy 2-vs-1 16/16; one stream unchanged | built (branch `batching/p1-tree-batch`): +3% at two (129.0 ms and 135 steps against 119.6 and 150 for 1,000 tokens), less than the +8-9% hoped for, because the FFN megakernel does not take more than 32 rows; parked behind C1, C2 and P2 |
+| P1 | The tree inside a batch of two: 2 x up to 24 rows, `kMaxStreamRows` 64 and the 33-64-row tier | `--batch-check` with trees; greedy 2-vs-1 16/16; one stream unchanged | built (branch `batching/p1-tree-batch`): +3% at two (129.0 ms and 135 steps against 119.6 and 150 for 1,000 tokens), less than the +8-9% hoped for, because the FFN megakernel does not take more than 32 rows; parked behind C1, C2 and P2. Its 16-row half landed without the raise (§5.1): the tree in a batch of two, at 32 rows, +30% accepted drafts and +12-13% tok/s on batched prose. What stays parked is the 24-row shape and the 33-64-row tier |
 | P4 | Paged KV and shared prefix pages (§5.3), in steps P4a-P4d behind `--kv-pages` | each step's gate in §5.3: memcmp paged against flat (`ragon-paged-tests`); the engine's checks with `--kv-pages`; agentlong greedy 16/16 at 1, 2 and 4 streams at `--sessions 4 --max-context 262144`, and with a small pool; one stream within noise | four or more conversations at the full 262,144 context (the owner's decision of 2026-11-04): a pool of ~1.02M positions on node-b instead of four 262,144-position slots that do not fit; then Ragon's recipe passes `--sessions 4 --batch 4`. Design 2026-11-04, P4a started |
 | P5 | FP8 KV (32 KB a token) behind the quality gate | VALIDATION §13's quality gate (not exact: a switch, off by default) | 2x the sessions per GB |
 

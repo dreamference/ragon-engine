@@ -360,6 +360,7 @@ struct Running {
   bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
   std::chrono::steady_clock::time_point yield_t0;
   int batched = 0;       // its decode steps taken in a batch with another request (M4 stage 3)
+  int step_rows = 0;     // the rows its last batched step verified (a block, or its tree)
   long admitted = 0;     // the order of admission (P4b: the last resort ends the request admitted last)
   bool kv_wait = false;  // its last decode turn waited for KV pages (P4b)
   Periods alone, beside;  // step periods without and with another request's prefill in between
@@ -701,7 +702,7 @@ class Scheduler {
     }
     for (Running* r : batch) {
       s.sessions.push_back(r->job.session);
-      s.rows.push_back(!decode ? 0 : batch.size() == 1 ? alone_rows : ctx_.engine->draft_block());
+      s.rows.push_back(!decode ? 0 : batch.size() == 1 ? alone_rows : r->step_rows);
       s.tokens.push_back(decode ? static_cast<int>(r->pending.size()) : 0);
       s.left.push_back(r->prefilling ? prefill_left(*r) : 0);
     }
@@ -877,7 +878,9 @@ class Scheduler {
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.batched_steps += 1;
-      ctx_.metrics.batch_rows = static_cast<int>(batch.size()) * eng.draft_block();  // a full block each
+      int rows = 0;  // each sequence's block, or its tree
+      for (size_t i = 0; i < batch.size(); ++i) rows += batch[i]->step_rows = steps[i].rows;
+      ctx_.metrics.batch_rows = rows;
     }
     for (size_t i = 0; i < batch.size(); ++i) {
       Running& r = *batch[i];

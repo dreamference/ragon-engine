@@ -277,6 +277,33 @@ void bench_attention() {
   cudaFree(dq), cudaFree(dgate), cudaFree(dout), cudaFree(dscr);
 }
 
+// tree_gather with row0: a batched sequence's accepted rows move within its own rows of the buffers the batch shares,
+// the other sequence's and the rows past its path stay; a KV buffer (pos_rel) goes by the position, whatever row0.
+bool check_gather_row0() {
+  constexpr int kRows = 40, kBytes = 32, kRow0 = 16, kPos = 8;
+  std::vector<unsigned char> h(size_t(kRows) * kBytes);
+  for (size_t i = 0; i < h.size(); ++i) h[i] = static_cast<unsigned char>(i / kBytes + 1);
+  const std::vector<int> path = {0, 2, 5, 7};
+  auto expect = [&](int off) {
+    std::vector<unsigned char> e = h;
+    for (size_t j = 1; j < path.size(); ++j)
+      std::memcpy(&e[size_t(off + j) * kBytes], &h[size_t(off + path[j]) * kBytes], kBytes);
+    return e;
+  };
+  unsigned char* row_buf = upload(h);
+  unsigned char* kv_buf = upload(h);
+  const std::vector<k::GatherBuf> bufs = {{reinterpret_cast<char*>(row_buf), kBytes, kBytes, 0},
+                                          {reinterpret_cast<char*>(kv_buf), kBytes, kBytes, 1}};
+  k::GatherBuf* dbufs = upload(bufs);
+  int* drows = upload(path);
+  k::tree_gather(dbufs, int(bufs.size()), drows, int(path.size()), k::DevPos(kPos), nullptr, kRow0);
+  cudaDeviceSynchronize();
+  const bool ok = download(row_buf, h.size()) == expect(kRow0) && download(kv_buf, h.size()) == expect(kPos);
+  std::printf("%s tree_gather at row0\n", ok ? "ok  " : "FAIL");
+  for (void* p : {(void*)row_buf, (void*)kv_buf, (void*)dbufs, (void*)drows}) cudaFree(p);
+  return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -296,6 +323,7 @@ int main(int argc, char** argv) {
                                  std::tuple{8, 7, 16}, std::tuple{8, 23, 16}, std::tuple{11, 0, 1}, std::tuple{3, 28, 2},
                                  std::tuple{1, 30, 16}, std::tuple{15, 16, 16}})
     ok &= check_gdn(rng, E, nodes, width);
+  ok &= check_gather_row0();
   std::printf(ok ? "all tree tests passed\n" : "TREE TESTS FAILED\n");
   return ok ? 0 : 1;
 }

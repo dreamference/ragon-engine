@@ -212,7 +212,7 @@ void Engine::alloc_drafter() {
   if (const char* e = std::getenv("RAGON_DRAFT_ON_MARGIN")) opts_.draft_on_margin = std::atof(e);
   if (const char* e = std::getenv("RAGON_DRAFT_OFF_SAMPLED")) opts_.draft_off_sampled = std::atoi(e) != 0;
   set_draft_guard(opts_.draft_off_below, opts_.draft_on_margin);
-  tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(sizeof(kernels::TreeDesc)));
+  tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(kernels::kMaxSeqs * sizeof(kernels::TreeDesc)));
   gather_rows_dev_ = alloc<int>(kernels::kMaxStreamRows);
   tree_grid_ = std::min(kernels::kMaxTreeVariants, 1 + std::max(0, opts_.tree_nodes));
   // Each session's buffers a tree's accepted path is gathered in: every full-attention layer's K and V per KV head
@@ -423,11 +423,10 @@ void Engine::draft_head(int n, int E, const uint8_t* const* masks) {
   kernels::draft_head_rows(b, dh_, n, E, masks, K16, dunary_, dcand_, stream_);
 }
 
-bool Engine::tree_step(const SamplingParams& p, bool use_lookup, bool want_logits, int B) const {
-  (void)p;
+bool Engine::tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const {
   const int rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
   return opts_.tree_nodes > 0 && !use_lookup && !want_logits && B == opts_.draft_block &&
-         rows <= kernels::kMaxStreamRows && s_->pos + rows <= opts_.max_context;
+         rows <= kernels::kMaxStreamRows && s.pos + rows <= opts_.max_context;
 }
 
 bool Engine::can_speculate(const SamplingParams& p) const {
@@ -757,7 +756,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
 void Engine::verify_launch(int V, int K, bool tree) {
   const ModelConfig& c = model_->config();
   if (tree) {  // the tree's description (BACKLOG 26), read by the attention and DeltaNet kernels of this pass
-    check(cudaMemcpyAsync(tree_dev_, &pin_->tree, sizeof(kernels::TreeDesc), cudaMemcpyHostToDevice, stream_), "tree");
+    check(cudaMemcpyAsync(tree_dev_, &pin_->tree[0], sizeof(kernels::TreeDesc), cudaMemcpyHostToDevice, stream_), "tree");
     tree_ = tree_dev_;
   }
   try {
@@ -880,6 +879,43 @@ void Engine::plan_walk(StepPlan& sp, int B, const int* cand, const float* scores
     sp.picks[e] = pick;
     prev = pick;
   }
+}
+
+void Engine::plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc) {
+  if (!tree_step(*sp.s, sp.use_lookup, want_logits, B)) return;
+  TreeShape shape;
+  shape.nodes = opts_.tree_nodes;
+  shape.temp = opts_.tree_temp;
+  shape.width = opts_.tree_width;
+  shape.max_depth = opts_.tree_max_depth;
+  shape.chain = opts_.tree_chain;
+  sp.tr = build_tree(sp.anchor, sp.cand.data(), scores, sp.E, draft_->config().selector_top_k,
+                     std::vector<int>(sp.rows.begin() + 1, sp.rows.end()), sp.picks, shape);
+  if (sp.tr.rows() == std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes &&  // a full tree (the graph's shape),
+      sp.tr.extra_mass >= opts_.tree_min_mass) {                              // worth its rows
+    describe_tree(sp.tr, desc);
+    sp.tree = true;
+    sp.rows = sp.tr.token;
+    sp.V = sp.tr.rows();
+  }
+}
+
+void Engine::plan_gather(StepPlan& sp) {
+  // The accepted path's rows to the sequence's first rows (KV slots, DeltaNet inputs, target features), so the commit
+  // is the chain's; its tokens become the step's rows.
+  const int n = static_cast<int>(sp.path.size());
+  bool moved = false;
+  for (int j = 0; j < n; ++j) moved = moved || sp.path[j] != j;
+  if (moved) {
+    std::copy(sp.path.begin(), sp.path.end(), pin_->gather_rows);
+    check(cudaMemcpyAsync(gather_rows_dev_, pin_->gather_rows, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+          "tree path");
+    kernels::tree_gather(sp.s->gather, sp.s->ngather, gather_rows_dev_, n, kernels::DevPos(sp.s->pos), stream_, sp.row0);
+    check(cudaStreamSynchronize(stream_), "tree gather");
+  }
+  std::vector<int> toks(n);
+  for (int j = 0; j < n; ++j) toks[j] = sp.tr.token[sp.path[j]];
+  sp.rows = toks;
 }
 
 void Engine::plan_accept(StepPlan& sp, const float* vals, const int* ids) {
@@ -1013,24 +1049,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     }
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
-  if (tree_step(p, sp.use_lookup, row_logits != nullptr, B)) {  // BACKLOG 26: the chain and its tree
-    const int K16 = draft_->config().selector_top_k;
-    TreeShape shape;
-    shape.nodes = opts_.tree_nodes;
-    shape.temp = opts_.tree_temp;
-    shape.width = opts_.tree_width;
-    shape.max_depth = opts_.tree_max_depth;
-    shape.chain = opts_.tree_chain;
-    sp.tr = build_tree(anchor, sp.cand.data(), pin_->scores, sp.E, K16,
-                       std::vector<int>(sp.rows.begin() + 1, sp.rows.end()), sp.picks, shape);
-    if (sp.tr.rows() == std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes &&  // a full tree (the graph's shape),
-        sp.tr.extra_mass >= opts_.tree_min_mass) {                              // worth its rows
-      describe_tree(sp.tr, pin_->tree);
-      sp.tree = true;
-      sp.rows = sp.tr.token;
-      sp.V = sp.tr.rows();
-    }
-  }
+  plan_tree(sp, B, pin_->scores, row_logits != nullptr, pin_->tree[0]);
   const int V = sp.V, K = sp.K;  // rows verified, top K per row
   kv_ensure(*s_, s_->pos, s_->pos + V, stream_);  // P4b: mapped above (kv_step_rows bounds V); a no-op check
   auto t1 = std::chrono::steady_clock::now();
@@ -1047,23 +1066,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   }
   check(cudaStreamSynchronize(stream_), "verify");
   plan_accept(sp, pin_->topk_vals, pin_->topk_ids);  // 3. accept
-  if (sp.tree) {
-    // The accepted path's rows to rows 0 .. n - 1 (KV slots, DeltaNet inputs, target features), so the commit is
-    // the chain's; its tokens become the step's rows.
-    const int n = static_cast<int>(sp.path.size());
-    bool moved = false;
-    for (int j = 0; j < n; ++j) moved = moved || sp.path[j] != j;
-    if (moved) {
-      std::copy(sp.path.begin(), sp.path.end(), pin_->gather_rows);
-      check(cudaMemcpyAsync(gather_rows_dev_, pin_->gather_rows, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
-            "tree path");
-      kernels::tree_gather(s_->gather, s_->ngather, gather_rows_dev_, n, kernels::DevPos(s_->pos), stream_);
-      check(cudaStreamSynchronize(stream_), "tree gather");
-    }
-    std::vector<int> toks(n);
-    for (int j = 0; j < n; ++j) toks[j] = sp.tr.token[sp.path[j]];
-    sp.rows = toks;
-  }
+  if (sp.tree) plan_gather(sp);
   if (std::FILE* f = dump_file(); f && !sp.use_lookup && !sp.tree) {
     const int K16 = draft_->config().selector_top_k;
     const int hdr[9] = {0x54524545, s_->pos, anchor, sp.E, K16, K, sp.accepted, sp.next, sp.greedy ? 1 : 0};
@@ -1129,7 +1132,13 @@ bool Engine::drafter_off(int session, const SamplingParams& p) const {
 void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
   const ModelConfig& c = model_->config();
   std::vector<Seg> segs;
-  for (const StepPlan& sp : plans) segs.push_back({sp.s, sp.row0, sp.V});
+  for (size_t i = 0; i < plans.size(); ++i) {
+    const StepPlan& sp = plans[i];
+    if (sp.tree)  // read by the state kernels of this pass, as verify_launch's is
+      check(cudaMemcpyAsync(tree_dev_ + i, &pin_->tree[i], sizeof(kernels::TreeDesc), cudaMemcpyHostToDevice, stream_),
+            "tree");
+    segs.push_back({sp.s, sp.row0, sp.V, sp.tree ? tree_dev_ + i : nullptr});
+  }
   forward_rows(pin_->rows, V, Pass::Verify, -1, segs);
   // Each sequence's top K over its own rows (K differs between a greedy and a sampled one), at 64 values per row
   // from its first row on, so the regions never overlap.
@@ -1230,8 +1239,17 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       if (si) ++plans[i].s->spec.sparse_steps;
     }
     check(cudaStreamSynchronize(stream_), "draft");
-    for (int i = 0; i < n; ++i)
-      plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, pin_->scores + size_t(i) * E * K16 * K16);
+    // BACKLOG 26: each sequence's tree, as it takes one alone, while the rows left hold the sequences after it. At the
+    // default shape two trees fit the tier (2 x 16 rows); a batch with a lookup chain verifies chains.
+    const int tree_rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
+    int used = 0;
+    for (int i = 0; i < n; ++i) {
+      const float* scores = pin_->scores + size_t(i) * E * K16 * K16;
+      plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, scores);
+      if (used + tree_rows + (n - 1 - i) * B <= kernels::kMaxStreamRows)
+        plan_tree(plans[i], B, scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
+      used += plans[i].V;
+    }
   } else {
     for (StepPlan& sp : plans) {
       if (sp.use_lookup) continue;
@@ -1240,9 +1258,10 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     }
   }
   int V = 0;
-  for (StepPlan& sp : plans) {
-    sp.row0 = V;
-    V += sp.V;
+  for (int i = 0; i < n; ++i) {
+    plans[i].row0 = V;
+    V += plans[i].V;
+    seqs[i].rows = plans[i].V;
   }
   if (V > kernels::kMaxStreamRows) throw std::runtime_error("speculate_batch: more rows than kMaxStreamRows");
   for (StepPlan& sp : plans) kv_ensure(*sp.s, sp.s->pos, sp.s->pos + sp.V, stream_);  // P4b: mapped above; a check
@@ -1253,8 +1272,8 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
   join_commit();  // the previous step's DeltaNet replays, beside this step's draft until here
   if (graph) {
-    std::vector<int> ks(n);
-    for (int i = 0; i < n; ++i) ks[i] = plans[i].K;
+    std::vector<int> ks(n);  // each sequence's top K, and whether it is a tree (a full one: its rows are fixed)
+    for (int i = 0; i < n; ++i) ks[i] = 2 * plans[i].K + (plans[i].tree ? 1 : 0);
     run_graph(bg->verify[ks], "verify", [&] { verify_batch_launch(plans, V); });
   } else {
     verify_batch_launch(plans, V);
@@ -1265,6 +1284,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     const size_t at = size_t(sp.row0) * 64;
     try {
       plan_accept(sp, pin_->topk_vals + at, pin_->topk_ids + at);
+      if (sp.tree) plan_gather(sp);
     } catch (const NonFiniteLogits&) {
       seqs[i].error = std::current_exception();
       sp.failed = true;
@@ -1289,14 +1309,16 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     s_ = sp.s;
     if (commit_overlap_) commit_state_async(sp.row0, k, graph);
     if (graph) {
-      // Slot i's commit reads its position from pos_dev_[i] and its rows from row i * B; slot 0's is the one-row
-      // step's own commit graph (the same rows, the same position slot).
+      // Slot i's commit reads its position from pos_dev_[i] and its rows from row0 (which depends on whether the
+      // sequences before it took trees); slot 0's is the one-row step's own commit graph (the same rows, the same
+      // position slot).
       cudaGraphExec_t* g = nullptr;
       if (i == 0) {
-        if (s_->commit_graphs.size() < size_t(B) + 1) s_->commit_graphs.resize(size_t(B) + 1, nullptr);
+        const size_t count = size_t(std::max(B, sp.V)) + 1;
+        if (s_->commit_graphs.size() < count) s_->commit_graphs.resize(count, nullptr);
         g = &s_->commit_graphs[k];
       } else {
-        g = &s_->batch_commit_graphs[{i, k}];
+        g = &s_->batch_commit_graphs[{i, sp.row0, k}];
       }
       dpos_slot_ = i;
       try {
