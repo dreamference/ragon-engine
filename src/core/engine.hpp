@@ -763,9 +763,9 @@ class Engine {
   float* lora_t_ = nullptr;  // the shrink's output, [max(prefill_chunk, kMaxStreamRows)][kLoraRankRows]
   // The diagnosis probe (RAGON_LORA_SITES, RAGON_LORA_DRAFT_SITES): the sites that launch, one bit per LoraSite.
   unsigned lora_site_mask_ = ~0u, lora_draft_mask_ = ~0u;
-  // RAGON_LORA_MK=1 (default off): with an adapter, a verify's DeltaNet mixer keeps its megakernel (stage 2), the Gdn
+  // With an adapter, a verify's DeltaNet mixer keeps its megakernel (stage 2; RAGON_LORA_MK=0 turns that off), the Gdn
   // site's delta in its in_qkv and in_z tiles, the Out site's after it; the other fused paths stay off.
-  bool lora_mk_ = false;
+  bool lora_mk_ = true;
   // The drafter's pool and table, the same per slot (lora_dsites_[(slot * draft layers + layer) * kLoraSites + site],
   // Qkv and O only): a slot whose adapter has no drafter/ has every entry empty, so the drafter runs as the base.
   std::vector<__nv_bfloat16*> lora_dpool_;
