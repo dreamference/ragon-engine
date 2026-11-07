@@ -49,7 +49,8 @@ __device__ __forceinline__ int rope_delta(const DevPos& p) { return p.rdelta_dev
 // Several sequences' rows in one launch (M4 stage 4, the batched verify and drafter): sequence i owns rows
 // [row0[i], row0[i + 1]) of the launch, at positions pos(i) + (row - row0[i]). Passed by value, so a launch captured
 // into a CUDA graph keeps the row split; the positions come from pos_dev (written before each replay) when set.
-constexpr int kMaxSeqs = 4;
+// Every row its own sequence at most (BATCHING P4d: a fan-out's forks decode one row each).
+constexpr int kMaxSeqs = 32;
 // P4 (BATCHING §5.3, --kv-pages): positions per KV page. A page holds them for every full-attention layer's K and V,
 // [layer][K, V][kv head][kKvPageTokens][D]; a session's page table holds each page's element offset into the pool
 // (uint64_t), one entry per kKvPageTokens positions, and a kernel given a null table reads the flat layout. A multiple
@@ -262,6 +263,12 @@ void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16
 // The verify's recurrence: each sequence's rows from its own state (read, not written).
 void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<const float> state, float* out,
                         const SeqBatch& b, int H, int HV, cudaStream_t s);
+// A joint commit (BATCHING P4d, Engine::step_batch): gdn_conv_seqs and gdn_recurrent_seqs that also write each
+// sequence's state, as gdn_conv and gdn_recurrent do for one. `mixed` of the conv is overwritten; `out` is scratch.
+void gdn_conv_commit_seqs(float* mixed, SeqPtrs<float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
+                          cudaStream_t s);
+void gdn_recurrent_commit_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<float> state, float* out,
+                               const SeqBatch& b, int H, int HV, cudaStream_t s);
 
 // RMSNorm (as rmsnorm) that also writes the FP16 copy and scales to_half_rows would make from its output.
 void rmsnorm_half(const float* x, const __nv_bfloat16* w, float* out, __half* xh, float* xinv, int rows, int H, float eps,

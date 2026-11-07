@@ -173,6 +173,21 @@ static void test_repetition() {
     const auto r = ragon::serve::resolve_repetition(req(R"(,"repetition_detection":{"max_pattern_size":1})"), server);
     EXPECT(r.max_pattern_size == 1 && r.min_pattern_size == 1);
   }
+  {  // `n`: one by default and when null; an integer from 1 to kMaxChoices, anything else a 400
+    EXPECT(req("").n == 1);
+    EXPECT(req(R"(,"n":null)").n == 1);
+    EXPECT(req(R"(,"n":32)").n == 32);
+    EXPECT(req(R"(,"n":128)").n == ragon::serve::kMaxChoices);
+    for (const char* bad : {R"(,"n":0)", R"(,"n":129)", R"(,"n":"2")", R"(,"n":1.5)", R"(,"n":true)"}) {
+      bool threw = false;
+      try {
+        req(bad);
+      } catch (const std::invalid_argument&) {
+        threw = true;
+      }
+      EXPECT(threw);
+    }
+  }
   auto refused = [&](const std::string& extra) {
     try {
       ragon::serve::resolve_repetition(req(extra), server);

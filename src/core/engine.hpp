@@ -216,6 +216,7 @@ struct SpecStats {
   // draft, verify and commit times are the batch's wall times, charged to each sequence in it, so a session's
   // seconds per step read as its own step period.
   long batched_steps = 0;
+  long fanout_steps = 0;  // BATCHING P4d: plain steps taken inside step_batch (not in `steps` or `batched_steps`)
   // BACKLOG 26: tree verifies, those whose accepted path left the chain, and the off-chain tokens they accepted.
   long tree_steps = 0, tree_branch_steps = 0, tree_off_chain = 0;
   // BACKLOG 19: drafts with the sparse head, and the session's switches to the full head (its fallback).
@@ -356,6 +357,19 @@ class Engine {
   // due (BACKLOG 10); speculate() then takes that step.
   bool drafter_off(int session, const SamplingParams& p) const;
   void speculate_batch(std::span<SeqStep> seqs);
+  // BATCHING P4d, a fan-out: several sessions take one plain step each (the row of `anchor`, then the next token) in
+  // one pass, one row per sequence, at most kMaxSeqs. Each row's logits and each token drawn from a seeded request
+  // are those of step() and sample() alone. `out` is the next token and `rows` 1; `row_logits`, when given, the row's
+  // logits. A non-finite row fails only its sequence: `error` set, its session reset. Needs the verify's buffers (a
+  // drafter, or more than one session).
+  bool can_step_batch(int session) const;
+  void step_batch(std::span<SeqStep> seqs);
+  // BATCHING P4d, a fork: the active session becomes a copy of session `from` at the end of its history, with no
+  // forward pass and no copy of its KV (its pages are shared, and only the page the history ends in is copied, when
+  // it ends inside one): the same logits, tokens and state as a separate request with that prompt would get. The fork
+  // draws its first token from the parent's prompt logits (logits()). KvPoolExhausted, with nothing changed, when the
+  // pool is short by kv_fork_need's count. `from` must not be running a pass.
+  void fork_session(int from);
   // The active session's speculation counters (each session counts its own steps, M4 §3), its lookup
   // shadow records scored as far as known.
   const SpecStats& spec_stats() {
@@ -500,6 +514,8 @@ class Engine {
   // The pages the next decode step of session i maps (a speculative one: every row its verify may write, the tree's
   // included; else one row). speculate() and speculate_batch() map them before anything else of the step.
   int kv_step_need(int session, bool spec, const KvGone* gone = nullptr) const;
+  // The pool pages fork_session(from) takes on session `to` (0 with flat slots).
+  int kv_fork_need(int from, int to, const KvGone* gone = nullptr) const;
   // Session i's pages released and the session emptied (an idle conversation evicted for the pool's sake: its next
   // turn prefills from scratch or from the prefix KV store). The slot becomes free for a new session.
   void kv_evict(int session);
@@ -672,6 +688,9 @@ class Engine {
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
+  void alloc_verify_rows();  // the buffers a Verify pass keeps its rows in: with a drafter, or for step_batch
+  // step_batch's commit: rows 0 .. n - 1 into their sessions' DeltaNet state, in one launch per kernel and layer.
+  void commit_seqs(std::span<Session* const> rows, cudaStream_t st, float* out);
   void alloc_sparse_head();
   // The drafter's head over n sequences' E rows each of dh_: dunary_ and dcand_ (the top K16 values and token ids per
   // row); sequence i's from the sparse head over masks[i] (its session's fixed list and context, BACKLOG 19), or the

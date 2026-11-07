@@ -54,6 +54,7 @@ add_library(ragon_core STATIC
   src/core/model.cu
   src/core/engine.cpp
   src/core/engine_lora.cpp
+  src/core/engine_fanout.cpp
   src/core/prefix_kv.cpp
   src/core/lora.cpp
   src/core/lora_kernels.cu

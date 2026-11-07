@@ -52,9 +52,13 @@ class RepetitionDetector {
   int last_ = -1, same_ = 0;
 };
 
+// The most choices (`n`) one request may ask for.
+inline constexpr int kMaxChoices = 128;
+
 struct Request {
   bool chat = true;
   bool stream = false;
+  int n = 1;  // choices (chat and completions; BATCHING P4d: each past the first a fork of the first's session)
   bool include_usage = false;
   std::string model;                // as the request names it; empty when it names none (adapter_of)
   std::string prompt_text;          // the rendered prompt (chat) or the given prompt (completions)

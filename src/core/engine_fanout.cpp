@@ -1,0 +1,232 @@
+// A fan-out (BATCHING P4d): a fork of a session (no copy of its KV, a copy of its per-sequence state), and many
+// sessions' plain steps, one row each, in one pass. Kept apart from speculate.cpp: no speculation here and nothing of
+// the one-stream path.
+#include <algorithm>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "core/engine.hpp"
+#include "core/kernels.cuh"
+#include "core/sampling.hpp"
+
+namespace ragon {
+
+namespace {
+void check(cudaError_t e, const char* what) {
+  if (e != cudaSuccess) throw std::runtime_error(std::string("fan-out: ") + what + ": " + cudaGetErrorString(e));
+}
+
+// The top K a row's token needs: 1 for greedy, its top_k when the GPU's top K covers it, 0 when the host must see every
+// logit (penalties, or a top_k above what the kernel returns).
+int row_top_k(const SamplingParams& p) {
+  if (p.presence_penalty != 0.f || p.repetition_penalty != 1.f) return 0;
+  if (p.temperature <= 0.f) return 1;
+  return p.top_k > 0 && p.top_k <= 64 ? p.top_k : 0;
+}
+}  // namespace
+
+void Engine::alloc_verify_rows() {
+  if (topk_scratch_) return;
+  const ModelConfig& c = model_->config();
+  const int B = kernels::kMaxStreamRows, C = c.lin_conv_channels();
+  topk_scratch_ = alloc<float>(kernels::topk_scratch_floats(B, 64));
+  vals_dev_ = alloc<float>(size_t(B) * 64);
+  ids_out_dev_ = alloc<int>(size_t(B) * 64);
+  for (size_t i = 0; i < s_->gdn.size(); ++i) {
+    v_pre_.push_back(alloc<float>(size_t(B) * C));
+    v_post_.push_back(alloc<float>(size_t(B) * C));
+    v_g_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
+    v_beta_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
+  }
+}
+
+void Engine::commit_seqs(std::span<Session* const> rows, cudaStream_t st, float* out) {
+  const ModelConfig& c = model_->config();
+  kernels::SeqBatch sb;
+  sb.n = static_cast<int>(rows.size());
+  for (int i = 0; i < sb.n; ++i) sb.row0[i + 1] = i + 1;
+  for (int li = 0; li < c.layers; ++li) {
+    const LayerWeights& L = model_->layers()[li];
+    if (L.full) continue;  // the verify already wrote the KV
+    const int slot = layer_slot_[li];
+    kernels::SeqPtrs<float> conv, gdn;
+    for (int i = 0; i < sb.n; ++i) {
+      conv.p[i] = rows[i]->conv[slot];
+      gdn.p[i] = rows[i]->gdn[slot];
+    }
+    kernels::gdn_conv_commit_seqs(v_pre_[slot], conv, L.conv, sb, c.lin_conv_channels(), st);
+    kernels::gdn_recurrent_commit_seqs(v_post_[slot], v_g_[slot], v_beta_[slot], gdn, out, sb, c.lin_k_heads,
+                                       c.lin_v_heads, st);
+  }
+}
+
+bool Engine::can_step_batch(int session) const {
+  return topk_scratch_ && opts_.max_context - sessions_.at(session).pos >= 1;
+}
+
+void Engine::step_batch(std::span<SeqStep> seqs) {
+  if (seqs.empty()) return;
+  const int n = static_cast<int>(seqs.size());
+  if (n > kernels::kMaxSeqs) throw std::runtime_error("step_batch: more sequences than kMaxSeqs");
+  for (const SeqStep& q : seqs) {
+    if (q.session < 0 || q.session >= sessions() || !q.params) throw std::runtime_error("step_batch: bad entry");
+    if (!can_step_batch(q.session)) throw std::runtime_error("step_batch: a sequence cannot join the batch");
+    for (const SeqStep& o : seqs)
+      if (&o != &q && o.session == q.session) throw std::runtime_error("step_batch: a session twice");
+  }
+  if (kv_book_) {  // every sequence's page first, all or nothing (see speculate_batch)
+    int need = 0;
+    for (const SeqStep& q : seqs) need += kv_step_need(q.session, false);
+    if (need > kv_book_->free_pages()) kv_retire(false);
+    if (need > kv_book_->free_pages()) kv_retire(true);
+    if (need > kv_book_->free_pages())
+      throw KvPoolExhausted("KV page pool exhausted: the batch's step needs " + std::to_string(need) + " pages, " +
+                            std::to_string(kv_book_->free_pages()) + " free");
+    for (const SeqStep& q : seqs) {
+      Session& s = sessions_[q.session];
+      kv_ensure(s, s.pos, s.pos + 1, stream_);
+    }
+  }
+  const size_t vocab = model_->config().vocab;
+  std::vector<Seg> segs;
+  std::vector<int> ks(n);
+  int kmax = 1;
+  for (int i = 0; i < n; ++i) {
+    pin_->rows[i] = seqs[i].anchor;
+    segs.push_back({&sessions_[seqs[i].session], i, 1, nullptr});
+    ks[i] = row_top_k(*seqs[i].params);
+    kmax = std::max(kmax, ks[i]);
+  }
+  forward_rows(pin_->rows, n, Pass::Verify, -1, segs);
+  kernels::topk_rows(logits_dev_, n, static_cast<int>(vocab), kmax, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
+  const size_t top = size_t(n) * kmax;
+  check(cudaMemcpyAsync(pin_->topk_vals, vals_dev_, top * sizeof(float), cudaMemcpyDeviceToHost, stream_), "topk");
+  check(cudaMemcpyAsync(pin_->topk_ids, ids_out_dev_, top * sizeof(int), cudaMemcpyDeviceToHost, stream_), "topk");
+  // A row chosen on the host from every logit, and a row whose logits were asked for.
+  std::vector<std::vector<float>> full(n);
+  for (int i = 0; i < n; ++i) {
+    std::vector<float>* to = seqs[i].row_logits;
+    if (!to && ks[i] != 0) continue;
+    if (!to) to = &full[i];
+    to->resize(vocab);
+    check(cudaMemcpyAsync(to->data(), logits_dev_ + size_t(i) * vocab, vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                          stream_),
+          "row logits");
+  }
+  check(cudaStreamSynchronize(stream_), "step");
+  // Every row's token, as sample() after step() draws it: the history holds the anchor, the seed counts it.
+  std::vector<Session*> ok;
+  for (int i = 0; i < n; ++i) {
+    Session& s = sessions_[seqs[i].session];
+    const SamplingParams& p = *seqs[i].params;
+    const float* vals = pin_->topk_vals + size_t(i) * kmax;
+    const int* ids = pin_->topk_ids + size_t(i) * kmax;
+    try {
+      s.history.push_back(seqs[i].anchor);
+      int next;
+      if (p.seed != 0 && p.temperature > 0.f) s.rng.seed(p.seed + s.history.size());
+      if (ks[i] == 0) {
+        const std::vector<float>& l = seqs[i].row_logits ? *seqs[i].row_logits : full[i];
+        const size_t output = std::min(s.history.size(), s.prompt_len);
+        next = sample_logits(l, p, std::span<const int>(s.history).subspan(output), s.rng);
+      } else {
+        require_finite_topk({vals, size_t(ks[i])}, {ids, size_t(ks[i])}, static_cast<int>(vocab));
+        next = ks[i] == 1 && p.temperature <= 0.f ? ids[0]
+                                                  : sample_topk({vals, size_t(ks[i])}, {ids, size_t(ks[i])}, p, s.rng);
+      }
+      seqs[i].out = {next};
+      seqs[i].rows = 1;
+      ok.push_back(&s);
+    } catch (const NonFiniteLogits&) {
+      seqs[i].error = std::current_exception();
+    }
+  }
+  // Commit: in one launch per kernel unless a row failed (its row must not write, and the joint kernels take a run).
+  quantized_ = false;
+  if (static_cast<int>(ok.size()) == n) {
+    if (commit_overlap_) {
+      commit_seqs(ok, commit_stream_, commit_core_);
+      check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
+      commit_pending_ = true;
+    } else {
+      commit_seqs(ok, stream_, core_);
+    }
+  } else {
+    for (int i = 0; i < n; ++i) {
+      if (seqs[i].error) continue;
+      s_ = &sessions_[seqs[i].session];
+      commit(i, 1, stream_, core_);
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    Session& s = sessions_[seqs[i].session];
+    s_ = &s;
+    if (seqs[i].error) {
+      reset_session();
+      continue;
+    }
+    if (draft_) draft_materialize(1, s.pos, i);
+    s.pos += 1;
+    s.spec.fanout_steps += 1;
+  }
+  check(cudaStreamSynchronize(stream_), "commit");
+}
+
+int Engine::kv_fork_need(int from, int to, const KvGone* gone) const {
+  if (!kv_book_) return 0;
+  const Session& parent = sessions_.at(from);
+  const int L = static_cast<int>(parent.history.size());
+  std::vector<std::vector<int>> gone_tree;
+  KvPool::Refs gone_refs;
+  if (gone) kv_gone_refs(*gone, gone_tree, gone_refs);
+  return kv_book_->resume_need(sessions_.at(to).kv_ids, L, kv_admit_pages(L), &parent.kv_ids, gone ? &gone_refs : nullptr);
+}
+
+void Engine::fork_session(int from) {
+  Session& parent = sessions_.at(from);
+  if (&parent == s_) throw std::runtime_error("fork_session: a session is not forked onto itself");
+  side_join();
+  join_commit();
+  const int L = static_cast<int>(parent.history.size());
+  int target = L;
+  if (kv_book_) {
+    // As begin_prefill: checked first, so a short pool changes nothing; the session's pages past the target go back.
+    const int need = kv_fork_need(from, active_session());
+    if (need > kv_book_->free_pages()) kv_retire(false);
+    if (need > kv_book_->free_pages()) kv_retire(true);
+    if (need > kv_book_->free_pages())
+      throw KvPoolExhausted("KV page pool exhausted: a fork needs " + std::to_string(need) + " pages, " +
+                            std::to_string(kv_book_->free_pages()) + " free of " +
+                            std::to_string(kv_book_->capacity()));
+    target = kv_target(L);
+    kv_release(*s_, target);
+    if (static_cast<int>(s_->history.size()) > target) truncate_history(target);
+    s_->pos = std::min(s_->pos, target);
+  }
+  adopt_prefix(parent, L);  // the pages (a reference each, flat slots a copy), the drafter's ring, the history
+  copy_state(StateSlot{parent.gdn, parent.conv}, false);
+  if (parent.snap_pos > 0) {
+    copy_slot(s_->snap, parent.snap);
+    s_->snap_pos = parent.snap_pos;
+  }
+  s_->pos = L;
+  s_->rope_delta = parent.rope_delta;
+  s_->prompt_len = parent.prompt_len;
+  s_->turn_start = parent.turn_start;
+  s_->guard.reset();
+  if (kv_book_) {
+    // The page L falls in stays with the parent: the fork copies it now, before either writes it. At a page boundary
+    // nothing is copied. Pages the fork mapped past L before are dropped, as a prefill drops them.
+    const int pending = kv_book_->pending_pages();
+    kv_book_->unshare(s_->kv_ids, L);
+    kv_table_sync(*s_, stream_);
+    if (kv_book_->pending_pages() > pending) kv_record_release();
+    kv_ensure(*s_, L, target, stream_);
+  }
+  // The parent's state is read only until here: its next pass or commit may run on another stream.
+  check(cudaStreamSynchronize(stream_), "fork");
+}
+
+}  // namespace ragon
