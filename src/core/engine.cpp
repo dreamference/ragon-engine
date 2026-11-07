@@ -1307,7 +1307,13 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   join_commit();  // a no-op inside a verify's capture: speculate joins before the verify
   const ModelConfig& c = model_->config();
   const bool rows = M <= kernels::kMaxStreamRows, verify = pass == Pass::Verify;
-  if (segs.empty() || (segs.size() > 1 && !verify)) throw std::runtime_error("forward: several sequences only in a verify");
+  // A joint prefill (prefill_joint): several sequences' last prompt chunks, each through exactly the kernels its own
+  // prefill_chunk runs; the row-wise work takes all rows at once, the state and attention go sequence by sequence.
+  const bool joint_prefill = segs.size() > 1 && pass == Pass::Prefill;
+  if (segs.empty() || (segs.size() > 1 && !verify && !joint_prefill))
+    throw std::runtime_error("forward: several sequences only in a verify or a joint prefill");
+  if (joint_prefill && (chunk_mrope_ || !chunk_img_.empty() || prefill_bf16_ || side_active_ || !joint_dst_))
+    throw std::runtime_error("forward: a joint prefill without images, BF16 prefill or the side stream, into joint_dst_");
   int seg_rows = 0;
   for (const Seg& g : segs) {
     if (g.row0 != seg_rows || g.rows < 1) throw std::runtime_error("forward: segments must tile the rows in order");
@@ -1332,7 +1338,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   const bool multi = segs.size() > 1;
   // A batch with a tree in it (BACKLOG 26) goes sequence by sequence through the state kernels: a tree's rows read
   // their ancestors, which the joint kernels do not know. A segment's tree is its own, its rows counted from its row0.
-  const bool joint = multi && std::none_of(segs.begin(), segs.end(), [](const Seg& g) { return g.td; });
+  const bool joint = multi && verify && std::none_of(segs.begin(), segs.end(), [](const Seg& g) { return g.td; });
   auto seg_tree = [&](const Seg& g) { return !verify ? nullptr : g.td ? g.td : tree_; };
   if (segs.size() > static_cast<size_t>(kernels::kMaxSeqs)) throw std::runtime_error("forward: too many sequences");
   kernels::SeqBatch sb;
@@ -1740,6 +1746,13 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
                 "verify conv");
           kernels::gdn_conv(mixed + r0 * C, conv_tmp_, L.conv, sg.rows, C, stream_);
         }
+      } else if (quantized_ && joint_prefill) {  // each sequence from its own conv window, its snap inside the pass
+        for (const Seg& sg : segs) {
+          const size_t r0 = sg.row0;
+          const bool kp = sg.keep_at > 0 && sg.keep_at < sg.rows;
+          kernels::gdn_conv_prefill(t2_ + r0 * C, mixed + r0 * C, sg.s->conv[slot], L.conv, sg.rows, C, stream_,
+                                    kp ? sg.s->snap.conv[slot] : nullptr, sg.keep_at);
+        }
       } else if (quantized_) {
         kernels::gdn_conv_prefill(t2_, mixed, s_->conv[slot], L.conv, M, C, stream_,
                                   keep ? keep_target().conv[slot] : nullptr, keep_at);
@@ -1748,7 +1761,15 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       }
       kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, stream_);
       mark("gdn_conv");
-      if (quantized_)
+      if (quantized_ && joint_prefill)
+        for (const Seg& sg : segs) {
+          const size_t r0 = sg.row0;
+          const bool kp = sg.keep_at > 0 && sg.keep_at < sg.rows;
+          kernels::gdn_recurrent_prefill(mixed + r0 * C, g + r0 * c.lin_v_heads, beta + r0 * c.lin_v_heads, sg.s->gdn[slot],
+                                         core_ + r0 * Vs, sg.rows, c.lin_k_heads, c.lin_v_heads, sg.s->pos, stream_,
+                                         kp ? sg.s->snap.gdn[slot] : nullptr, sg.keep_at);
+        }
+      else if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
                                        stream_, keep ? keep_target().gdn[slot] : nullptr, keep_at);
       else if (joint && verify_commits_) {
@@ -1846,6 +1867,23 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       kernels::rmsnorm(h_, model_->final_norm(), xn_, M, H, c.eps, true, stream_);
       linear_fp4(lm, xn_, M, logits_dev_);
       mark("lm_head");
+      return;
+    }
+    if (joint_prefill) {  // each sequence's last row, as its own pass computes it
+      const int n = static_cast<int>(segs.size());
+      const size_t V = logits_.size();
+      for (int k = 0; k < n; ++k)
+        kernels::rmsnorm(h_ + size_t(segs[k].row0 + segs[k].rows - 1) * H, model_->final_norm(), xn_ + size_t(k) * H, 1,
+                         H, c.eps, true, stream_);
+      if (joint_lm_rows_)
+        for (int k = 0; k < n; ++k) linear_fp4(lm, xn_ + size_t(k) * H, 1, logits_dev_ + size_t(k) * V);
+      else
+        linear_fp4(lm, xn_, n, logits_dev_);
+      check(cudaMemcpyAsync(joint_dst_, logits_dev_, size_t(n) * V * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+            "logits");
+      check(cudaStreamSynchronize(stream_), "forward");
+      mark("lm_head");
+      for (const Seg& sg : segs) sg.s->pos += sg.rows;
       return;
     }
     const float* last = h_ + size_t(M - 1) * H;
@@ -2281,6 +2319,116 @@ bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
   return chunk_end(cur, run);
 }
 
+bool Engine::joint_eligible(const PrefillCursor& cur) const {
+  if (cur.done() || cur.has_images() || prefill_bf16_) return false;
+  if (cur.session < 0 || cur.session >= static_cast<int>(sessions_.size()) || sessions_[cur.session].lora_slot >= 0)
+    return false;
+  // The last chunk, whole: what chunk_begin would run with no token limit, with no checkpoint inside it.
+  const int L = static_cast<int>(cur.prompt.size()), i = cur.next;
+  const int chunk = std::max(kResumeAlign, opts_.prefill_chunk - opts_.prefill_chunk % kResumeAlign);
+  if (L - i > chunk) return false;
+  for (int b : cur.bounds)
+    if (b > i && b < L) return false;
+  for (int b : cur.soft)
+    if (b > i && b < L) return false;
+  return true;
+}
+
+std::vector<std::exception_ptr> Engine::prefill_joint(std::span<PrefillCursor* const> curs) {
+  if (side_cur_) throw std::runtime_error("prefill_joint while a side chunk is in flight");
+  side_join();
+  static const bool lm_rows = [] {
+    const char* e = std::getenv("RAGON_JOINT_LM_ROWS");
+    return e && *e == '1';
+  }();
+  joint_lm_rows_ = lm_rows;
+  const size_t n = curs.size(), V = logits_.size();
+  std::vector<std::exception_ptr> out(n);
+  if (joint_logits_.size() < n * V) joint_logits_.resize(n * V);
+  joint_sessions_.assign(n, -1);
+  for (size_t k = 0; k < n; ++k)
+    if (!joint_eligible(*curs[k])) throw std::runtime_error("prefill_joint: a cursor joint_eligible does not take");
+  for (size_t a = 0; a < n;) {
+    // One pass: the cursors in order while their rows fit the chunk and the sequences kMaxSeqs.
+    size_t b = a;
+    int rows = 0;
+    while (b < n && b - a < static_cast<size_t>(kernels::kMaxSeqs)) {
+      const int r = static_cast<int>(curs[b]->prompt.size()) - curs[b]->next;
+      if (b > a && rows + r > opts_.prefill_chunk) break;
+      rows += r;
+      ++b;
+    }
+    if (b - a == 1) {  // alone: prefill_chunk itself
+      PrefillCursor& cur = *curs[a];
+      joint_sessions_[a] = cur.session;
+      try {
+        prefill_chunk(cur);
+        std::copy(logits_.begin(), logits_.end(), joint_logits_.begin() + a * V);
+      } catch (...) {
+        out[a] = std::current_exception();
+      }
+      a = b;
+      continue;
+    }
+    const auto t = std::chrono::steady_clock::now();
+    std::vector<int> ids;
+    ids.reserve(rows);
+    std::vector<Seg> segs;
+    std::vector<ChunkRun> runs;
+    int row = 0;
+    for (size_t k = a; k < b; ++k) {
+      PrefillCursor& cur = *curs[k];
+      Session& s = sessions_[cur.session];
+      ChunkRun r;
+      r.t = t;
+      r.i = cur.next;
+      r.end = static_cast<int>(cur.prompt.size());
+      r.n = r.end - r.i;
+      r.pos0 = s.pos;
+      r.cap0 = row;
+      r.keep_at = cur.snap_at > r.i && cur.snap_at < r.end ? cur.snap_at - r.i : -1;  // as chunk_begin
+      if (r.keep_at > 0) s.snap_pos = -1;  // the snap is rewritten by the pass
+      Seg g{&s, row, r.n};
+      g.keep_at = r.keep_at;
+      segs.push_back(g);
+      ids.insert(ids.end(), cur.prompt.begin() + r.i, cur.prompt.end());
+      runs.push_back(r);
+      joint_sessions_[k] = cur.session;
+      row += r.n;
+    }
+    joint_dst_ = joint_logits_.data() + a * V;
+    try {
+      forward_rows(ids.data(), rows, Pass::Prefill, -1, segs);
+    } catch (...) {
+      joint_dst_ = nullptr;
+      for (size_t k = a; k < b; ++k) out[k] = std::current_exception();
+      a = b;
+      continue;
+    }
+    joint_dst_ = nullptr;
+    for (size_t k = a; k < b; ++k) {  // what prefill_chunk does after its pass, cursor by cursor
+      PrefillCursor& cur = *curs[k];
+      select_session(cur.session);
+      std::copy(joint_logits_.begin() + k * V, joint_logits_.begin() + (k + 1) * V, logits_.begin());
+      try {
+        chunk_end(cur, runs[k - a]);
+      } catch (...) {
+        out[k] = std::current_exception();
+      }
+    }
+    a = b;
+  }
+  return out;
+}
+
+void Engine::joint_select(int k) {
+  if (k < 0 || k >= static_cast<int>(joint_sessions_.size()) || joint_sessions_[k] < 0)
+    throw std::runtime_error("joint_select: no such cursor");
+  select_session(joint_sessions_[k]);
+  const size_t V = logits_.size();
+  std::copy(joint_logits_.begin() + k * V, joint_logits_.begin() + (k + 1) * V, logits_.begin());
+}
+
 Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
   ChunkRun r;
   r.t = std::chrono::steady_clock::now();
@@ -2380,7 +2528,7 @@ bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
   if (keep_at > 0 && run.soft_at < 0) s_->snap_pos = snap_at;
   if (draft_) {
     const int first = std::max(pos0, window);
-    if (first < pos0 + n) draft_materialize(pos0 + n - first, first, first - pos0);  // still quantized_
+    if (first < pos0 + n) draft_materialize(pos0 + n - first, first, run.cap0 + first - pos0);  // still quantized_
   }
   s_->history.insert(s_->history.end(), prompt.begin() + i, prompt.begin() + end);
   cur.next = end;

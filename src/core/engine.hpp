@@ -298,6 +298,14 @@ class Engine {
   static void rope_rows(const PrefillCursor& cur, int from, int to, std::vector<int>& out);
   static int rope_delta_after(const PrefillCursor& cur);
   bool prefill_chunk(PrefillCursor& cur, int max_tokens = 0);
+  // Joint question prefill (fan-out, BATCHING P4d): the last chunk of each cursor in one pass, or in as few passes as
+  // the chunk's row cap and kMaxSeqs allow, each sequence's rows through exactly the kernels a prefill_chunk of it alone
+  // runs (row-invariant), so every cursor ends where prefill_chunk would have left it, bitwise. Only cursors that
+  // joint_eligible() takes. Returns one entry per cursor: nullptr, or the exception its chunk's finish threw (the
+  // others go on). Afterwards joint_select(k) makes cursor k's session active with its logits in logits().
+  bool joint_eligible(const PrefillCursor& cur) const;
+  std::vector<std::exception_ptr> prefill_joint(std::span<PrefillCursor* const> curs);
+  void joint_select(int k);
   // The same chunk beside other sessions' work (EngineOptions::side_prefill): prefill_chunk_launch queues the
   // chunk's pass on the side stream, with the side scratch, and returns at once; the caller goes on with other
   // sessions' steps on the main stream; side_ready() says whether the pass has finished on the GPU, and
@@ -549,6 +557,7 @@ class Engine {
     Session* s;
     int row0, rows;
     const kernels::TreeDesc* td = nullptr;  // a batched verify's tree for this sequence (tree_ is the one-row step's)
+    int keep_at = -1;  // a joint prefill's row (from row0) whose state goes to this sequence's snap (-1: none)
   };
   void forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs);
   // The runs of segs whose sessions map the same KV pages (attention_rows_cascade); none in a flat cache.
@@ -1064,9 +1073,15 @@ class Engine {
   // (the model, the sessions, the checkpoint store, the decode's graphs and pinned step buffers) is shared and is
   // touched by one pass at a time: a session by its own pass only, the store from the host between passes.
   float* logits_host_ = nullptr;  // where a pass copies its last row's logits: logits_'s data, or the side's pinned buffer
+  // A joint prefill's last-row logits, one row per cursor, and where the pass in flight writes its rows' logits.
+  std::vector<float> joint_logits_;
+  std::vector<int> joint_sessions_;
+  float* joint_dst_ = nullptr;
+  bool joint_lm_rows_ = false;  // RAGON_JOINT_LM_ROWS=1: the joint lm_head one row per call (M=1, as alone)
   struct ChunkRun {
     int i = 0, end = 0, keep_at = -1, n = 0, pos0 = 0;
     int soft_at = -1;  // the soft point whose state the pass captured into soft_slot_ (-1: none, or the snap)
+    int cap0 = 0;      // the chunk's first row in the drafter capture (a joint prefill's segment row0)
     std::chrono::steady_clock::time_point t;
   };
   ChunkRun chunk_begin(PrefillCursor& cur, int max_tokens);  // prefill_chunk's pass, launched
