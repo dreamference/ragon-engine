@@ -72,6 +72,19 @@ __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* 
   }
 }
 
+__global__ void draft_store_kv_seqs_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
+                                           SeqPtrs<__nv_bfloat16> kcs, SeqPtrs<__nv_bfloat16> vcs, int ring, SeqBatch b) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int r = blockIdx.x, sq = seq_of(b, r), pos = seq_pos(b, sq) + r - b.row0[sq];
+  __nv_bfloat16* __restrict__ kc = kcs.p[sq];
+  __nv_bfloat16* __restrict__ vc = vcs.p[sq];
+  for (int i = threadIdx.x; i < kv_size; i += blockDim.x) {
+    const size_t dst = static_cast<size_t>(pos % ring) * kv_size + i;
+    kc[dst] = __float2bfloat16(k[static_cast<size_t>(r) * kv_size + i]);
+    vc[dst] = __float2bfloat16(v[static_cast<size_t>(r) * kv_size + i]);
+  }
+}
+
 // Non-causal attention of the block's B queries over the context cache (a sliding window ending before the
 // block) and over the block itself. One block per (query row, KV head); 8 warps walk the keys with an online
 // softmax and are merged at the end. Lane l owns dims 4l .. 4l + 3.
@@ -521,6 +534,14 @@ void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16
                         float eps, cudaStream_t s) {
   launch_kernel("draft_qk_rope_seqs", draft_qk_rope_seqs_kernel, dim3(b.row0[b.n], heads), dim3(kDD), 0, s, x,
                 row_stride, norm, b, theta, eps);
+}
+
+void draft_store_kv_seqs(const float* k, const float* v, int kv_size, SeqPtrs<__nv_bfloat16> kc,
+                         SeqPtrs<__nv_bfloat16> vc, int ring, const SeqBatch& b, cudaStream_t s) {
+  for (int i = 0; i < b.n; ++i)
+    if (b.row0[i + 1] - b.row0[i] > ring) throw std::runtime_error("draft_store_kv: more rows than the ring holds");
+  launch_kernel("draft_store_kv_seqs", draft_store_kv_seqs_kernel, dim3(b.row0[b.n]), dim3(256), 0, s, k, v, kv_size,
+                kc, vc, ring, b);
 }
 
 void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc, int ring,

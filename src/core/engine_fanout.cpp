@@ -210,6 +210,25 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
     }
   }
   prof("commit");
+  // The drafter's rings follow every sequence (a fork may speculate again later): one pass over all the rows, as the
+  // forward was (BATCHING §5.8); a sequence that failed resets instead, and its row is skipped.
+  std::vector<Session*> upkeep;
+  std::vector<int> upkeep_rows;
+  for (int i = 0; i < n; ++i)
+    if (!seqs[i].error) {
+      upkeep.push_back(&sessions_[seqs[i].session]);
+      upkeep_rows.push_back(i);
+    }
+  if (draft_) {
+    if (n > 1 && static_cast<int>(upkeep.size()) == n) {
+      draft_materialize_seqs(upkeep);
+    } else {
+      for (size_t j = 0; j < upkeep.size(); ++j) {
+        s_ = upkeep[j];
+        draft_materialize(1, upkeep[j]->pos, upkeep_rows[j]);
+      }
+    }
+  }
   for (int i = 0; i < n; ++i) {
     Session& s = sessions_[seqs[i].session];
     s_ = &s;
@@ -217,7 +236,6 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
       reset_session();
       continue;
     }
-    if (draft_) draft_materialize(1, s.pos, i);
     s.pos += 1;
     s.spec.fanout_steps += 1;
   }

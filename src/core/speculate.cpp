@@ -522,10 +522,8 @@ void Engine::commit(int row0, int n, cudaStream_t st, float* out) {
   }
 }
 
-void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
-  if (rows <= 0) return;
+void Engine::draft_context(int rows, int cap_row0) {
   const DraftConfig& d = draft_->config();
-  const int dkv = d.kv_heads * d.head_dim;
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
   // A prefill's rows (quantized_) always take the BF16 GEMM, as the target's projections take the prefill path
@@ -542,6 +540,13 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     kernels::gemm_bf16(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                        stream_);
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
+}
+
+void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
+  if (rows <= 0) return;
+  const DraftConfig& d = draft_->config();
+  const int dkv = d.kv_heads * d.head_dim;
+  draft_context(rows, cap_row0);
   Session* const self[1] = {s_};
   const int nrows[1] = {rows};
   const kernels::LoraRows lrows = lora_draft_rows(self, nrows);  // LORA §3: the session's adapter on k and v
@@ -555,6 +560,42 @@ void Engine::draft_materialize(int rows, kernels::DevPos pos0, int cap_row0) {
     lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, rows, kv);
     kernels::draft_qk_rope(dk_, rows, d.kv_heads, dkv, L.k_norm, pos0, d.rope_theta, d.eps, stream_);
     kernels::draft_store_kv(dk_, dv_, rows, dkv, pos0, s_->dkc[l], s_->dvc[l], ring_, stream_);
+  }
+}
+
+void Engine::draft_materialize_seqs(std::span<Session* const> seqs) {
+  const int n = static_cast<int>(seqs.size());
+  if (n == 0) return;
+  if (n > kernels::kMaxSeqs || quantized(n)) throw std::runtime_error("draft_materialize_seqs: more rows than a pass");
+  const DraftConfig& d = draft_->config();
+  const int dkv = d.kv_heads * d.head_dim;
+  // Every step of the rows path is row-invariant (the stream GEMMs, the norm, the per-row rope and store), so row i
+  // here is bit-for-bit what draft_materialize(1, pos_i, i) computes alone (--batch-check compares the drafts after).
+  draft_context(n, 0);
+  kernels::SeqBatch sb;
+  sb.n = n;
+  std::vector<int> ones(static_cast<size_t>(n), 1);
+  for (int i = 0; i < n; ++i) {
+    sb.row0[i] = i;
+    sb.pos[i] = seqs[static_cast<size_t>(i)]->pos;
+  }
+  sb.row0[n] = n;
+  const kernels::LoraRows lrows = lora_draft_rows(seqs, ones);
+  kernels::LoraOuts kv;
+  kv.y[1] = dk_;
+  kv.y[2] = dv_;
+  kv.ld[1] = kv.ld[2] = dkv;
+  for (int l = 0; l < d.layers; ++l) {
+    const DraftLayer& L = draft_->layers()[l];
+    linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, n);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, n, kv);
+    kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
+    kernels::SeqPtrs<__nv_bfloat16> kc, vc;
+    for (int i = 0; i < n; ++i) {
+      kc.p[i] = seqs[static_cast<size_t>(i)]->dkc[l];
+      vc.p[i] = seqs[static_cast<size_t>(i)]->dvc[l];
+    }
+    kernels::draft_store_kv_seqs(dk_, dv_, dkv, kc, vc, ring_, sb, stream_);
   }
 }
 
