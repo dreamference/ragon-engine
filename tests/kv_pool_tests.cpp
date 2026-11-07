@@ -678,9 +678,54 @@ void admission() {
   check(!run(p4b, &need, &p4b), "admission: P4b's count would have admitted a prefill that cannot map its pages");
 }
 
+// P4c at a fan-out: N forks of one context share its pages, no copy until a write, one copy per fork that writes into a
+// shared page, and none of it reaches the parent or the other forks.
+void fanout() {
+  constexpr int kForks = 32;
+  KvPool pool(200);
+  std::vector<int> parent;
+  std::vector<KvPool::Copy> copies;
+  pool.ensure(parent, 0, 4 * T + 10, &copies);  // 5 pages: the last holds the context's tail
+  check(copies.empty() && pool.free_pages() == 194, "the parent's pages");
+  std::vector<std::vector<int>> forks(kForks);
+  for (std::vector<int>& f : forks) pool.share(f, parent, 4 * T + 10);
+  check(pool.free_pages() == 194, "forking takes no page");
+  for (int p : parent) check(pool.refs(p) == kForks + 1, "every page held by the parent and each fork");
+  // The first write of each fork lands in the shared last page: exactly one copy, of that page.
+  const int last = parent[4];
+  for (int i = 0; i < kForks; ++i) {
+    copies.clear();
+    check(pool.ensure(forks[i], 4 * T + 10, 4 * T + 11, &copies), "a fork's first write");
+    check(copies.size() == 1 && copies[0].src == last && copies[0].dst == forks[i][4], "one page copied");
+    check(pool.refs(last) == kForks - i && pool.refs(forks[i][4]) == 1, "the copy is private");
+    check(forks[i][0] == parent[0] && forks[i][3] == parent[3], "the earlier pages stay shared");
+    copies.clear();
+    check(pool.ensure(forks[i], 4 * T + 11, 4 * T + 12, &copies) && copies.empty(), "a private page copies nothing");
+  }
+  check(pool.refs(last) == 1, "the parent alone holds its last page");
+  check(pool.free_pages() == 194 - kForks, "one page per fork");
+  // A context ending on a page boundary: nothing is copied at all; each fork takes one fresh page.
+  KvPool edge(200);
+  std::vector<int> whole;
+  edge.ensure(whole, 0, 4 * T, &copies);
+  std::vector<std::vector<int>> g(kForks);
+  for (std::vector<int>& f : g) {
+    edge.share(f, whole, 4 * T);
+    copies.clear();
+    check(edge.ensure(f, 4 * T, 4 * T + 1, &copies) && copies.empty(), "a boundary fork copies nothing");
+    check(f[3] == whole[3] && f[4] != 0, "a boundary fork's own page");
+  }
+  // Ending the forks gives everything back; the parent keeps its context.
+  for (std::vector<int>& f : g) edge.truncate(f, 0);
+  edge.retire();
+  for (int p : whole) check(edge.refs(p) == 1, "the parent's pages back to one reference");
+  check(edge.free_pages() == 195, "the forks' pages are free");
+}
+
 int main() {
   basics();
   sharing();
+  fanout();
   resume();
   admission();
   random_walk();

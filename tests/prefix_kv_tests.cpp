@@ -144,6 +144,48 @@ struct Paged {
 void paged_tests() {
   using ragon::KvPool;
   using ragon::PrefixKvTree;
+  // A fan-out: many sessions adopt one stored prefix at once. They share its pages, a fork's first write into the
+  // straddling page copies only that page, and each still reads the stored positions.
+  {
+    constexpr int kForks = 8, kL = 150;
+    Paged h;
+    PrefixKvTree t(2 * kState, 0, kState, h.ops());
+    const std::vector<int> a = prompt({}, 1, kL);
+    h.run(a, {}, 0);
+    t.insert(a, kL, {}, 1);
+    h.end_session();
+    const auto m = t.match(a);
+    const std::vector<int> store = t.pages(m, kL);
+    std::vector<std::vector<int>> forks(kForks);
+    for (std::vector<int>& f : forks) {
+      f = store;
+      for (int pg : f) h.pool.retain(pg);
+    }
+    for (int pg : store) EXPECT(h.pool.refs(pg) == kForks + 1);
+    for (int i = 0; i < kForks; ++i) {
+      std::vector<ragon::KvPool::Copy> copies;
+      const int L = kL + PT;
+      EXPECT(h.pool.ensure(forks[i], kL, L, &copies));
+      EXPECT(copies.size() == 1 && copies[0].src == store[2]);
+      for (const auto& c : copies) h.mem[c.dst] = h.mem[c.src];
+      const std::vector<int> own = prompt(a, 100 + i, L);
+      for (int pos = kL; pos < L; ++pos) {
+        const int pg = forks[i][KvPool::index_of(pos)];
+        EXPECT(h.pool.refs(pg) == 1);
+        h.mem[pg].resize(PT, 0);
+        h.mem[pg][pos % PT] = kv_at(own, pos);
+      }
+    }
+    for (int i = 0; i < kForks; ++i) {
+      const std::vector<int> own = prompt(a, 100 + i, kL + PT);
+      for (int pos = 0; pos < kL + PT; ++pos)
+        EXPECT(h.mem.at(forks[i][KvPool::index_of(pos)])[pos % PT] == kv_at(own, pos));
+    }
+    for (int pos = 0; pos < kL; ++pos) EXPECT(h.mem.at(store[KvPool::index_of(pos)])[pos % PT] == kv_at(a, pos));
+    for (std::vector<int>& f : forks)
+      for (int pg : f) h.pool.release(pg);
+    for (int pg : store) EXPECT(h.pool.refs(pg) == 1);
+  }
   // Insert, then pages() is the session's own table.
   {
     Paged h;
