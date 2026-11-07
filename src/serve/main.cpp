@@ -501,7 +501,32 @@ class Scheduler {
       }
     }
     start(std::move(job));
+    // Fan-out (BATCHING P4d): the rest of a burst of short prefills (forks' questions after a shared context) is admitted
+    // in this turn too, one job at a time as above, so the gang's joint pass (joint_prefill) finds them together instead
+    // of prefilling each one before the next is admitted. Only with fan-out on and while the last job admitted is such a
+    // short prefill; RAGON_JOINT_PREFILL=0 keeps one admission a turn.
+    while (burst_more()) {
+    }
     return true;
+  }
+
+  bool burst_more() {
+    static const bool on = [] {
+      const char* e = std::getenv("RAGON_JOINT_PREFILL");
+      return !e || *e != '0';
+    }();
+    if (!on || fanout_plain_above_ <= 0 || running_.empty()) return false;
+    const Running& last = *running_.back();
+    if (!last.prefilling || prefill_left(last) > ctx_.engine->prefill_chunk_size()) return false;
+    Job job;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      if (stop_ || static_cast<int>(running_.size()) >= batch_ || queue_.empty() || !pick(job)) return false;
+      dirty_ = !queue_.empty();
+    }
+    const size_t before = running_.size();
+    start(std::move(job));
+    return running_.size() > before;  // a job start() refused ends the burst (the next turn looks again)
   }
 
   // Binds the admitted job's session and readies its prefill; a job refused here is answered at once.
@@ -718,6 +743,8 @@ class Scheduler {
       unit_kind_ = nullptr;
       if (kv_blocked) {
         kv_stalled(ended);
+      } else if (gang_unit_ && joint_prefill(batch, ended)) {
+        unit_kind_ = "joint";
       } else if (batch.size() >= 2) {
         batch_step(batch, ended);
         unit_kind_ = "decode";
@@ -796,6 +823,50 @@ class Scheduler {
       return nullptr;
     }
     return next;
+  }
+  // The held question prefills together (BATCHING P4d): every short prefill the engine can take in a joint pass
+  // (Engine::joint_eligible), shortest first, in as few passes as its row cap allows; each request then goes on as after
+  // its last chunk, alone. Each question's logits and state are what its own chunk would have left, bit for bit.
+  // RAGON_JOINT_PREFILL=0 keeps the one-by-one order. False when fewer than two qualify (the gang's unit runs instead).
+  bool joint_prefill(std::vector<Running*>& batch, std::vector<Running*>& ended) {
+    static const bool on = [] {
+      const char* e = std::getenv("RAGON_JOINT_PREFILL");
+      return !e || *e != '0';
+    }();
+    Engine& eng = *ctx_.engine;
+    if (!on || eng.side_busy()) return false;
+    std::vector<Running*> rs;
+    for (const auto& o : running_)
+      if (o->prefilling && !o->side_flight && eng.joint_eligible(o->cur)) rs.push_back(o.get());
+    if (rs.size() < 2) return false;
+    std::stable_sort(rs.begin(), rs.end(),
+                     [](const Running* a, const Running* b) { return prefill_left(*a) < prefill_left(*b); });
+    std::vector<Engine::PrefillCursor*> curs;
+    for (Running* r : rs) curs.push_back(&r->cur);
+    std::vector<std::exception_ptr> errs;
+    try {
+      errs = eng.prefill_joint(curs);
+    } catch (...) {  // before any pass (a precondition): every request fails as its own chunk would have
+      errs.assign(rs.size(), std::current_exception());
+    }
+    for (size_t k = 0; k < rs.size(); ++k) {
+      Running& r = *rs[k];
+      bool done = false;
+      try {
+        if (errs[k]) std::rethrow_exception(errs[k]);
+        eng.joint_select(static_cast<int>(k));
+        r.prefilling = false;
+        begin_decode(r);
+        start_forks(r);
+        done = emit(r) && end(r);
+      } catch (const std::exception& e) {
+        fail(r, e);
+        done = true;
+      }
+      if (done) ended.push_back(&r);
+    }
+    batch = rs;
+    return true;
   }
   // Whether r's next step speculates.
   bool spec_turn(const Running& r) const { return r.spec && !fanout_plain(); }
