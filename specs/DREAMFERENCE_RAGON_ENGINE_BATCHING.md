@@ -258,7 +258,7 @@ The fused pass (C2, `forward_fused`) launches the same kernels and inherits the 
 - **Sharing and forks.** A fork maps its parent's pages and copies only per-sequence state; a page is copied on the first write into it. `kMaxSeqs` is 32 and forks past it queue. At exactly 32,000 tokens (500 pages) no page is copied on the measured path.
 - **The cascade** (`RAGON_CASCADE=0` turns it off): attention over the pages adjacent sequences share is computed once per group, then each fork's own suffix is added. Joint, eager and paged only, from 4,096 shared keys (`kCascadeMinKeys`); forks that are not adjacent in the batch are not grouped. 172 tok/s against 128 at 32 forks when it landed; one stream never takes it.
 - **The plain threshold** (`--fanout-plain-above`, `RAGON_FANOUT_PLAIN_ABOVE`, 0 for never): above it every decoder takes plain batched steps, with the drafter's rings kept up. The default is 6 with a drafter, 1 without one. Wall tok/s with a drafter, speculating against plain: 5 forks 56/47, 6 forks 58/55, 7 forks 57/60, 8 forks 55/66. Measured on one workload (the bench's greedy questions on code context), so a workload the drafter predicts worse moves the crossover down.
-- **Gang prefill.** Above the same threshold, short prefills run ahead of the decode passes, at most 10 s per hold (`kGangHold`), so the forks start decoding together.
+- **Gang prefill.** Above the same threshold (or `--fanout-gang-above`, `RAGON_FANOUT_GANG_ABOVE`, §5.8), short prefills run ahead of the decode passes, at most 10 s per hold (`kGangHold`), so the forks start decoding together.
 - **State in the pass.** A joint plain step writes each sequence's DeltaNet and convolution state during the pass (`verify_commits_`); it used to run each DeltaNet layer again in the commit, about 52 ms of a 32-row pass.
 
 32 forks of 32K, 100 tokens each, greedy, one question each, `--kv-pages --graphs --pdl --max-context 32768`, branch and main alternating on one box in one hour; SGLang's figures are from an earlier run on this hardware (`ignore_eos`, which ours lacks: the bench's forks here all ran to 100 tokens).
@@ -266,7 +266,7 @@ The fused pass (C2, `forward_fused`) launches the same kernels and inherits the 
 | Forks | Drafter | Decode span tok/s: fan-out / main / SGLang | Wall tok/s: fan-out / main first burst / SGLang | MemAvailable minimum, GB: fan-out / main |
 | --- | --- | --- | --- | --- |
 | 32 | none | 202 / 11.4 / 211 | 180 (serial questions 152) / 8.9 / 187 | 18.7-19.0 / 18.8-18.9 |
-| 32 | loaded | 184 / 33-46 / 294 (8 drafts) | 164-165 (141) / 22.5 / 247 | 17.5-18.5 / 16.6-16.8 |
+| 32 | loaded | 200-201 (184 before §5.8) / 33-46 / 294 (8 drafts) | 178-179 (164-165 before §5.8; 141) / 22.5 / 247 | 17.5-18.5 / 16.6-16.8 |
 | 8 | none | 79 / 11.3 / 83 | 75-76 (71) / 6.1 / - | 56.2 / 56.2 |
 | 8 | loaded | 75 / 54-55 / 100 (16 drafts, cap 8) | 72-73 (66-67) / 10.0 / - | 52.0 / 51.7 |
 | 4 | none | 43 / 11.3 / - | 41 (40) / 6.6 / - | 65.0 / 65.1 |
@@ -277,9 +277,9 @@ Main's first burst pays a whole prefill per fork, which sharing removes (361 s a
 **The questions' prefill, joint.** The forks' question prefills run as one prefill pass (`Engine::prefill_joint`): `forward_rows` takes several segments, each with its own attention and DeltaNet state, keep point and last row, at most `prefill_chunk` rows, and the lm_head is one GEMM over the segments' last rows. `ragon-run --joint-check` proves it bitwise equal to the serial prefills (32 and 8 sessions, also with `RAGON_JOINT_LM_ROWS=1`, the per-row lm_head): 32 short questions 4.25 s serial against 0.79 s joint, 8 sessions 1.07 against 0.26 s. A question that crosses a chunk bound or soft checkpoint, an image, a LoRA adapter or `--prefill-bf16` keeps the serial path (with long questions 19 of 32 went joint, 6.63 against 4.82 s). In the serve the gang's held prefills run as one "joint" unit, and a burst of short prefills is admitted in one turn (admission took one job a turn, so each question was prefilled alone before the next fork arrived). `RAGON_JOINT_PREFILL=0` restores both. The wall column above shows joint with serial in brackets, alternating on one box: 32 forks without a drafter 180.4 and 180.3 against 153.7 and 151.9, span 202 on both; MemAvailable minimum 18.4 GB against 18.8. 4 forks with a drafter are unchanged (54-59 against 55-61, noisy). One stream: agentlong 16/16 turns byte-identical to main in two more alternating runs, 64.31 and 64.31 tok/s against main's 64.29 and 64.19.
 
 What is left, none of it needed for exactness:
-- **With a drafter above the threshold**: keeping the rings up costs about 16 ms a pass (184 against 202).
+- **With a drafter above the threshold**: closed (§5.8, stage 6): the rings are kept up in one pass over all the forks, 200-201 against 202.
 - **The last 4% without one**: about 158 ms a pass against SGLang's 151.6, the same slope per fork (2.26 against 2.2 ms). A persistent N-sequence DeltaNet kernel (§5.2) is the untried lever; the recurrent step is 6.4 GB of memory traffic a pass and may be bandwidth-bound.
-- **Speculation at 32 forks**: SGLang's 294 takes 32 forks of 9 rows; `kRowsMax` is 32, so it needs the 64+ row pass.
+- **Speculation at 32 forks**: SGLang's 294 takes 32 forks of 9 rows; `kRowsMax` is 32, so it needs the 64+ row pass. Measured in §5.8.
 
 ### 5.4 Steps with different acceptance
 
@@ -304,6 +304,43 @@ Sequences in a batch accept different numbers of tokens; there is no lockstep an
 - `--batch-check` generalised to N: every batched step re-run alone and compared bit for bit (tokens, state, accepted drafts), as two-sequence batches are checked today;
 - agentlong greedy at N streams against one stream, `n_streams.py --compare`, 16/16 turns at every N a phase enables;
 - `ragon-stream-tests`: memcmp per batched kernel (the 33-64-row GEMM tier, the N-sequence gdn kernel, paged attention against flat).
+
+### 5.8 Speculation under fan-out
+
+32 forks of 32K with the drafter loaded run plain (§5.3, the plain threshold) at 200-201 span tok/s, 178-179 wall; SGLang speculates at 294 / 247. Measured 2026-11-07 on the measuring box, the bench of §5.3 (100 tokens a fork, greedy, 2 reps an arm).
+
+**Stage 6, landed: the plain step's drafter upkeep in one pass.** A plain fan-out step used to materialize the drafter's rings once per fork (`draft_materialize(1, …)` 32 times, about 16 ms a pass: 184 against 202). `Engine::draft_materialize_seqs` runs the drafter's context projection, K/V projections, norm and rope over all the forks' rows at once and writes each row into its own fork's rings (`draft_store_kv_seqs`); the rings come out as the per-fork call leaves them, and `--fanout-check` compares the drafter context bit for bit. 32 forks with the drafter loaded: span 184 -> 200-201, wall 165 -> 178-180, level with no drafter (200.6-200.8 / 179.3-179.5 in the same window). One stream: agentlong 16/16 identical, 33.97 -> 33.96 tok/s.
+
+**Stage 7, landed: `--fanout-gang-above`** (`RAGON_FANOUT_GANG_ABOVE`; default: the plain threshold, so nothing changes). The gang prefill and `burst_more` were keyed on `--fanout-plain-above`, so forcing speculation (`--fanout-plain-above 0`) also turned the gang off and every fork's question prefill ran between the others' steps (wall 50-57 tok/s at 32 forks, blocks 4-12): earlier speculation figures under fan-out measured the scheduler, not speculation. With the gang kept on (`--fanout-plain-above 0 --fanout-gang-above 6`) every arm starts decoding after the same 15 s warm-up as plain. `ragon-run`'s `RAGON_JOINT_QLEN` fixes `--joint-check`'s short questions at one length, to price a joint pass of N x K rows.
+
+**Why speculation loses, suspect by suspect** (32 forks of 32K, gang on, `--draft-block` B, so `fit` = 32 / B forks a pass):
+
+| B | forks a pass | span / wall tok/s | tokens per fork-step | verify + draft ms a step |
+| --- | ---: | --- | ---: | --- |
+| plain | 32 | 200.6-200.8 / 179.3-179.5 | 1 | 157 (no draft) |
+| 2 | 16 | 138 / 127 (one rep 65 / 63, not understood) | 1.85 | 166 + 15 |
+| 4 | 8 | 140-144 / 130-132 | 2.92 | 131 + 14 |
+| 8 | 4 | 108-109 / 102 | 3.67 | 115 + 13 |
+| 12 | 2 (tree) | 66-67 / 64 | 4.51 | 120 + 11 |
+
+1. *The verify batch* is the cause. At `kMaxStreamRows` 32 a pass verifies 32 / B forks, so a row yields 0.73 tokens at B 4 (0.38 at B 12) against plain's 1.0, for a pass that costs about what the plain 32-row pass does. No block size wins at 32 rows; with a tree's acceptance (3.47 at B 4) it would still be 8 x 3.47 / 0.145 s = 191 against 201.
+2. *The drafter per fork, serially*: no. The draft is one pass over the forks, 11-15 ms for 2-16 of them (about 10 % of a step).
+3. *Acceptance at batch*: no collapse with the number of forks (B 4: 2.91 tokens a fork-step at 8 forks, 2.92 at 32). But a batched step verifies a chain where a lone fork verifies a tree: forks speculating mostly alone got 3.47 (B 4) and 4.47 (B 8), 16-18 % more than batched, and one fork 3.1-3.7 (B 4) and 3.5-4.4 (B 12). The tree in a batch (§5.1) covers pairs only; it would raise any batched speculation, not only fan-out.
+4. *`burst_more` and speculation*: the scheduler confound above, removed by stage 7; not a cost of its own.
+5. *The number of drafts* (SGLang: 8): within 32 rows B 4 is best; a larger block loses forks a pass faster than it gains tokens.
+
+**The prefill path is not the wide pass.** One joint pass (`prefill_joint`, every row's logits) over 32 forks of 32K, K rows each: 0.754 s at K 1, 0.780 at 4, 0.813 at 8, 0.930 at 12 (`--joint-check` bitwise green in every arm). The floor is per fork and nearly flat in K: about 23 ms a fork against the rows path's 157 ms for all 32. Not traced (the step trace sees no sections inside a joint pass); the likely cause is that its attention reads each fork's 32K keys on its own, where the rows path's cascade reads the shared pages once. A verify routed through it would give at most 32 x 2.92 / 0.78 s = 120 tok/s.
+
+**For the continuation: a rows-path pass over 32 forks x B rows**, row-invariant (the stream GEMM's order kept, so a fork's tokens stay those of its plain step and of one stream), with the cascade and the batched DeltaNet path, the drafter context and the commit for all forks in one pass. What such a pass must cost, from the measured tokens per fork-step (32 forks; draft included):
+
+| B | rows | tokens a pass | 250 tok/s needs a pass under | beating plain's 201 needs under |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 64 | 59 | 237 ms | 295 ms |
+| 4, chain | 128 | 93 | 374 ms | 465 ms |
+| 4, tree | 128 | 111 | 444 ms | 552 ms |
+| 8, chain | 256 | 117 | 470 ms | 584 ms |
+
+What is measured toward it: the plain 32-row pass at 32 forks is 157 ms (FFN 52, DeltaNet recurrence 46, DeltaNet projections 29, attention 15, its projections 8, lm_head 3); a 32-row verify costs 131 ms over 8 forks and 166 over 16; P1's 33-64-row tier (§6) cost 129 against 119.6 ms at two sequences with the FFN megakernel lost above 32 rows; the stream GEMM is bus-bound at 32 rows (about 27 TFLOPS). The cost of a 64-128-row rows-path pass at 32 forks is not measured. The first step of the continuation is to measure it: `kMaxStreamRows` 64 with P1's tier, `--fanout-plain-above 0 --fanout-gang-above 6 --draft-block 2`, against the 237 / 295 ms budget; then 128 rows at B 4. The batched tree (item 3) adds 16-18 % on top. Using the prefill path's GEMM for the extra rows would drop row-invariance (a fork's tokens could differ from its plain step's): an owner's decision, not taken here.
 
 ## 6. Phases
 
