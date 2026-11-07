@@ -34,10 +34,21 @@ std::string image_url_of(const json& item) {
 
 // `images`: with vision (ChatOptions::images set), each image part renders production's placeholder and its URL is
 // appended here, in the order the placeholders appear; without it, the part renders as the text `[image]`.
+// Text a user wrote that quotes the image placeholder: the tokenizer would read it as the special token and the
+// request would fail the placeholder count (400). With vision on, a zero-width space after the `|` keeps it ordinary
+// text; only the placeholders this renderer writes are tokens.
+std::string quoted_text(std::string text, bool vision) {
+  if (!vision) return text;
+  static const std::string pad = "<|image_pad|>", safe = "<|image_pad|\xE2\x80\x8B>";
+  for (size_t at = text.find(pad); at != std::string::npos; at = text.find(pad, at + safe.size()))
+    text.replace(at, pad.size(), safe);
+  return text;
+}
+
 std::string render_content(const json& content, bool is_system, std::vector<std::string>* images = nullptr,
                            bool vision = false) {
   if (content.is_null()) return {};
-  if (content.is_string()) return content.get<std::string>();
+  if (content.is_string()) return quoted_text(content.get<std::string>(), vision);
   if (content.is_array()) {
     std::string out;
     for (const json& item : content) {
@@ -60,7 +71,7 @@ std::string render_content(const json& content, bool is_system, std::vector<std:
         throw std::invalid_argument(is_system ? "System message cannot contain video."
                                               : "ragon-engine v0 does not accept video");
       }
-      if (item.contains("text")) out += item["text"].get<std::string>();
+      if (item.contains("text")) out += quoted_text(item["text"].get<std::string>(), vision);
       else throw std::invalid_argument("Unexpected item type in content.");
     }
     return out;

@@ -112,9 +112,9 @@ def test_bad_images_are_refused_with_a_code(vision, url, code):
     assert status == 400 and out["error"]["code"] == code, out
 
 
-def test_image_pad_in_the_text_is_refused(vision):
+def test_image_pad_in_the_text_is_ordinary_text(vision):
     status, out = chat(vision, [{"type": "text", "text": "<|vision_start|><|image_pad|><|vision_end|> what?"}])
-    assert status == 400 and out["error"]["code"] == "invalid_image", out
+    assert status == 200, out
 
 
 def test_streamed_image_request(vision):

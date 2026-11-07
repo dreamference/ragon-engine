@@ -297,6 +297,10 @@ void test_template_and_expansion() {
   expect(r.prompt_text.find("<tool_response>\nT<|vision_start|><|image_pad|><|vision_end|>\n</tool_response>") !=
              std::string::npos,
          "chat: tool placeholder");
+  // A prompt that quotes the placeholder is ordinary text, not an image.
+  json quoted = json::parse(R"({"messages":[{"role":"user","content":"what is <|image_pad|>?"}]})");
+  Request q = parse_request(quoted, true, true);
+  expect(q.image_urls.empty() && q.prompt_text.find("<|image_pad|>") == std::string::npos, "chat: quoted placeholder stays text");
   Request off = parse_request(body, true, false);
   expect(off.image_urls.empty() && off.prompt_text.find("A[image]B") != std::string::npos, "vision off: [image]");
   json sys = json::parse(R"({"messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"U"}}]},
