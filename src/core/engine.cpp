@@ -236,9 +236,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   s_ = &sessions_[0];
   for (int i = 0; i < opts_.prefix_checkpoints; ++i) ckpt_slots_.push_back(alloc_slot());
   if (!opts_.draft_dir.empty()) {
-    bool nvfp4 = opts_.draft_nvfp4;
-    if (const char* e = std::getenv("RAGON_DRAFT_NVFP4")) nvfp4 = std::atoi(e) != 0;
-    draft_ = std::make_unique<DraftModel>(opts_.draft_dir, nvfp4);
+    load_drafters();
     alloc_drafter();
     if (opts_.lora_slots > 0) lora_alloc_drafter();
     alloc_sparse_head();
@@ -618,8 +616,37 @@ int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned
   return best;
 }
 
-void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_t scope, int lora_slot) {
+void Engine::load_drafters() {
+  bool nvfp4 = opts_.draft_nvfp4;
+  if (const char* e = std::getenv("RAGON_DRAFT_NVFP4")) nvfp4 = std::atoi(e) != 0;
+  drafters_.push_back(std::make_unique<DraftModel>(opts_.draft_dir, nvfp4));
+  drafter_ids_.push_back("general");
+  draft_ = drafters_[0].get();
+  const DraftConfig& a = draft_->config();
+  for (const auto& [id, dir] : opts_.extra_drafters) {
+    if (std::find(drafter_ids_.begin(), drafter_ids_.end(), id) != drafter_ids_.end())
+      throw std::runtime_error("drafter " + id + " named twice");
+    auto d = std::make_unique<DraftModel>(dir, nvfp4);
+    const DraftConfig& b = d->config();
+    // MULTI_DRAFTER §5.1: the rings, scratch buffers and the sparse head are one shape, the first drafter's.
+    const bool same = a.hidden == b.hidden && a.intermediate == b.intermediate && a.layers == b.layers &&
+                      a.heads == b.heads && a.kv_heads == b.kv_heads && a.head_dim == b.head_dim &&
+                      a.rope_theta == b.rope_theta && a.eps == b.eps && a.sliding_window == b.sliding_window &&
+                      a.trained_block == b.trained_block && a.mask_token == b.mask_token &&
+                      a.conv_groups == b.conv_groups && a.conv_taps == b.conv_taps &&
+                      a.selector_rank == b.selector_rank && a.selector_top_k == b.selector_top_k &&
+                      a.target_layers == b.target_layers && draft_->nvfp4_copies() == d->nvfp4_copies() &&
+                      draft_->fc4().K == d->fc4().K;
+    if (!same) throw std::runtime_error("drafter " + id + " (" + dir + ") has another shape than general's");
+    std::fprintf(stderr, "drafter %s: %.2f GB\n", id.c_str(), d->device_bytes() / 1e9);
+    drafters_.push_back(std::move(d));
+    drafter_ids_.push_back(id);
+  }
+}
+
+bool Engine::activate_session(int i, const std::string& key, bool fresh, uint64_t scope, int lora_slot, int drafter) {
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
+  if (drafter < 0 || drafter >= std::max(drafters(), 1)) throw std::runtime_error("activate_session: no such drafter");
   side_join();  // a side chunk's session, store entries and donor KV are complete before anything binds or copies
   s_ = &sessions_[i];
   if (s_->scope != scope) {
@@ -640,6 +667,19 @@ void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_
   // adapter drops them (another adapter keeps them: the slots are read on the device). The batch graphs are keyed by it.
   if ((s_->lora_slot >= 0) != (lora_slot >= 0)) clear_session_graphs(*s_);
   s_->lora_slot = lora_slot;
+  // MULTI_DRAFTER §2.3: the graphs bake in the drafter's weights, and the ring was projected by the drafter that built
+  // it. Nothing of the ring is valid from here (dkv_from is the history's end), so only a resume at or before the window's
+  // start is usable and its prefill rebuilds the ring. The target's state and KV stay what they are.
+  const bool changed = s_->drafter != drafter;
+  const bool switched = changed && !fresh && !s_->history.empty();
+  if (changed) {
+    clear_session_graphs(*s_);
+    s_->drafter = drafter;
+    s_->dkv_lo = static_cast<int>(s_->history.size());
+    s_->guard.reset();  // its mean is of the other drafter's steps (BACKLOG 10)
+    s_->shadow.clear();  // the lookup's records are of the other drafter's steps
+  }
+  bind_session(s_);
   if (fresh) {
     if (s_->owned) ++evictions_;
     s_->owned = true;
@@ -650,6 +690,7 @@ void Engine::activate_session(int i, const std::string& key, bool fresh, uint64_
     s_->key = key;
   }
   touch_session();
+  return switched;
 }
 
 void Engine::touch_session() { s_->last_used = std::chrono::steady_clock::now(); }
@@ -658,17 +699,17 @@ void Engine::touch_session(int i) { sessions_.at(i).last_used = std::chrono::ste
 
 void Engine::select_session(int i) {
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
-  s_ = &sessions_[i];
+  bind_session(&sessions_[i]);
 }
 
 void Engine::reset_all() {
   side_join();
   for (Session& s : sessions_) {
-    s_ = &s;
+    bind_session(&s);
     reset_session();
     s.spec = SpecStats{};
   }
-  s_ = &sessions_[0];
+  bind_session(&sessions_[0]);
   ckpts_.clear();
   if (kv_tree_) kv_store_dropped([&] { kv_tree_->clear(); });
 }
@@ -785,16 +826,17 @@ void Engine::kv_store_dropped(const std::function<void()>& op) {
 }
 
 int Engine::kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope, KvSource* src,
-                          const KvGone* gone, bool from_scratch) const {
+                          const KvGone* gone, bool from_scratch, int drafter) const {
   if (!kv_book_ || prompt.empty()) return 0;
   const Session& s = sessions_.at(session);
-  const ResumePlan plan = plan_resume(s, prompt, from_scratch, scope);
+  if (drafter < 0) drafter = s.drafter;
+  const ResumePlan plan = plan_resume(s, prompt, from_scratch, scope, drafter);
   const int need = kv_resume_need(s, plan, prompt, gone);
   if (src) {
     *src = KvSource{};
     if (plan.from_kv) src->store_path = plan.kvm.path;
     else if (plan.donor) src->donor = static_cast<int>(plan.donor - sessions_.data());
-    src->cold = std::max(need, kv_resume_need(s, plan_resume(s, prompt, true, scope), prompt));
+    src->cold = std::max(need, kv_resume_need(s, plan_resume(s, prompt, true, scope, drafter), prompt));
   }
   return need;
 }
@@ -932,7 +974,8 @@ void Engine::adopt_prefix(const Session& from, int n) {
                             cudaMemcpyDeviceToDevice, stream_),
           "session KV copy");
   }
-  if (draft_) {
+  const bool same_drafter = from.drafter == s_->drafter;  // another drafter's ring is nothing this one can read
+  if (draft_ && same_drafter) {
     const DraftConfig& d = draft_->config();
     const size_t ring_bytes = size_t(ring_) * d.kv_heads * d.head_dim * sizeof(__nv_bfloat16);
     for (size_t l = 0; l < s_->dkc.size(); ++l) {
@@ -948,6 +991,7 @@ void Engine::adopt_prefix(const Session& from, int n) {
   s_->snap_pos = -1;  // the active session's own end-of-prompt state belongs to the history it replaced
   s_->shadow.clear();
   truncate_history(n);
+  if (!same_drafter) s_->dkv_lo = n;
 }
 
 void Engine::reset_state() {
@@ -1844,7 +1888,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
 }
 
 Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch,
-                                       uint64_t scope) const {
+                                       uint64_t scope, int drafter) const {
   // (begin_prefill's comment above its call says what is chosen and why.) Share scopes (P4c): only the sessions,
   // checkpoints and store entries of `scope` count; self's history only when it is that scope's (activate_session
   // clears it otherwise).
@@ -1869,7 +1913,11 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
     const int n = std::min(static_cast<int>(s.history.size()), L);
     int lcp = 0;
     while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
-    auto usable = [&](int p) { return p <= lcp && p < L && (!draft_ || p <= window || dkv_from(s) <= window); };
+    // Past the window's start the resume needs s's ring, which only the drafter that built it can read (MULTI_DRAFTER
+    // §2.3); at or before it the prefill rebuilds the ring, so any session's state serves.
+    auto usable = [&](int p) {
+      return p <= lcp && p < L && (!draft_ || p <= window || (s.drafter == drafter && dkv_from(s) <= window));
+    };
     Source r;
     if (s.snap_pos > 0 && usable(s.snap_pos)) r = {s.snap_pos, &s.snap};
     for (const Checkpoint& k : ckpts_)
@@ -1989,7 +2037,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // Where the prompt resumes, planned before anything changes (P4c: the pool's need depends on the source's pages).
   // The truncation below does not change the choice: it keeps every position below the prompt's end, and the drafter
   // ring's valid start only moves to the cut, past any usable resume point.
-  const ResumePlan plan0 = plan_resume(*s_, prompt, from_scratch, s_->scope);
+  const ResumePlan plan0 = plan_resume(*s_, prompt, from_scratch, s_->scope, s_->drafter);
   // P4b: the prompt's pages and kKvGrowthPages more are taken below, whatever the prompt resumes from, after the
   // session's pages past them are given back (their frees deferred as every release's: kv_ensure waits for them when
   // it needs them). Checked first, so a short pool changes nothing (ragon-serve's scheduler admits a request only when
@@ -2401,11 +2449,11 @@ void Engine::prefill_chunk_launch(PrefillCursor& cur, int max_tokens) {
     check(cudaEventRecord(side_done_, stream_), "side chunk");
   } catch (...) {
     swap_side();
-    s_ = main_s;
+    bind_session(main_s);
     throw;
   }
   swap_side();
-  s_ = main_s;
+  bind_session(main_s);
   side_cur_ = &cur;
 }
 

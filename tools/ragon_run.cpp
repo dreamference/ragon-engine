@@ -6,6 +6,7 @@
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
+//            [--drafter ID=DIR ...] [--switch-check]
 //            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
 //
 // --lora LIBRARY/NAME loads that adapter (LORA §3) into one GPU slot and runs every session on it, so each check
@@ -74,6 +75,15 @@
 // (NAME.pixel_values.bf16) and the tower's output from those pixel values against transformers' (NAME.hf_fp32.f32,
 // NAME.hf_bf16.bf16, and production's NAME.sgl.bf16 when present): relative L2 error and the worst token's cosine
 // against the FP32 tower, beside the reference's own. --vision-bench times the tower per image.
+//
+// --drafter ID=DIR (MULTI_DRAFTER §5.3, repeatable; beside --draft, which is `general`): more drafters, loaded at the
+// start. With one, B of --interleave-check and --batch-check runs on it (A on --draft), alone as well as together.
+//
+// --switch-check (MULTI_DRAFTER §2.6; needs --draft and one --drafter): decodes each prompt on one drafter, then the
+// next request of that conversation (the prompt, the output, the prompt's first 16 tokens) on the other, in the same
+// session, both ways, greedy and sampled. Passes when the tokens equal a never-switched run's (and plain decoding's,
+// greedy) and the target's state hash equals its. The rebuilt ring against the one built from the start is reported;
+// it changes proposals and never acceptance. A prompt shorter than the drafter's 2,048 tokens re-prefills from 0.
 //
 // --batch-check (M4 §4, stage 3; needs --draft and --sessions 2) takes the prompts in pairs (A, B) and decodes
 // each pair as a batch of two (Engine::speculate_batch: one verify pass over both sequences' rows), --max-tokens
@@ -334,7 +344,8 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2;
   std::string draft, lora;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
-  bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
+  bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false, switch_check = false;
+  std::vector<std::pair<std::string, std::string>> extra_drafters;  // --drafter ID=DIR, beside --draft (`general`)
   double draft_off_below = -1;  // the drafter-off guard (BACKLOG 10): the engine's default unless given
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
@@ -360,6 +371,12 @@ int main(int argc, char** argv) {
     else if (a == "--ids-out") ids_out = true;
     else if (a == "--prompt-ids-out") prompt_ids_out = true;
     else if (a == "--draft") draft = next();
+    else if (a == "--drafter") {
+      const std::string v = next();
+      const size_t eq = v.find('=');
+      if (eq == std::string::npos || eq == 0 || eq + 1 == v.size()) throw std::runtime_error("--drafter takes ID=DIR");
+      extra_drafters.emplace_back(v.substr(0, eq), v.substr(eq + 1));
+    }
     else if (a == "--lora") lora = next();
     else if (a == "--block") block = std::stoi(next());
     else if (a == "--spec") spec = true;
@@ -385,6 +402,7 @@ int main(int argc, char** argv) {
     else if (a == "--sessions") sessions = std::stoi(next());
     else if (a == "--chunk-check") chunk_check = std::stoi(next());
     else if (a == "--interleave-check") interleave_check = true;
+    else if (a == "--switch-check") switch_check = true;
     else if (a == "--batch-check") batch_check = true;
     else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
@@ -486,6 +504,7 @@ int main(int argc, char** argv) {
     ragon::EngineOptions opts;
     opts.max_context = max_context;
     opts.draft_dir = draft;
+    opts.extra_drafters = extra_drafters;
     opts.draft_block = block;
     opts.lookup_mode = lookup;
     opts.lookup_min_match = lookup_min;
@@ -523,9 +542,11 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "adapter %s (%zu bytes%s)\n", adapter->name.c_str(), adapter->bytes(),
                    adapter->has_drafter ? ", with a drafter part" : "");
     }
-    auto activate = [&](int i, const std::string& key, bool fresh) {
-      engine.activate_session(i, key, fresh, lora_sc, lora_slot);
+    auto activate = [&](int i, const std::string& key, bool fresh, int drafter = 0) {
+      return engine.activate_session(i, key, fresh, lora_sc, lora_slot, drafter);
     };
+    // With a --drafter, the second sequence of --interleave-check and --batch-check runs on it (MULTI_DRAFTER §2.6).
+    const int other_drafter = engine.drafters() > 1 ? 1 : 0;
     if (lora_slot >= 0) activate(0, "", false);
     const std::vector<ragon::PromptImage>* IMG = all_images.empty() ? nullptr : &all_images;
     if (!vision_check.empty()) return vision_check_run(engine, vision_check, vision_bench, vision_dump);
@@ -721,6 +742,76 @@ int main(int argc, char** argv) {
       std::printf(failures ? "CHUNK CHECK FAILED\n" : "chunk check passed\n");
       return failures ? 1 : 0;
     }
+    if (switch_check) {
+      if (engine.drafters() < 2 || prompts.empty())
+        throw std::runtime_error("--switch-check needs --draft, one --drafter and at least one prompt");
+      for (size_t pi = 0; pi < prompts.size(); ++pi) {
+        const std::vector<int>& P = prompts[pi];
+        for (int sampled = 0; sampled < 2; ++sampled) {
+          ragon::SamplingParams sp;
+          sp.temperature = sampled ? (temperature > 0.f ? temperature : 1.f) : 0.f;
+          sp.seed = seed ? seed : 1;
+          for (int to = 0; to < 2; ++to) {
+            const int from = 1 - to;
+            // A request on `from`, then the next one of the conversation on `to`, in the same session.
+            engine.reset_all();
+            Seq first;
+            first.sp = sp;
+            activate(0, "", true, from);
+            engine.prefill(P, nullptr, false, IMG);
+            first.pending = {engine.sample(engine.logits(), sp, engine.history())};
+            while (!first.done) advance(first, max_tokens);
+            const long steps0 = engine.session_spec_stats(0).steps, accepted0 = engine.session_spec_stats(0).accepted;
+            std::vector<int> next = P;
+            next.insert(next.end(), first.out.begin(), first.out.end());
+            next.insert(next.end(), P.begin(), P.begin() + std::min<size_t>(P.size(), 16));
+            const bool counted = activate(0, "", false, to);
+            ragon::EngineStats stats;
+            auto t0 = std::chrono::steady_clock::now();
+            engine.prefill(next, &stats, false, IMG);
+            const double switch_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            const uint64_t ring_switched = engine.draft_hash();
+            Seq q;
+            q.sp = sp;
+            q.pending = {engine.sample(engine.logits(), sp, engine.history())};
+            while (!q.done) advance(q, max_tokens);
+            Result switched = result_of(q);
+            switched.steps -= steps0;
+            switched.accepted -= accepted0;
+            // The same request on `to` from a cold engine, never switched.
+            engine.reset_all();
+            activate(0, "", true, to);
+            engine.prefill(next, nullptr, false, IMG);
+            const uint64_t ring_cold = engine.draft_hash();
+            Seq c;
+            c.sp = sp;
+            c.pending = {engine.sample(engine.logits(), sp, engine.history())};
+            while (!c.done) advance(c, max_tokens);
+            const Result cold = result_of(c);
+            // Plain decoding of it, greedy only: a seed's draw differs between drafters and from plain (§2.6).
+            bool same_plain = true;
+            if (!sampled) {
+              double plain_s = 0;
+              same_plain = generate(next, sp, false, true, &plain_s) == switched.tokens;
+            }
+            const bool same = switched.tokens == cold.tokens && same_plain && switched.hash == cold.hash && counted;
+            failures += !same;
+            std::printf("prompt %zu, %s, %s -> %s: %zu tokens, %d re-prefilled (%d reused) in %.3f s, %zu out, %ld steps %ld "
+                        "accepted (cold %ld, %ld), tokens against cold: %s, against plain: %s, state: %s, ring: %s\n",
+                        pi, sampled ? "sampled" : "greedy", engine.drafter_id(from).c_str(), engine.drafter_id(to).c_str(),
+                        next.size(), stats.prefill_tokens, stats.reused_tokens, switch_s, switched.tokens.size(),
+                        switched.steps, switched.accepted, cold.steps, cold.accepted,
+                        switched.tokens == cold.tokens ? "identical" : "DIFFERS",
+                        sampled ? "not compared" : (same_plain ? "identical" : "DIFFERS"),
+                        switched.hash == cold.hash ? "identical" : "DIFFERS",
+                        ring_switched == ring_cold ? "identical" : "differs (reported, §2.6)");
+            if (!counted) std::printf("  the session did not report a switch\n");
+          }
+        }
+      }
+      std::printf(failures ? "SWITCH CHECK FAILED\n" : "switch check passed\n");
+      return failures ? 1 : 0;
+    }
     if (interleave_check) {
       if (!engine.has_drafter() || engine.sessions() < 2 || prompts.size() < 2)
         throw std::runtime_error("--interleave-check needs --draft, --sessions 2 and at least two prompts");
@@ -736,7 +827,7 @@ int main(int argc, char** argv) {
             Result alone[2];
             for (int k = 0; k < 2; ++k) {
               engine.reset_all();
-              activate(0, "", true);
+              activate(0, "", true, k ? other_drafter : 0);
               engine.prefill(k ? B : A, nullptr, false, IMG);
               Seq q;
               q.sp = sp;
@@ -755,7 +846,7 @@ int main(int argc, char** argv) {
             engine.prefill(A, nullptr, false, IMG);
             a.pending = {engine.sample(engine.logits(), sp, engine.history())};
             for (int k = 0; k < 2 && !a.done; ++k) advance(a, max_tokens);
-            activate(1, "", true);
+            activate(1, "", true, other_drafter);
             ragon::Engine::PrefillCursor cur = engine.begin_prefill(B, false, IMG);
             int chunks_beside = 0;
             while (!a.done || !b.done) {
@@ -842,9 +933,9 @@ int main(int argc, char** argv) {
           }
         }
       };
-      auto start = [&](Seq& q, int session, const std::vector<int>& prompt) {
+      auto start = [&](Seq& q, int session, const std::vector<int>& prompt, int drafter) {
         q.session = session;
-        activate(session, "", true);
+        activate(session, "", true, drafter);
         engine.prefill(prompt, nullptr, false, IMG);
         q.pending = {engine.sample(engine.logits(), q.sp, engine.history())};
       };
@@ -855,8 +946,8 @@ int main(int argc, char** argv) {
           Seq q[2];
           q[0].sp.temperature = q[1].sp.temperature = 0.f;
           q[0].sp.seed = q[1].sp.seed = 1;
-          start(q[0], 0, *P[0]);
-          start(q[1], 1, *P[1]);
+          start(q[0], 0, *P[0], 0);
+          start(q[1], 1, *P[1], other_drafter);
           run_batch({&q[0], &q[1]});
           const ragon::SpecStats& s = engine.session_spec_stats(q[0].session);
           const ragon::SpecStats& o = engine.session_spec_stats(q[1].session);
@@ -878,7 +969,7 @@ int main(int argc, char** argv) {
             engine.reset_all();
             Seq q;
             q.sp = sp;
-            start(q, 0, *P[k]);
+            start(q, 0, *P[k], k ? other_drafter : 0);
             while (!q.done) advance(q, max_tokens);
             alone[k] = result_of(q);
           }
@@ -892,15 +983,15 @@ int main(int argc, char** argv) {
             q[0].sp = q[1].sp = sp;
             int chunks_beside = 0, steps_beside = 0;
             if (run < 2) {
-              start(q[0], 0, *P[0]);
-              start(q[1], 1, *P[1]);
+              start(q[0], 0, *P[0], 0);
+              start(q[1], 1, *P[1], other_drafter);
               run_batch(run == 0 ? std::vector<Seq*>{&q[0], &q[1]} : std::vector<Seq*>{&q[1], &q[0]});
             } else {
               const int f = run == 2 ? 0 : 1, o = 1 - f;  // first (decoding), other (prefilling)
-              start(q[f], 0, *P[f]);
+              start(q[f], 0, *P[f], f ? other_drafter : 0);
               for (int k = 0; k < 2 && !q[f].done; ++k) advance(q[f], max_tokens);
               q[o].session = 1;
-              activate(1, "", true);
+              activate(1, "", true, o ? other_drafter : 0);
               ragon::Engine::PrefillCursor cur = engine.begin_prefill(*P[o], false, IMG);
               while (!cur.done()) {
                 if (engine.prefill_chunk(cur, q[f].done ? 0 : contended))

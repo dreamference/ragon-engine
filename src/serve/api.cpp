@@ -193,11 +193,23 @@ std::string StopScanner::finish() {
   return out;
 }
 
+namespace {
+// The request's workload hint (MULTI_DRAFTER §2.1). API §8: a known key's malformed value is a 400 naming the key.
+std::string workload_of(const json& body) {
+  if (body.contains("ragon") && body["ragon"].is_object() && body["ragon"].contains("workload") &&
+      !body["ragon"]["workload"].is_string())
+    throw std::invalid_argument("ragon.workload must be a string");
+  return declared_workload(body);
+}
+}  // namespace
+
 Request parse_request(const json& body, bool chat, bool vision) {
   if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
   Request r;
   r.chat = chat;
   r.stream = get_or(body, "stream", false);
+  r.workload = workload_of(body);
+  if (body.contains("messages")) r.last_item = last_item_of(body["messages"]);
   if (body.contains("model") && !body["model"].is_null()) {
     if (!body["model"].is_string()) throw std::invalid_argument("model must be a string");
     r.model = body["model"].get<std::string>();
@@ -867,6 +879,7 @@ Request parse_responses_request(const json& body, bool vision) {
     }
   }
   Request r = parse_request(chat, true, vision);
+  r.workload = workload_of(body);  // both carriers sit on the Responses body, which `chat` does not copy
   r.custom_tools = std::move(custom);
   if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
     r.session_key = body["prompt_cache_key"].get<std::string>();

@@ -60,6 +60,9 @@ struct EngineOptions {
   int max_context = 65536;
   int prefill_chunk = 2048;  // measured: 647 tokens/s against 582 at 1024 on a 7.7K-token prompt
   std::string draft_dir;     // the DFlash2 drafter's checkpoint; empty: no speculation
+  // MULTI_DRAFTER §5.3: more resident drafters (id, checkpoint) beside draft_dir, which is `general`, index 0. Each
+  // has draft_dir's shape; all are loaded at start and none while serving.
+  std::vector<std::pair<std::string, std::string>> extra_drafters;
   // LoRA (specs/DREAMFERENCE_RAGON_ENGINE_LORA.md): the GPU pool's adapter slots (max_loras_per_batch - 1; 0: no
   // adapter is served and nothing of LoRA is allocated).
   int lora_slots = 0;
@@ -326,6 +329,10 @@ class Engine {
   // next call's anchor). Greedy output equals plain decoding's token for token; sampled output follows
   // the same distribution (exact rejection sampling).
   bool has_drafter() const { return draft_ != nullptr; }
+  // MULTI_DRAFTER: the resident drafters, `general` first; a session names one by its index here.
+  int drafters() const { return static_cast<int>(drafters_.size()); }
+  const std::string& drafter_id(int i) const { return drafter_ids_.at(i); }
+  int session_drafter(int i) const { return sessions_.at(i).drafter; }
   bool can_speculate(const SamplingParams& p) const;
   // `row_logits`, when given, receives the raw logits each returned token was chosen from: one row of
   // config().vocab floats per returned token, in the same order (the verify's rows, which the
@@ -424,7 +431,12 @@ class Engine {
   // `lora_slot` (LORA §3): the GPU pool's slot of the request's adapter, -1 for the base. The scope already keeps the
   // adapters' histories apart; a session switched between the base and an adapter drops its graphs (captured with or
   // without the adapter's kernels).
-  void activate_session(int i, const std::string& key, bool fresh, uint64_t scope = 0, int lora_slot = -1);
+  // `drafter` (MULTI_DRAFTER §2.3, option c): the resident drafter this request uses. A session that changes drafter
+  // drops its graphs and its drafter-off mean, and its ring holds nothing the new drafter can read, so the next
+  // begin_prefill resumes at or before the window's start and rebuilds the ring. Returns true when a session that was
+  // not new changed drafter (a switch, which the caller counts).
+  bool activate_session(int i, const std::string& key, bool fresh, uint64_t scope = 0, int lora_slot = -1,
+                        int drafter = 0);
   // LoRA (LORA §2): the pool's slot count, and the upload of an adapter's target weights into slot `slot` (whose
   // previous adapter no session uses: LoraSlots decides). Synchronous; throws std::runtime_error for an adapter that
   // does not fit the slot (it was checked against the model at load, so only a bug).
@@ -492,8 +504,9 @@ class Engine {
   // `src`, when given, gets the plan's source. With `gone`, planned as if those holders had let go (the plan's
   // source among them is not taken out of the plan: the scheduler names it only with `from_scratch`, a prefill from
   // position 0).
+  // `drafter`: the request's (MULTI_DRAFTER §2.3), which decides how much of a session's ring counts; -1 the session's.
   int kv_admit_need(int session, const std::vector<int>& prompt, uint64_t scope = 0, KvSource* src = nullptr,
-                    const KvGone* gone = nullptr, bool from_scratch = false) const;
+                    const KvGone* gone = nullptr, bool from_scratch = false, int drafter = -1) const;
   // The pages a prompt of `prompt_len` tokens maps in all (its end plus kKvGrowthPages pages): more than
   // kv_pages_total() and it can never run.
   int kv_admit_pages(size_t prompt_len) const { return KvPool::pages_for(kv_target(prompt_len)); }
@@ -818,7 +831,12 @@ class Engine {
   std::vector<ImgRows> chunk_img_;
   int* mrope_dev_ = nullptr;  // [prefill_chunk][3]
   bool chunk_mrope_ = false;
-  std::unique_ptr<DraftModel> draft_;
+  // MULTI_DRAFTER: every resident drafter, `general` first, and the one the active session uses (bind_session keeps
+  // draft_ on it). The config, scratch buffers and sparse head are the first's: load_drafters refuses another shape.
+  std::vector<std::unique_ptr<DraftModel>> drafters_;
+  std::vector<std::string> drafter_ids_;
+  DraftModel* draft_ = nullptr;
+  void load_drafters();
   cudaStream_t stream_ = nullptr;
   std::vector<void*> buffers_;
   template <typename T>
@@ -893,7 +911,8 @@ class Engine {
     int branch_at = 0;                    // the branch point (BACKLOG 34)
   };
   // `scope`: the share scope the prompt runs in (self's history counts only when it is self's).
-  ResumePlan plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch, uint64_t scope) const;
+  ResumePlan plan_resume(const Session& self, const std::vector<int>& prompt, bool from_scratch, uint64_t scope,
+                         int drafter) const;
   // KvPool::resume_need of the plan, for session `self` and a prompt of L tokens, plus the page the first decode step
   // copies when the prefix KV store will share it (kv_store_cuts: the store's last cut falls in the page that holds
   // position L, so the store holds a reference to the page the session writes next).
@@ -1018,10 +1037,16 @@ class Engine {
     std::string key;     // the prompt_cache_key it was bound with ("" without one)
     uint64_t scope = 0;  // P4c: the share scope of its requests (X-Ragon-Share-Scope; 0: unscoped)
     int lora_slot = -1;  // LORA §3: its request's adapter slot in the GPU pool (-1: the base)
+    int drafter = 0;     // MULTI_DRAFTER: the resident drafter whose ring and graphs this session holds
     std::chrono::steady_clock::time_point last_used{};
   };
   std::vector<Session> sessions_;
   Session* s_ = nullptr;  // the active session
+  // Makes `s` the active session and its drafter the active drafter: the one way s_ moves once a drafter is loaded.
+  void bind_session(Session* s) {
+    s_ = s;
+    if (!drafters_.empty()) draft_ = drafters_[s->drafter].get();
+  }
   long evictions_ = 0;
   // The first position whose drafter context KV session s still holds.
   int dkv_from(const Session& s) const {
