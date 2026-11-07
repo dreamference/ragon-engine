@@ -259,13 +259,16 @@ __device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_
 // engine (attn_bulk_tile) instead of cp.async. The arithmetic is the same either way, bit for bit. (bx, kvh, split):
 // the block's row block, KV head and key range (the launch's blockIdx). CQ: the queries are read through the coherent
 // path (ld.global.cg), for a launch that writes them itself (the megakernel's attention layer); the same values.
-template <int ROWS, int TK, int NS, bool BULK, bool CQ = false>
+// CASC, the cascade (BATCHING §5.3): 1 runs only keys below kcut, every row seeing them all (pos0 == kcut), for the rows of
+// sequences that share those pages; 2 runs only keys from kcut on, starting a range that holds kcut from the partial
+// state the first phase left in `scratch`. Same tile grid, same order of keys, so the same floats as CASC 0.
+template <int ROWS, int TK, int NS, bool BULK, bool CQ = false, int CASC = 0>
 __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                                                    const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq,
                                                    int Hkv, int splits, int chunk, float* __restrict__ scratch, size_t hs,
                                                    size_t ps, int pf, int bx, int kvh, int split,
                                                    const TreeDesc* __restrict__ td = nullptr,
-                                                   const uint64_t* __restrict__ pages = nullptr) {
+                                                   const uint64_t* __restrict__ pages = nullptr, int kcut = 0) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   static_assert(kKvPageTokens % TK == 0, "a tile inside one KV page (P4)");
   extern __shared__ __align__(16) unsigned char smem[];
@@ -274,8 +277,9 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   const int R = M * G, r0 = bx * ROWS, nrows = min(ROWS, R - r0);
   const bool active = warp * 16 < nrows;
   const int last_m = (r0 + nrows - 1) / G;
-  const int kend = pos0 + last_m + 1;  // keys [0, kend) are visible to some row of this block
+  const int kend = CASC == 1 ? kcut : pos0 + last_m + 1;  // keys [0, kend) are visible to some row of this block
   const int klo = split * chunk, khi = min(kend, klo + chunk);
+  const int kfirst = CASC == 2 ? max(klo, kcut) : klo;  // this launch's first key of the range
   if (klo >= kend) {
     // A range no row of this block sees (a graph launches ranges up to a fixed context): an empty partial,
     // max = -inf, which attention_combine_kernel skips without reading its sum or values.
@@ -315,13 +319,30 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
 #pragma unroll
   for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
   float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
+  if constexpr (CASC == 2) {
+    if (klo < kcut) {  // the partial state stored below, back as it was: raw floats, normalized only by the combine
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        if (!(h ? vb : va)) continue;
+        const int row = h ? rb : ra;
+        const float* part = scratch + ((static_cast<size_t>(row / G) * Hq + kvh * G + row % G) * splits + split) * (D + 2);
+        (h ? mb : ma) = part[0];
+        (h ? lb : la) = part[1];
+#pragma unroll
+        for (int i = 0; i < D / 8; ++i) {
+          o[i][2 * h] = part[2 + i * 8 + 2 * t];
+          o[i][2 * h + 1] = part[2 + i * 8 + 2 * t + 1];
+        }
+      }
+    }
+  }
   // A ring of NS stages: tiles i + 1 .. i + NS - 1 are in flight while tile i is computed. Every
   // iteration commits one cp.async group (empty past the range), so wait_group NS - 2 always means
   // "tile i has landed". With BULK, stage s's tiles complete phases 0, 1, 0, ... of bar[s] instead.
   // In a tree the pipelined loop stops before the first tile (on the range's own grid of TK keys) holding a key at
   // or past pos0, the tail, which follows per variant below; a chain's loop covers the whole range.
   const int kctx = td ? min(khi, klo + max(0, (pos0 - klo) / TK) * TK) : khi;
-  const int ntiles = (kctx - klo + TK - 1) / TK;
+  const int ntiles = (kctx - kfirst + TK - 1) / TK;
   __shared__ __align__(8) uint64_t bar[BULK ? NS : 1];
   if constexpr (BULK) {
     // Zero the stages once (rows past the range are never copied), make those generic-proxy writes
@@ -435,14 +456,14 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
 #pragma unroll
   for (int p = 0; p < NS - 1; ++p) {
     if constexpr (BULK) {
-      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, pages, &bar[p]);
+      if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, kfirst + p * TK, khi, kvh, hs, ps, pages, &bar[p]);
     } else {
-      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, klo + p * TK, khi, kvh, hs, ps, pages);
+      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, kfirst + p * TK, khi, kvh, hs, ps, pages);
       else asm volatile("cp.async.commit_group;");
     }
   }
   for (int it = 0; it < ntiles; ++it) {
-    const int k0 = klo + it * TK;
+    const int k0 = kfirst + it * TK;
     if constexpr (BULK) mbar_wait(&bar[it % NS], (it / NS) & 1);
     else asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
     __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
@@ -457,7 +478,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       if (pf > 0 && ps == static_cast<size_t>(D)) {
         if (it == 0)
           for (int p = NS; p < NS + pf - 1; ++p)
-            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, klo + p * TK, khi, kvh, hs, ps, pages);
+            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, kfirst + p * TK, khi, kvh, hs, ps, pages);
         if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps, pages);
       }
     }

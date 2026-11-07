@@ -1317,6 +1317,75 @@ bool test_batched_state_kernels() {
                     (void*)scratch, (void*)o1, (void*)o2})
       cudaFree(p);
   }
+  // ---- the cascade: keys on shared pages computed once for every row that shares them ----
+  {
+    const int Hq = 24, Hkv = 4, D = 256, page = k::kKvPageTokens, shared = 150, own = 10;
+    k::set_kv_layout(size_t(page) * D, D);
+    const size_t page_elems = size_t(page) * Hkv * D;
+    const int pool_pages = 2 * shared + 32 * own;  // the shared run, a sequence with a table of its own, 32 tails
+    __nv_bfloat16* pk = upload(randb(pool_pages * page_elems));
+    __nv_bfloat16* pv = upload(randb(pool_pages * page_elems));
+    // Sequence i's table: `run` pages from `first`, then its own tail.
+    auto table = [&](int first, int run, int i) {
+      std::vector<uint64_t> t(shared + own);
+      for (int p = 0; p < shared + own; ++p)
+        t[p] = (p < run ? first + p : 2 * shared + i * own + (p - run) % own) * page_elems;
+      return upload(t);
+    };
+    float* qc = upload(randv(size_t(32) * Hq * D, 0.05f));
+    const size_t bytes = size_t(32) * Hq * D * 4;
+    float *scr, *ref, *got;
+    cudaMalloc(&scr, k::attention_rows_scratch_floats(32, Hq, D, (shared + own) * page) * sizeof(float));
+    cudaMalloc(&ref, bytes), cudaMalloc(&got, bytes);
+    struct Case {
+      const char* name;
+      std::vector<int> rows, pos, first, run;
+      k::SeqGroups g;
+    };
+    k::SeqGroups all, mixed, two;
+    all.n = 1, all.seq0[0] = 0, all.seq1[0] = 32, all.cut[0] = 8960;
+    mixed.n = 1, mixed.seq0[0] = 0, mixed.seq1[0] = 3, mixed.cut[0] = 6400;
+    two.n = 2, two.seq0[0] = 0, two.seq1[0] = 2, two.cut[0] = 8192, two.seq0[1] = 2, two.seq1[1] = 4, two.cut[1] = 6400;
+    Case thirtytwo{"32 forks, a cut inside a range", {}, {}, {}, {}, all};
+    for (int i = 0; i < 32; ++i) {
+      thirtytwo.rows.push_back(1);
+      thirtytwo.pos.push_back(8960 + i * 7);
+      thirtytwo.first.push_back(0);
+      thirtytwo.run.push_back(140);
+    }
+    const std::vector<Case> cases = {
+        thirtytwo,
+        {"forks of several rows beside a sequence with no sharing", {1, 1, 3, 1}, {6400, 7000, 6463, 7001}, {0, 0, 0, shared},
+         {100, 105, 100, 120}, mixed},
+        {"two groups, one cut on a range's end", {1, 2, 1, 1}, {8200, 8192, 6500, 6401}, {0, 0, 0, 0}, {128, 128, 100, 100}, two},
+    };
+    for (const Case& c : cases) {
+      const int n = static_cast<int>(c.rows.size());
+      k::SeqBatch b;
+      b.n = n;
+      k::SeqPtrs<const __nv_bfloat16> kp, vp;
+      k::SeqPtrs<const uint64_t> tp;
+      std::vector<uint64_t*> tables;
+      for (int i = 0; i < n; ++i) {
+        b.row0[i + 1] = b.row0[i] + c.rows[i];
+        b.pos[i] = c.pos[i];
+        kp.p[i] = pk, vp.p[i] = pv;
+        tables.push_back(table(c.first[i], c.run[i], i));
+        tp.p[i] = tables.back();
+      }
+      const size_t used = size_t(b.row0[n]) * Hq * D * 4;
+      for (int i = 0; i < n; ++i)
+        k::attention_rows(qc + size_t(b.row0[i]) * Hq * D, pk, pv, c.pos[i], c.rows[i], Hq, Hkv, D, scr,
+                          ref + size_t(b.row0[i]) * Hq * D, nullptr, 0, nullptr, tp.p[i]);
+      k::attention_rows_cascade(qc, kp, vp, b, c.g, Hq, Hkv, D, scr, got, nullptr, tp);
+      const bool eq = same(download(ref, used / 4).data(), download(got, used / 4).data(), used);
+      ok &= eq;
+      std::printf("the cascade identical to per sequence, %s: %s\n", c.name, eq ? "yes ok" : "NO FAIL");
+      for (uint64_t* t : tables) cudaFree(t);
+    }
+    k::set_kv_layout(0, 0);
+    for (void* p : {(void*)pk, (void*)pv, (void*)qc, (void*)scr, (void*)ref, (void*)got}) cudaFree(p);
+  }
   // ---- the verify's gdn_conv and gdn_recurrent ----
   {
     const int H = 16, HV = 48, C = 2 * H * 128 + HV * 128;

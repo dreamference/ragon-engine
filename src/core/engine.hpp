@@ -551,6 +551,8 @@ class Engine {
     const kernels::TreeDesc* td = nullptr;  // a batched verify's tree for this sequence (tree_ is the one-row step's)
   };
   void forward_rows(const int* ids, int M, Pass pass, int keep_at, std::span<const Seg> segs);
+  // The runs of segs whose sessions map the same KV pages (attention_rows_cascade); none in a flat cache.
+  kernels::SeqGroups cascade_groups(std::span<const Seg> segs) const;
   // The rows path's linear layers take x through an FP16 copy; `x_ready` reuses the previous call's copy
   // (the same x feeding several matrices).
   void linear_fp4(const Fp4Weight& w, const float* x, int M, float* y, bool x_ready = false);
@@ -569,6 +571,7 @@ class Engine {
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)
   bool quantized_ = false;                // set by forward(): the pass is a prefill
+  bool verify_commits_ = false;           // set by step_batch: a joint verify writes each sequence's state as it goes
   bool kv_pages_ = false;                 // opts_.kv_pages or RAGON_KV_PAGES (P4)
   __nv_bfloat16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
   size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
@@ -1051,6 +1054,7 @@ class Engine {
   void adopt_prefix(const Session& from, int n);
 
   std::vector<float> logits_;
+  std::chrono::steady_clock::time_point fanout_last_;  // RAGON_PROFILE: the last step_batch's end
   bool profile_ = false;
   std::map<std::string, double> phase_seconds_;
 

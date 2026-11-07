@@ -489,7 +489,10 @@ class Scheduler {
         if (look) {
           dirty_ = false;
           last_look_ = now;
-          if (pick(job)) break;
+          if (pick(job)) {
+            dirty_ = !queue_.empty();  // a burst: the jobs behind this one are looked at on the next turn, not in a second
+            break;
+          }
         }
         if (!running_.empty()) return true;
         kv_gauges();  // the pool's gauges stay current while nothing runs
@@ -697,6 +700,12 @@ class Scheduler {
             k = j;
             break;
           }
+      gang_unit_ = false;
+      if (Running* g = gang_prefill()) {
+        k = static_cast<size_t>(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == g; }) -
+                                running_.begin());
+        gang_unit_ = true;
+      }
       Running& r = *running_[k];
       std::vector<Running*> ended;
       // P4b: a decode step whose KV pages are not there waits while the others run; when every request waits, the
@@ -753,6 +762,39 @@ class Scheduler {
     int decoding = 0;
     for (const auto& o : running_) decoding += !o->prefilling;
     return decoding > fanout_plain_above_;
+  }
+  // Fan-out's question prefills (BATCHING P4d): above --fanout-plain-above live requests, the short prefills waiting
+  // (at most a chunk left: a fork's question after a shared context) run ahead of the decode passes, shortest first and
+  // alone on the main stream, so the forks start decoding together instead of each waiting out the others' steps; a pass
+  // over 32 rows is what pays. A hold lasts kGangHold at most, then a decode pass runs. None while a side chunk is in
+  // flight: the decoders go on beside it.
+  static constexpr auto kGangHold = std::chrono::seconds(10);
+  Running* gang_prefill() {
+    if (fanout_plain_above_ <= 0 || static_cast<int>(running_.size()) <= fanout_plain_above_) return nullptr;
+    Engine& eng = *ctx_.engine;
+    int live = 0;
+    Running* next = nullptr;
+    for (const auto& o : running_) {
+      if (!o->prefilling) {
+        ++live;
+      } else if (prefill_left(*o) <= eng.prefill_chunk_size()) {
+        ++live;
+        if (!next || prefill_left(*o) < prefill_left(*next)) next = o.get();
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!next || live <= fanout_plain_above_ || eng.side_busy()) {
+      gang_holding_ = false;
+      return nullptr;
+    }
+    if (!gang_holding_) {
+      gang_holding_ = true;
+      gang_t0_ = now;
+    } else if (now - gang_t0_ >= kGangHold) {
+      gang_holding_ = false;
+      return nullptr;
+    }
+    return next;
   }
   // Whether r's next step speculates.
   bool spec_turn(const Running& r) const { return r.spec && !fanout_plain(); }
@@ -1079,7 +1121,7 @@ class Scheduler {
   bool unit(Running& r) {
     Engine& eng = *ctx_.engine;
     if (r.prefilling) {
-      const bool contended = other_decoding(r);
+      const bool contended = !gang_unit_ && other_decoding(r);
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
@@ -1304,6 +1346,9 @@ class Scheduler {
   int batch_, contended_, side_share_;
   bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
   int fanout_plain_above_;  // --fanout-plain-above: fanout_plain(), 0 for never
+  bool gang_unit_ = false;     // this turn's unit is a gang_prefill()
+  bool gang_holding_ = false;  // the decode passes are holding for short prefills, since gang_t0_
+  std::chrono::steady_clock::time_point gang_t0_;
   StepTrace trace_{std::getenv("RAGON_STEP_TRACE")};  // the per-step trace, when the variable names a file
   const char* unit_kind_ = nullptr;  // what the last unit did, for the trace (null: nothing worth a line)
   mutable std::vector<StepCandidate> cand_;  // the partner choice's view for the trace (filled while it is on)

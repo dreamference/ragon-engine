@@ -107,3 +107,40 @@ def test_two_requests_with_choices_at_once(server):
         t.join()
     for tag in ("twoa", "twob"):
         assert len(set(texts(out[tag]))) == 1 and len(out[tag]["choices"]) == 4
+
+
+LONG_IDS = [1000 + i % 5000 for i in range(20000)]  # past the checkpoint store's chunk multiples (eight, 2048 apart)
+
+
+def completion(server, ids, max_tokens=1):
+    status, out = server.request(
+        "/v1/completions", {"prompt": ids, "max_tokens": max_tokens, "temperature": 0}
+    )
+    assert status == 200, out
+    return out
+
+
+def test_the_second_fork_resumes_where_the_first_one_did(server):
+    """The first follow-up rewrites the session's end state: the point it left stays in the store for the next one."""
+    completion(server, LONG_IDS)
+    completion(server, LONG_IDS + [7001, 7002, 7003])
+    second = completion(server, LONG_IDS + [7004, 7005, 7006])
+    assert second["usage"]["prompt_tokens_details"]["cached_tokens"] >= len(LONG_IDS)
+
+
+def test_many_forks_with_their_own_questions_answer_as_alone(server):
+    """Past --fanout-plain-above live requests the question prefills run ahead of decoding; the answers do not change."""
+    ids = LONG_IDS[:4096]
+    questions = [ids + [7100 + 3 * i, 7101 + 3 * i, 7102 + 3 * i] for i in range(12)]
+    alone = [completion(server, q, 16)["choices"][0]["text"] for q in questions]
+    together = [None] * len(questions)
+
+    def one(i):
+        together[i] = completion(server, questions[i], 16)["choices"][0]["text"]
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(len(questions))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert together == alone
