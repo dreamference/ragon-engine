@@ -1,6 +1,6 @@
 # ragon-engine: Several drafters, one per kind of work
 
-Part of the ragon-engine specification; the index is [README.md](./README.md). Written on 2026-11-04 at the owner's decision of that day: **Ragon's next major release ships several speculative drafters, each tuned for a different kind of work.** This document is the specification. Nothing has been trained or built yet. It has no section number in the former `SPEC.md`.
+Part of the ragon-engine specification; the index is [README.md](./README.md). Written on 2026-11-04 at the owner's decision of that day: **Ragon's next major release ships several speculative drafters, each tuned for a different kind of work.** This document is the specification. The serving path is built (`--drafter ID=DIR`, `--drafter-routes FILE`, `x-ragon-drafter`, the `/metrics` labels, `ragon-run --switch-check`; measured in §4.4); no second drafter worth shipping exists yet. It has no section number in the former `SPEC.md`.
 
 It builds on:
 
@@ -263,6 +263,15 @@ The bar extends the memo's rule (SELF_SPEEDING §6.3) to specialists:
 - Option (c)'s switch cost is measured and reported per switch. It re-prefills from the nearest kept state at or before the window's start: at least 2,048 tokens, more when the last message boundary or prefix-store node lies earlier. Phase 2 reports the distribution on the mixed replay, and each switch is counted.
 - `structset` is no slower under any shipped drafter than under `general`.
 - Production's start canary and the tool-call canary (Ragon MODELS §2.1) pass with each drafter.
+
+**Measured on 2026-11-07, serving path only.** No second trained drafter exists, so "three drafters" was the one real drafter (RTN) plus two copies loaded as separate models, and the mixed replay was also run with the scale-search drafter as a really different second one. Flat KV, as the shipping recipe; the paged path has `--switch-check` and `--batch-check` only.
+
+- **Three resident, all on `general`:** `agentlong`, 52 turns, greedy, one stream, four ABBA pairs: 100.06% of one drafter's tok/s, 95% interval ±0.27% (50.17 against 50.13). Every output identical, the same 4,771 verify passes, no request on another drafter. Passes.
+- **Memory:** admission counts each extra drafter at 1.55 GB; the plan goes from 48.6 GB to 51.7 GB. Rings stay per session (§5.4).
+- **Mixed replay, two streams, three runs each:** same drafter 31.82 tok/s against 31.84 today (−0.07%, within the noise); different drafters 31.46 (−1.2%; 31.51 with the scale-search drafter). Both pass, and all outputs are identical. A third of the passes were batched. In the time with both streams decoding, different drafters are 5.6% slower, the cost §2.3 predicts for a second draft pass; a workload that always overlaps would sit just past the 5% line. Mixed batches are not refused: they run on the per-sequence eager path, one draft pass per drafter, and pairing sessions by drafter is the possible follow-up.
+- **Switch cost:** the mixed replay has no switches, since each stream keeps its session, so the distribution comes from a forced set: 28 long turns, each primed on one drafter and run on another, two sessions, three runs. 19 switches in 28 turns; re-prefilled tokens min 145, p50 18,809, p90 33,969, max 39,405 (the count includes the new turn's tokens); seconds min 0.19, p50 9.6, p90 19.3, max 23.6. The whole set takes 739 s against 523 s without switches, every output identical. A switch can cost **less than the 2,048 tokens above**: a kept state past the window's start is usable from another session holding the target drafter's ring. It usually costs far more, because kept states are sparse in a long conversation.
+- **Canaries:** the text and tool-call canaries pass on the three ids (copies of one drafter). `--spec-check` and `--graph-check` pass on RTN and the scale-search drafter, `--switch-check` flat, paged and eager.
+- **`structset` is not measured:** the engine has no structured output yet and the set is not built, and with one real drafter the comparison would say little.
 
 ## 5. Distribution
 
