@@ -1029,15 +1029,23 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // P4b: the KV pages of every row the verify may write, before anything of the step runs (all or nothing: a short
   // pool throws KvPoolExhausted with nothing drawn or changed), so a replayed verify graph finds them mapped.
   kv_ensure(*s_, s_->pos, s_->pos + kv_step_rows(*s_, true), stream_);
-  // Graphs have the block's shape and the drafter's chain; a short block at the context's end or a lookup
-  // chain runs eagerly. Either way the same kernels run, so the result is the same.
-  const bool graph = graphs_ && B == opts_.draft_block && !(opts_.lookup_mode == 2);
+  // Graphs have the block's shape; a short block at the context's end runs eagerly. A lookup chain keeps the graphs:
+  // it is padded below to the block's rows (the verify graph's shape), so the same graphs replay. Either way the
+  // same kernels run, so the result is the same.
+  const bool graph = graphs_ && B == opts_.draft_block;
   auto t0 = std::chrono::steady_clock::now();
   StepPlan sp;
   sp.s = s_;
   sp.p = &p;
   sp.anchor = anchor;
   plan_begin(sp, B);
+  if (graph && sp.use_lookup && sp.E < B - 1) {
+    // Pad the chain to the block's rows with its last token: a pad row is verified like any proposal (accepted only
+    // if it is what the model would write), so the output is unchanged and the graphs' shape holds.
+    sp.rows.resize(B, sp.rows.back());
+    sp.E = B - 1;
+    sp.V = B;
+  }
   if (graph) {  // the position every graph of this step reads
     pin_->pos = s_->pos;
     check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
