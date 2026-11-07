@@ -383,7 +383,7 @@ struct Running {
 class Scheduler {
  public:
   Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0,
-            bool fair_pairing = false, int fanout_plain_above = 0)
+            bool fair_pairing = false, int fanout_plain_above = 0, int fanout_gang_above = -1)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
@@ -391,6 +391,7 @@ class Scheduler {
         side_share_(side_share),
         fair_pairing_(fair_pairing),
         fanout_plain_above_(fanout_plain_above),
+        fanout_gang_above_(fanout_gang_above < 0 ? fanout_plain_above : fanout_gang_above),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -515,7 +516,7 @@ class Scheduler {
       const char* e = std::getenv("RAGON_JOINT_PREFILL");
       return !e || *e != '0';
     }();
-    if (!on || fanout_plain_above_ <= 0 || running_.empty()) return false;
+    if (!on || fanout_gang_above_ <= 0 || running_.empty()) return false;
     const Running& last = *running_.back();
     if (!last.prefilling || prefill_left(last) > ctx_.engine->prefill_chunk_size()) return false;
     Job job;
@@ -791,14 +792,14 @@ class Scheduler {
     for (const auto& o : running_) decoding += !o->prefilling;
     return decoding > fanout_plain_above_;
   }
-  // Fan-out's question prefills (BATCHING P4d): above --fanout-plain-above live requests, the short prefills waiting
-  // (at most a chunk left: a fork's question after a shared context) run ahead of the decode passes, shortest first and
-  // alone on the main stream, so the forks start decoding together instead of each waiting out the others' steps; a pass
-  // over 32 rows is what pays. A hold lasts kGangHold at most, then a decode pass runs. None while a side chunk is in
-  // flight: the decoders go on beside it.
+  // Fan-out's question prefills (BATCHING P4d): above --fanout-gang-above live requests (by default the plain
+  // threshold), the short prefills waiting (at most a chunk left: a fork's question after a shared context) run ahead
+  // of the decode passes, shortest first and alone on the main stream, so the forks start decoding together instead of
+  // each waiting out the others' steps; a pass over 32 rows is what pays. A hold lasts kGangHold at most, then a
+  // decode pass runs. None while a side chunk is in flight: the decoders go on beside it.
   static constexpr auto kGangHold = std::chrono::seconds(10);
   Running* gang_prefill() {
-    if (fanout_plain_above_ <= 0 || static_cast<int>(running_.size()) <= fanout_plain_above_) return nullptr;
+    if (fanout_gang_above_ <= 0 || static_cast<int>(running_.size()) <= fanout_gang_above_) return nullptr;
     Engine& eng = *ctx_.engine;
     int live = 0;
     Running* next = nullptr;
@@ -811,7 +812,7 @@ class Scheduler {
       }
     }
     const auto now = std::chrono::steady_clock::now();
-    if (!next || live <= fanout_plain_above_ || eng.side_busy()) {
+    if (!next || live <= fanout_gang_above_ || eng.side_busy()) {
       gang_holding_ = false;
       return nullptr;
     }
@@ -1418,6 +1419,7 @@ class Scheduler {
   int batch_, contended_, side_share_;
   bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
   int fanout_plain_above_;  // --fanout-plain-above: fanout_plain(), 0 for never
+  int fanout_gang_above_;   // --fanout-gang-above: gang_prefill() and burst_more(), 0 for never, -1 as plain
   bool gang_unit_ = false;     // this turn's unit is a gang_prefill()
   bool gang_holding_ = false;  // the decode passes are holding for short prefills, since gang_t0_
   std::chrono::steady_clock::time_point gang_t0_;
@@ -2167,7 +2169,8 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = -1;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = -1,
+       fanout_gang_above = -1;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -2231,6 +2234,7 @@ int main(int argc, char** argv) {
     else if (a == "--auto-size") auto_size = std::stol(next());
     else if (a == "--fair-pairing") fair_pairing = std::stol(next());
     else if (a == "--fanout-plain-above") fanout_plain_above = std::stol(next());
+    else if (a == "--fanout-gang-above") fanout_gang_above = std::stol(next());
     else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
@@ -2352,7 +2356,8 @@ int main(int argc, char** argv) {
                           std::pair<const char*, long*>{"RAGON_ADMIT_RESERVE_MB", &admit_reserve_mb},
                           std::pair<const char*, long*>{"RAGON_AUTO_SIZE", &auto_size},
                           std::pair<const char*, long*>{"RAGON_FAIR_PAIRING", &fair_pairing},
-                          std::pair<const char*, long*>{"RAGON_FANOUT_PLAIN_ABOVE", &fanout_plain_above}})
+                          std::pair<const char*, long*>{"RAGON_FANOUT_PLAIN_ABOVE", &fanout_plain_above},
+                          std::pair<const char*, long*>{"RAGON_FANOUT_GANG_ABOVE", &fanout_gang_above}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -2503,8 +2508,11 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
   if (fanout_plain_above < 0) fanout_plain_above = draft_dir.empty() ? 1 : kFanoutPlainAboveDrafting;
+  // The fork prefills gang above the same count unless told otherwise (BATCHING §5.8: speculation under fan-out needs
+  // the forks started together as much as plain steps do).
+  if (fanout_gang_above < 0) fanout_gang_above = fanout_plain_above;
   ragon::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0,
-                                     static_cast<int>(fanout_plain_above));
+                                     static_cast<int>(fanout_plain_above), static_cast<int>(fanout_gang_above));
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;
