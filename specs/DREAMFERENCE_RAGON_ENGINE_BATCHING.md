@@ -377,6 +377,43 @@ Plain is 201 at every rep. A warm step of 32 sessions takes 252.7 ms, back to ba
 
 Why rep 0 is slower: its questions trip five forks' drafter guards, which before this stage ran as five serial one-row units after every batch step and as a 25-second tail, and left a 27-session batch with room for one tree. With both fixed, a rep-0 step is the 27-session wide pass (223-228 ms) followed by a plain pass of the five (95-97 ms). What would close most of the rest, not built: the guard-off requests ride in the wide verify as one-row segments (59 rows of 64), with no second pass a step; estimated about 188 tok/s for rep 0. The production default stays plain above 6 drafting requests; the 64-row pass is behind the flags above until the ride-along makes rep 0 beat plain.
 
+**Stage 10, landed: the guard-off requests ride in the wide verify** (2026-11-07). In `speculate_batch`, a request whose drafter guard has its next step plain no longer waits for a separate plain pass. It joins the batch after the drafting sequences as a rider: one row (its anchor), V = 1, no draft. It takes its token from the verify's top K exactly as `step_batch` draws it (K 1 when greedy, else `top_k`; the seed counts the anchor in the history), and it commits as a step with nothing accepted (`commit_launch(row0, 1)`, which carries the drafter's context for that row). The step counts as the guard's plain step (`guard.plain()`, `drafter_off_steps`) and in `/spec_stats` as `ride_steps`. The riders' rows come out of the tier before the trees do: a drafting sequence takes a tree only while rows are left after the riders. Their graphs are their batch's own (the order key carries `INT_MIN + nd`). The serve loop forms such a batch whenever one sequence speculates. `RAGON_RIDE_ALONG=0` turns it off (stage 9's behaviour).
+
+Measured on 32 forks x 2 rows with the flags above (32K context, 100 tokens a fork, span / wall tok/s, one binary, `RAGON_RIDE_ALONG=0` for the second column):
+
+| rep | ride | no ride | stage 9 |
+| --- | ---: | ---: | ---: |
+| 0 (285 guard-off steps, 181 rode) | 196.5 / 175.9 | 160.8 / 146.8 | 159.5 / 145.0 |
+| 1 | 233.8 / 202.4 | 230.6 / 202.1 | 230.4 / 201.8 |
+| 2 | 230.5 / 199.8 | 202.4 / 178.5 | 227.6 / 197.7 |
+| 3 (65 guard-off steps) | 196.4 / 174.0 | 155.3 / 142.1 | 160.4 / 145.5 |
+
+Rep 0 is 196.5 against the 188 estimated. Greedy outputs are sha-identical between ride and no ride, and against the base, at every rep. The gates held: ctest, `--batch-check paged` at the default block and at `--block 32`, `--joint-check 32`, `--fanout-check 32`, and the 33-session server test.
+
+Sampled output with riders is deterministic run to run, but it is not the same as without them. A forced test (api-n 32, temperature 0.7, `RAGON_DRAFT_OFF_SAMPLED=1`, `--draft-off-below 1.8`) gave 192/175/181 tok/s against 157/160/153, with 1-2 of 32 forks differing per rep. The cause is the tree budget: riders take rows, so fewer drafting sequences verify trees (greedy: 1587 tokens drafted against 1685, 1332 accepted against 1333). A sampled speculative continuation depends on its drafts, and it already depended on which sequences shared its batch. Production does not hit this, because the guard applies to sampled requests only with `RAGON_DRAFT_OFF_SAMPLED=1`.
+
+Against today's default (plain above 6 drafting requests, trees at or below), same workload, outputs sha-identical at every width and rep:
+
+| forks | default | flags above, rep 0 / 1 / 2 / 3 |
+| --- | --- | --- |
+| 4 | 73.8 / 66.6 / 65.1 / 71.5 (trees, batched) | 34.7 / 34.1 / 33.7 / 33.7 |
+| 8 | 78.1 every rep (plain) | 82.3 / 111.3 / 112.0 / 82.5 |
+| 16 | 136.1 every rep (plain) | 131.8 / 131.2 / 171.7 / 168.1 |
+| 32 | 199.7 / 199.7 / 199.4 / 199.2 (plain) | 194.7 / 230.8 / 228.1 / 194.1 |
+
+(Span tok/s; the reps with guard-off steps are 0 and 3 at 8 and 32, 0 and 1 at 16.) The flags are never slower than the default at 8 forks. At 16 and 32 they are 2-3% slower on the reps where guards trip and 17-26% faster on warm reps. At 4 forks, where block 2 replaces trees, they give half the throughput. The default is unchanged.
+
+**The ~39 ms before the wide verify** (stage 9's open question) was the previous step's DeltaNet commit. With the commit beside the next draft, `speculate_batch` queued one replay per sequence on `commit_stream_`: a graph each, a few small blocks per launch, about 2.7 ms per sequence and about 85 ms for a 32-wide step. The 20 ms draft hid part of it, and the next verify waited about 39 ms on `commit_done_` before its first kernel (nsys with `-t cuda-sw,nvtx`; the hardware trace dropped kernels on this box). The fix: `commit_state_seqs` replays every sequence in one launch per kernel and layer (`gdn_conv_commit_seqs`, `gdn_recurrent_commit_seqs`). These use the per-sequence kernels' arithmetic, so outputs are identical. `SeqBatch::row1` marks each sequence's end, because the accepted rows leave gaps between sequences. The replay now takes about 53 ms. The verify's first kernel starts at its launch, but the step period falls only from 245 to 241 ms. The replay reads and writes every sequence's FP32 state, about 9.6 GB a step at about 250 GB/s, and the step is bandwidth-bound, so those bytes cost time wherever they run. Same workload, one binary, `RAGON_COMMIT_STATE_BATCH=0` for the second column:
+
+| forks | batched, rep 0 / 1 / 2 / 3 | per sequence |
+| --- | --- | --- |
+| 32, flags above | 198.0 / 235.0 / 232.0 / 197.1 | 195.0 / 230.1 / 228.5 / 187.2 |
+| 16, flags above | 132.9 / 131.9 / 172.8 / 169.3 | 132.3 / 131.5 / 171.9 / 168.2 |
+| 8, default (plain) | 78.3 / 78.3 / 78.3 | 78.3 / 78.2 / 78.1 |
+| 4, default (trees) | 50.4 / 66.5 / 66.0 | 47.2 / 65.9 / 64.3 |
+
+Outputs and step counts are identical at every width and rep. The gates held again, and the sampled api-n 32 run gives the same output as before. With it, the flags' guard reps at 32 forks are within 1% of the default (198.0 and 197.1 against 199.7 and 199.2), and at 16 forks still about 3% behind. What would remove more, not built: fold the commit into the next verify's recurrence, which reads the same state. It would replay the accepted rows first and write the state once, which saves the commit's read of the state: one of the step's three passes over it, about 4.8 GB at 32 forks. That needs the previous step's saved inputs double-buffered.
+
 ## 6. Phases
 
 Each phase merges into main once its exactness gate passes and nothing regresses (one stream's agentlong tokens/s within noise of main, every earlier gate still green). Expected gains are from §3.1's model and are measured, not assumed, at each gate.
