@@ -254,6 +254,32 @@ The fused pass (C2, `forward_fused`) launches the same kernels and inherits the 
 - **P4c, sharing.** `adopt_prefix` maps pages; the prefix KV store holds pages, its arena states only; copy-on-write. Gate: `ragon-prefix-kv-tests` extended, `--prefix-check`, agentlong 16/16 with prefill tokens no more than today's. (~3 days)
 - **P4d, the default.** `--kv-pages` on; then in Ragon the recipe passes `--sessions 4 --batch 4` at 262,144, and `start_server`'s pre-load check counts the engine's plan, not the recipe's 0.50 arena (~61 GB), or it guards less than the engine takes (§3.5). Ships after a night with no loss. Eight sessions only after node-c's eight-session reproduction (§2.6) and the owner's say. (~1 day and a night) *Merged with the flat slots still the default (2026-11-04, the owner's decision):* paged KV is exact (agentlong 16/16 identical at 4 warm streams in every run) but its passes are slower: on node-b, 4 warm agentlong streams at `--sessions 4 --batch 4 --max-context 65536`, paged took 182.6-195.7 ms a pass (mean 187.6; pooled 32.7-35.1 tokens/s, mean 34.0, over four runs) against the flat slots' 170.9-185.3 (mean 177.9; 34.3-37.2, mean 35.8, over three) in the same windows, at the same tokens a pass (6.30-6.48): about 5% more a pass, the ranges overlapping, so the flip waits for that cost to be found and removed. `--kv-pages` (or `RAGON_KV_PAGES=1`) turns paging on, `--no-kv-pages` says the default explicitly, `--kv-pool-mb` needs `--kv-pages`. `--plan-only` reports the paged plan (`kv_pages`, `kv_pool_bytes`, `kv_pool_pages`, `host_reserve_bytes`), and auto-size follows it (n sessions fit when the pool holds one conversation at the context and n x context / 2). The prefix KV store's budget (`--prefix-kv-mb`, 4,096 MB) is left out of the pool: since P4c it holds states only and the engine allocates it after the pool at that size. The Ragon side (the recipe and the pre-load check) follows the merge.
 
+**Fan-out, what landed and what it measures (2026-11-07).** Many forks of one long context decoding at once, behind `--kv-pages`, which stays off by default (P4d).
+- **Sharing and forks.** A fork maps its parent's pages and copies only per-sequence state; a page is copied on the first write into it. `kMaxSeqs` is 32 and forks past it queue. At exactly 32,000 tokens (500 pages) no page is copied on the measured path.
+- **The cascade** (`RAGON_CASCADE=0` turns it off): attention over the pages adjacent sequences share is computed once per group, then each fork's own suffix is added. Joint, eager and paged only, from 4,096 shared keys (`kCascadeMinKeys`); forks that are not adjacent in the batch are not grouped. 172 tok/s against 128 at 32 forks when it landed; one stream never takes it.
+- **The plain threshold** (`--fanout-plain-above`, `RAGON_FANOUT_PLAIN_ABOVE`, 0 for never): above it every decoder takes plain batched steps, with the drafter's rings kept up. The default is 6 with a drafter, 1 without one. Wall tok/s with a drafter, speculating against plain: 5 forks 56/47, 6 forks 58/55, 7 forks 57/60, 8 forks 55/66. Measured on one workload (the bench's greedy questions on code context), so a workload the drafter predicts worse moves the crossover down.
+- **Gang prefill.** Above the same threshold, short prefills run ahead of the decode passes, at most 10 s per hold (`kGangHold`), so the forks start decoding together.
+- **State in the pass.** A joint plain step writes each sequence's DeltaNet and convolution state during the pass (`verify_commits_`); it used to run each DeltaNet layer again in the commit, about 52 ms of a 32-row pass.
+
+32 forks of 32K, 100 tokens each, greedy, one question each, `--kv-pages --graphs --pdl --max-context 32768`, branch and main alternating on one box in one hour; SGLang's figures are from an earlier run on this hardware (`ignore_eos`, which ours lacks: the bench's forks here all ran to 100 tokens).
+
+| Forks | Drafter | Decode span tok/s: fan-out / main / SGLang | Wall tok/s: fan-out / main first burst / SGLang | MemAvailable minimum, GB: fan-out / main |
+| --- | --- | --- | --- | --- |
+| 32 | none | 202 / 11.4 / 211 | 152 / 8.9 / 187 | 18.7-19.0 / 18.8-18.9 |
+| 32 | loaded | 184 / 33-46 / 294 (8 drafts) | 141 / 22.5 / 247 | 17.5-18.5 / 16.6-16.8 |
+| 8 | none | 79 / 11.3 / 83 | 71 / 6.1 / - | 56.2 / 56.2 |
+| 8 | loaded | 75 / 54-55 / 100 (16 drafts, cap 8) | 66-67 / 10.0 / - | 52.0 / 51.7 |
+| 4 | none | 43 / 11.3 / - | 40 / 6.6 / - | 65.0 / 65.1 |
+| 4 | loaded | 63 / 35-65 / - | 58-60 / 11.2 / - | 61.6 / 61.4 |
+
+Main's first burst pays a whole prefill per fork, which sharing removes (361 s against 21 s at 32 forks, no drafter); on later bursts its wall tok/s at 8 forks is 11.2 without a drafter and 56 with one. One stream is unchanged: agentlong 16/16 turns byte-identical to main in two alternating runs, 64.39 and 64.22 tok/s against 64.32 and 64.31, prefill tokens 520,529 and 783 verify passes both; one fork without a drafter 11.4 tok/s on both.
+
+What is left, none of it needed for exactness:
+- **The questions' prefill.** 32 serial passes of about 85 rows take 5.3 s of the 21 s wall, about 3 s more than SGLang's. `forward_rows` allows several sequences only in a verify; one joint prefill pass over several cursors (per-segment state, keep point and last row, at most `prefill_chunk` rows) is estimated at about 1.8 s, wall about 180 tok/s.
+- **With a drafter above the threshold**: keeping the rings up costs about 16 ms a pass (184 against 202).
+- **The last 4% without one**: about 158 ms a pass against SGLang's 151.6, the same slope per fork (2.26 against 2.2 ms). A persistent N-sequence DeltaNet kernel (§5.2) is the untried lever; the recurrent step is 6.4 GB of memory traffic a pass and may be bandwidth-bound.
+- **Speculation at 32 forks**: SGLang's 294 takes 32 forks of 9 rows; `kRowsMax` is 32, so it needs the 64+ row pass.
+
 ### 5.4 Steps with different acceptance
 
 Sequences in a batch accept different numbers of tokens; there is no lockstep and no padding: each commits its own count (as M4 already does). Cross-sequence allocation of rows by expected gain (more rows to the sequence that accepts more) is greedy-identical and distribution-exact but breaks seeded identity across batch shapes, so it ships only behind a switch, measured against the fixed share.
