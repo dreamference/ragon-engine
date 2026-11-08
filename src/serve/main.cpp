@@ -871,10 +871,20 @@ class Scheduler {
   }
   // Whether r's next step speculates.
   bool spec_turn(const Running& r) const { return r.spec && !fanout_plain(); }
+  // Whether r's next step drafts: a speculative turn whose drafter guard is off takes a plain step, and such requests
+  // step together in one plain pass (step_batch) instead of one unit each. RAGON_DRAFTER_OFF_ALONE=1 keeps one unit each,
+  // for a comparison.
+  bool spec_step(const Running& r) const {
+    static const bool alone = [] {
+      const char* e = std::getenv("RAGON_DRAFTER_OFF_ALONE");
+      return e && std::atoi(e) != 0;
+    }();
+    return spec_turn(r) && (alone || !ctx_.engine->drafter_off(r.job.session, r.job.req.sampling));
+  }
   // Whether r's next decode step can join the batch of the kind it would take alone.
   bool batchable_now(const Running& r) const {
     if (r.prefilling) return false;
-    return spec_turn(r) ? batchable(r) : ctx_.engine->can_step_batch(r.job.session);
+    return spec_step(r) ? batchable(r) : ctx_.engine->can_step_batch(r.job.session);
   }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
   // just r, or nothing, when there is no batch to form.
@@ -886,13 +896,13 @@ class Scheduler {
     b.push_back(&r);
     Engine& eng = *ctx_.engine;
     // A batch is all speculative or all plain; a plain one takes one row per request.
-    const bool spec = spec_turn(r);
+    const bool spec = spec_step(r);
     const int fit = spec ? kernels::kMaxStreamRows / eng.draft_block() : std::min(kernels::kMaxStreamRows, kernels::kMaxSeqs);
     int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, spec) : 0;
     const int kv_free = eng.kv_paged() ? eng.kv_pages_free() : 0;
     for (size_t i : partner_order()) {
       const auto& o = running_[i];
-      if (o.get() != &r && static_cast<int>(b.size()) < fit && spec_turn(*o) == spec && batchable_now(*o)) {
+      if (o.get() != &r && static_cast<int>(b.size()) < fit && spec_step(*o) == spec && batchable_now(*o)) {
         if (eng.kv_paged()) {
           const int n = eng.kv_step_need(o->job.session, spec);
           if (kv_need + n > kv_free) {
@@ -1088,7 +1098,7 @@ class Scheduler {
   // the requests that end are added to `ended`. A non-finite row fails only its own request.
   void batch_step(const std::vector<Running*>& batch, std::vector<Running*>& ended) {
     Engine& eng = *ctx_.engine;
-    const bool spec = spec_turn(*batch[0]);
+    const bool spec = spec_step(*batch[0]);
     std::vector<Engine::SeqStep> steps(batch.size());
     const auto now = std::chrono::steady_clock::now();
     for (size_t i = 0; i < batch.size(); ++i) {
@@ -1103,6 +1113,7 @@ class Scheduler {
       steps[i].anchor = r.pending.back();
       steps[i].params = &r.job.req.sampling;
       steps[i].row_logits = r.job.req.logprobs ? &r.rows : nullptr;
+      steps[i].drafter_off = !spec && spec_turn(r);
     }
     ++decode_passes_;
     try {

@@ -232,12 +232,16 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
   for (int i = 0; i < n; ++i) {
     Session& s = sessions_[seqs[i].session];
     s_ = &s;
+    if (seqs[i].drafter_off) {  // speculate()'s plain step: the guard's count to its next probe
+      s.guard.plain();
+      s.spec.drafter_off_steps += 1;
+    }
     if (seqs[i].error) {
       reset_session();
       continue;
     }
     s.pos += 1;
-    s.spec.fanout_steps += 1;
+    if (!seqs[i].drafter_off) s.spec.fanout_steps += 1;
   }
   check(cudaStreamSynchronize(stream_), "commit");
   prof("materialize");
