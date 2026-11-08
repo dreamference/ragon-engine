@@ -41,8 +41,11 @@ struct LoraSiteDev {
 struct LoraRows {
   int n = 0;
   int row0[kMaxSeqs + 1] = {};
-  int slot[kMaxSeqs] = {-1, -1, -1, -1};
+  int slot[kMaxSeqs];
   const int* slot_dev = nullptr;
+  LoraRows() {
+    for (int& s : slot) s = -1;
+  }
 };
 
 // The outputs a site's segments add into, FP32 [M][ld]; a null one is skipped.

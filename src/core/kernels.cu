@@ -527,6 +527,43 @@ __global__ void kv_pages_copy_kernel(__nv_bfloat16* __restrict__ pool, const uin
   }
 }
 
+// A joint commit (Engine::step_batch): the conv above, over each sequence's rows, its window written back. The same
+// arithmetic as gdn_conv_kernel's.
+__global__ void gdn_conv_commit_seqs_kernel(float* __restrict__ mixed, SeqPtrs<float> state,
+                                            const __nv_bfloat16* __restrict__ w, SeqBatch b, int C) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int c = blockIdx.x * blockDim.x + threadIdx.x, sq = blockIdx.y;
+  if (c >= C) return;
+  float* st = state.p[sq];
+  float s0 = st[c * 3], s1 = st[c * 3 + 1], s2 = st[c * 3 + 2];
+  const float w0 = __bfloat162float(w[c * 4]), w1 = __bfloat162float(w[c * 4 + 1]);
+  const float w2 = __bfloat162float(w[c * 4 + 2]), w3 = __bfloat162float(w[c * 4 + 3]);
+  for (int t = b.row0[sq]; t < b.row0[sq + 1]; ++t) {
+    const float xv = mixed[static_cast<size_t>(t) * C + c];
+    const float o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+    s0 = s1;
+    s1 = s2;
+    s2 = xv;
+    mixed[static_cast<size_t>(t) * C + c] = silu(o);
+  }
+  st[c * 3] = s0;
+  st[c * 3 + 1] = s1;
+  st[c * 3 + 2] = s2;
+}
+
+// The recurrence of a joint commit: each sequence's rows from its own state, which they then overwrite.
+__global__ void __launch_bounds__(32)
+    gdn_recurrent_commit_seqs_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
+                                     const float* __restrict__ beta, SeqPtrs<float> state, float* __restrict__ out,
+                                     SeqBatch b, int H, int HV) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int sq = blockIdx.y;
+  const size_t r0 = b.row0[sq];
+  const int C = 2 * H * kGdnDk + HV * kGdnDv;
+  gdn_recurrent_body(mixed + r0 * C, g + r0 * HV, beta + r0 * HV, state.p[sq], state.p[sq], out + r0 * HV * kGdnDv,
+                     b.row0[sq + 1] - b.row0[sq], H, HV, blockIdx.x);
+}
+
 // The verify's recurrence over several sequences in one launch (M4 stage 4): blockIdx.y is the sequence, its rows
 // [row0, row0 + rows) read from its own state, which stays unwritten.
 __global__ void __launch_bounds__(32)
@@ -855,6 +892,18 @@ void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, S
                         const SeqBatch& b, int H, int HV, cudaStream_t s) {
   launch_kernel("gdn_recurrent_seqs", gdn_recurrent_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed, g, beta,
                 state, out, b, H, HV);
+}
+
+void gdn_conv_commit_seqs(float* mixed, SeqPtrs<float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
+                          cudaStream_t s) {
+  launch_kernel("gdn_conv_commit_seqs", gdn_conv_commit_seqs_kernel, dim3((C + 255) / 256, b.n), dim3(256), 0, s, mixed,
+                state, w, b, C);
+}
+
+void gdn_recurrent_commit_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<float> state, float* out,
+                               const SeqBatch& b, int H, int HV, cudaStream_t s) {
+  launch_kernel("gdn_recurrent_commit_seqs", gdn_recurrent_commit_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed,
+                g, beta, state, out, b, H, HV);
 }
 
 void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,

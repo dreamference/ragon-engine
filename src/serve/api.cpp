@@ -216,6 +216,13 @@ Request parse_request(const json& body, bool chat, bool vision) {
   r.sampling.presence_penalty = get_or(body, "presence_penalty", 0.0f);
   r.sampling.repetition_penalty = get_or(body, "repetition_penalty", 1.0f);
   if (body.contains("seed") && body["seed"].is_number_integer()) r.sampling.seed = body["seed"].get<uint64_t>();
+  if (body.contains("n") && !body["n"].is_null()) {
+    if (!body["n"].is_number_integer()) throw std::invalid_argument("n must be an integer");
+    const auto choices = body["n"].get<long long>();
+    if (choices < 1 || choices > kMaxChoices)
+      throw std::invalid_argument("n must be between 1 and " + std::to_string(kMaxChoices));
+    r.n = static_cast<int>(choices);
+  }
   if (body.contains("stop")) {
     if (body["stop"].is_string()) r.stop.push_back(body["stop"]);
     else if (body["stop"].is_array())

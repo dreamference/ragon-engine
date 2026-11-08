@@ -165,7 +165,7 @@ struct Metrics {
               {"accept_histogram", spec.accept_hist}, {"draft_seconds", spec.draft_seconds},
               {"verify_seconds", spec.verify_seconds}, {"commit_seconds", spec.commit_seconds},
               {"lookup_steps", spec.lookup_steps}, {"lookup_accepted", spec.lookup_accepted},
-              {"batched_steps", spec.batched_steps}, {"tree_steps", spec.tree_steps},
+              {"batched_steps", spec.batched_steps}, {"fanout_steps", spec.fanout_steps}, {"tree_steps", spec.tree_steps},
               {"tree_branch_steps", spec.tree_branch_steps}, {"tree_off_chain", spec.tree_off_chain},
               {"sparse_steps", spec.sparse_steps}, {"sparse_fallbacks", spec.sparse_fallbacks},
               {"drafter_off_steps", spec.drafter_off_steps}, {"drafter_switches", spec.drafter_switches},
@@ -307,6 +307,9 @@ struct Job {
   std::shared_ptr<const LoraAdapter> lora;
   int lora_slot = -1;
   bool lora_upload = false;
+  // BATCHING P4d, a request's other choices (`n`): each starts as a fork of this job's session when its prompt is done.
+  std::vector<Job> forks;
+  bool fork = false;  // one of those: never continues a session (the identical prompt would wait for its parent)
 };
 
 // P4b (--kv-pages): a prompt whose KV pages (with the two of growth it is admitted with) exceed the whole page pool
@@ -380,13 +383,14 @@ struct Running {
 class Scheduler {
  public:
   Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0,
-            bool fair_pairing = false)
+            bool fair_pairing = false, int fanout_plain_above = 0)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
         contended_(contended),
         side_share_(side_share),
         fair_pairing_(fair_pairing),
+        fanout_plain_above_(fanout_plain_above),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -432,7 +436,7 @@ class Scheduler {
     std::vector<int> match(queue_.size());
     std::vector<bool> pinned = busy;
     for (size_t j = 0; j < queue_.size(); ++j) {
-      match[j] = eng.match_session(queue_[j].prompt, queue_[j].req.session_key, queue_[j].req.share_scope);
+      match[j] = queue_[j].fork ? -1 : eng.match_session(queue_[j].prompt, queue_[j].req.session_key, queue_[j].req.share_scope);
       if (match[j] >= 0) pinned[match[j]] = true;
     }
     for (size_t j = 0; j < queue_.size(); ++j) {
@@ -551,6 +555,106 @@ class Scheduler {
     ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
   }
 
+  // BATCHING P4d: the request's other choices start now, each a fork of its session: no prefill, the prompt's logits
+  // (still the engine's: its last prefill chunk just ran), its pages shared. A fork that finds no room (no session, no
+  // pages, --batch) goes to the front of the queue and later runs as a request with the same prompt: the same tokens,
+  // resumed from its parent's history instead of forked. The active session is the parent's again on return.
+  void start_forks(Running& parent) {
+    if (parent.job.forks.empty()) return;
+    Engine& eng = *ctx_.engine;
+    const int from = parent.job.session;
+    std::vector<Job> forks = std::move(parent.job.forks);
+    parent.job.forks.clear();
+    std::vector<Job> later;
+    for (Job& j : forks)
+      if (!later.empty() || !start_fork(j, from)) later.push_back(std::move(j));
+    eng.select_session(from);
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      for (auto it = later.rbegin(); it != later.rend(); ++it) queue_.push_front(std::move(*it));
+      if (!later.empty()) dirty_ = true;
+      std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+      ctx_.metrics.queued += static_cast<double>(later.size());
+      ctx_.metrics.running = static_cast<int>(running_.size());
+      ctx_.metrics.sessions_resident = eng.sessions_resident();
+      ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
+    }
+  }
+
+  // Starts one fork; false, with j as it was, when it has to wait.
+  bool start_fork(Job& j, int from) {
+    Engine& eng = *ctx_.engine;
+    if (static_cast<int>(running_.size()) >= batch_) return false;
+    int s;
+    {
+      std::lock_guard<std::mutex> l(mu_);  // pick()'s pins: running requests, and the sessions queued jobs continue
+      std::vector<bool> pinned(eng.sessions(), false);
+      for (const auto& o : running_) pinned[o->job.session] = true;
+      for (const Job& q : queue_) {
+        const int m = q.fork ? -1 : eng.match_session(q.prompt, q.req.session_key, q.req.share_scope);
+        if (m >= 0) pinned[m] = true;
+      }
+      s = eng.free_session(protect_seconds_, pinned);
+    }
+    if (s < 0) return false;
+    if (eng.kv_paged()) {
+      Engine::KvSource src;
+      src.donor = from;
+      const KvNeed need = [&](const Engine::KvGone* gone, bool) { return eng.kv_fork_need(from, s, gone); };
+      if (!kv_make_room(need, s, src)) return false;
+    }
+    int lslot = -1;
+    bool upload = false;
+    if (j.lora && (lslot = ctx_.lora_slots->acquire(j.lora->id, &upload)) < 0) return false;
+    j.session = s;
+    j.fresh = true;
+    j.lora_slot = lslot;
+    j.lora_upload = upload;
+    try {
+      if (j.lora_upload) {  // (its parent holds the adapter, so the slot is filled: this is only the general rule)
+        eng.lora_upload(j.lora_slot, *j.lora);
+        j.lora_upload = false;
+      }
+      eng.activate_session(s, j.req.session_key, true, j.req.share_scope, j.lora_slot);
+      eng.fork_session(from);
+    } catch (const KvPoolExhausted& e) {  // nothing changed: the count above was short, it waits
+      std::fprintf(stderr, "KV pool: a fork of %zu tokens waits (%s)\n", j.prompt.size(), e.what());
+      release_lora(j);
+      j.session = -1;
+      j.fresh = false;
+      eng.touch_session(s);
+      return false;
+    } catch (const std::exception& e) {
+      auto failed = std::make_unique<Running>();
+      failed->job = std::move(j);
+      fail(*failed, e);
+      release_lora(failed->job);
+      eng.touch_session(s);
+      return true;
+    }
+    auto r = std::make_unique<Running>();
+    r->job = std::move(j);
+    r->admitted = ++admitted_;
+    r->prefilling = false;
+    r->cur.t0 = std::chrono::steady_clock::now();
+    r->cur.stats.reused_tokens = static_cast<int>(r->job.prompt.size());
+    bool done;
+    try {
+      begin_decode(*r);
+      done = emit(*r) && end(*r);
+    } catch (const std::exception& e) {
+      fail(*r, e);
+      done = true;
+    }
+    if (done) {
+      release_lora(r->job);
+      eng.touch_session(s);
+      return true;
+    }
+    running_.push_back(std::move(r));
+    return true;
+  }
+
   // Gives back the job's GPU slot (it ended, failed or went back to the queue); a slot whose upload did not finish
   // holds no adapter.
   void release_lora(Job& j) {
@@ -641,23 +745,41 @@ class Scheduler {
   bool batchable(const Running& r) const {
     return !r.prefilling && r.spec && ctx_.engine->can_batch(r.job.session, r.job.req.sampling);
   }
+  // Fan-out (BATCHING P4d): above --fanout-plain-above decoding requests, a speculative block no longer fits enough
+  // of them in one pass, and one row each decodes more in total. Every decoder then takes plain steps, together;
+  // greedy output is unchanged (a plain row's logits are a verify row's) and a sampled one keeps its distribution.
+  bool fanout_plain() const {
+    if (fanout_plain_above_ <= 0) return false;
+    int decoding = 0;
+    for (const auto& o : running_) decoding += !o->prefilling;
+    return decoding > fanout_plain_above_;
+  }
+  // Whether r's next step speculates.
+  bool spec_turn(const Running& r) const { return r.spec && !fanout_plain(); }
+  // Whether r's next decode step can join the batch of the kind it would take alone.
+  bool batchable_now(const Running& r) const {
+    if (r.prefilling) return false;
+    return spec_turn(r) ? batchable(r) : ctx_.engine->can_step_batch(r.job.session);
+  }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
   // just r, or nothing, when there is no batch to form.
   // P4b: only requests whose step's KV pages are free join (r's are: kv_room).
   std::vector<Running*> batch_with(Running& r) const {
     std::vector<Running*> b;
     if (trace_.on()) snapshot_candidates();
-    if (!batchable(r)) return b;
+    if (!batchable_now(r)) return b;
     b.push_back(&r);
     Engine& eng = *ctx_.engine;
-    const int fit = kernels::kMaxStreamRows / eng.draft_block();
-    int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, true) : 0;
+    // A batch is all speculative or all plain; a plain one takes one row per request.
+    const bool spec = spec_turn(r);
+    const int fit = spec ? kernels::kMaxStreamRows / eng.draft_block() : std::min(kernels::kMaxStreamRows, kernels::kMaxSeqs);
+    int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, spec) : 0;
     const int kv_free = eng.kv_paged() ? eng.kv_pages_free() : 0;
     for (size_t i : partner_order()) {
       const auto& o = running_[i];
-      if (o.get() != &r && static_cast<int>(b.size()) < fit && batchable(*o)) {
+      if (o.get() != &r && static_cast<int>(b.size()) < fit && spec_turn(*o) == spec && batchable_now(*o)) {
         if (eng.kv_paged()) {
-          const int n = eng.kv_step_need(o->job.session, true);
+          const int n = eng.kv_step_need(o->job.session, spec);
           if (kv_need + n > kv_free) {
             if (trace_.on()) cand_[i].state = 2;
             continue;
@@ -682,7 +804,7 @@ class Scheduler {
   void snapshot_candidates() const {
     cand_.clear();
     for (const auto& o : running_)
-      cand_.push_back({o->job.session, o->admitted, batchable(*o) ? 1 : 0, o->window.count(decode_passes_),
+      cand_.push_back({o->job.session, o->admitted, batchable_now(*o) ? 1 : 0, o->window.count(decode_passes_),
                        o->window.last()});
   }
 
@@ -805,7 +927,7 @@ class Scheduler {
   // Whether r's next decode step has its KV pages (Engine::kv_step_need), making room as kv_make_room does.
   bool kv_room(Running& r) {
     Engine& eng = *ctx_.engine;
-    return kv_make_room([&](const Engine::KvGone* gone, bool) { return eng.kv_step_need(r.job.session, r.spec, gone); },
+    return kv_make_room([&](const Engine::KvGone* gone, bool) { return eng.kv_step_need(r.job.session, spec_turn(r), gone); },
                         r.job.session, Engine::KvSource{});
   }
   // A decode turn waited for pages. When every running request waits: pages being freed are waited for, else the
@@ -816,7 +938,7 @@ class Scheduler {
     std::vector<KvRunner> rs;
     for (const auto& o : running_) {
       if (o->prefilling || !o->kv_wait) return;  // someone still makes progress
-      rs.push_back({o->admitted, true, eng.kv_step_need(o->job.session, o->spec)});
+      rs.push_back({o->admitted, true, eng.kv_step_need(o->job.session, spec_turn(*o))});
     }
     const KvPoolView v = kv_view(-1);
     if (v.pending > 0) {  // nothing else can run: wait for the released pages' readers
@@ -846,10 +968,12 @@ class Scheduler {
     ctx_.metrics.kv_pages_free = free;
   }
 
-  // One batched speculative step of the requests in `batch`, then each one's tokens emitted as unit() does;
+  // One batched step of the requests in `batch` (speculative, or plain: batch_with), then each one's tokens emitted
+  // as unit() does;
   // the requests that end are added to `ended`. A non-finite row fails only its own request.
   void batch_step(const std::vector<Running*>& batch, std::vector<Running*>& ended) {
     Engine& eng = *ctx_.engine;
+    const bool spec = spec_turn(*batch[0]);
     std::vector<Engine::SeqStep> steps(batch.size());
     const auto now = std::chrono::steady_clock::now();
     for (size_t i = 0; i < batch.size(); ++i) {
@@ -867,7 +991,10 @@ class Scheduler {
     }
     ++decode_passes_;
     try {
-      eng.speculate_batch(steps);
+      if (spec)
+        eng.speculate_batch(steps);
+      else
+        eng.step_batch(steps);
     } catch (const std::exception& e) {  // not one sequence's rows: the step itself failed
       for (Running* r : batch) {
         fail(*r, e);
@@ -985,6 +1112,7 @@ class Scheduler {
         }
         r.prefilling = false;
         begin_decode(r);
+        start_forks(r);
         return emit(r) && end(r);
       }
       if (eng.side_busy()) return false;  // another request's chunk is in flight: no prefill beside it
@@ -998,6 +1126,7 @@ class Scheduler {
       if (!last) return false;
       r.prefilling = false;
       begin_decode(r);
+      start_forks(r);
       return emit(r) && end(r);
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1010,17 +1139,18 @@ class Scheduler {
     unit_kind_ = "decode";
     {
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
-      ctx_.metrics.batch_rows = r.spec && !eng.drafter_off(r.job.session, r.job.req.sampling)
+      ctx_.metrics.batch_rows = spec_turn(r) && !eng.drafter_off(r.job.session, r.job.req.sampling)
                                     ? std::min(eng.draft_block(), eng.max_context() - static_cast<int>(eng.history().size()))
                                     : 1;
     }
-    if (r.spec) {
+    if (spec_turn(r)) {
       r.pending = eng.speculate(r.pending.back(), r.job.req.sampling, r.job.req.logprobs ? &r.rows : nullptr);
       // The verify checks only each row's top K for NaN and inf (the plain path's sample() checks the
       // whole row); a row reported as logprobs is checked whole, so a NaN never reaches the client.
       if (r.job.req.logprobs) require_finite(r.rows);
     } else {
       r.logits = eng.step(r.pending.back());
+      r.rows.clear();  // emit reads r.logits, not an earlier batched step's row
       r.pending = {eng.sample(r.logits, r.job.req.sampling, eng.history())};
     }
     return emit(r) && end(r);
@@ -1173,6 +1303,7 @@ class Scheduler {
   double protect_seconds_;
   int batch_, contended_, side_share_;
   bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
+  int fanout_plain_above_;  // --fanout-plain-above: fanout_plain(), 0 for never
   StepTrace trace_{std::getenv("RAGON_STEP_TRACE")};  // the per-step trace, when the variable names a file
   const char* unit_kind_ = nullptr;  // what the last unit did, for the trace (null: nothing worth a line)
   mutable std::vector<StepCandidate> cand_;  // the partner choice's view for the trace (filled while it is on)
@@ -1528,167 +1659,214 @@ class Handler : public proxygen::RequestHandler {
       int text_chars = 0;  // characters of output text so far (completions text_offset)
       State(bool r, const json& t) : parser(r, t) {}
     };
-    auto st = std::make_shared<State>(chat && req.reasoning, req.tools);
-    auto fresh_logprobs = [chat]() {
-      return chat ? json(json::array())
-                  : json{{"tokens", json::array()}, {"token_logprobs", json::array()}, {"top_logprobs", json::array()},
-                         {"text_offset", json::array()}};
+    // What a request's choices (`n`, BATCHING P4d) share: one response (engine thread only).
+    struct Fan {
+      int left = 1;            // choices not done yet
+      bool keepalive = false;  // keep-alives are armed and nothing has been written yet
+      bool closed = false;     // an error answered for every choice
+      json choices = json::array();
+      int completion = 0, reasoning = 0, cached = 0;
     };
-    st->logprobs = fresh_logprobs();
-    auto pending_logprobs = [=]() { return chat ? !st->logprobs.empty() : !st->logprobs["tokens"].empty(); };
-    auto take_logprobs = [=]() {  // choices[0].logprobs from what has been collected, which starts afresh
-      json out = chat ? json{{"content", st->logprobs}} : st->logprobs;
-      st->logprobs = fresh_logprobs();
-      return out;
-    };
-
-    auto sse = [ex](const json& chunk) {
-      std::string data = "data: " + dump_json(chunk) + "\n\n";
-      post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
-    };
-    // Before the first write of any kind (the first token, done, or error): no keep-alive after it.
-    auto stop_ticks = [=]() {
-      if (!st->keepalive) return;
-      st->keepalive = false;
-      stop_keepalive(ex);
-    };
-    auto chunk_of = [=](json delta, json finish, json logprobs = json()) {
-      json c = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
-                {"model", model}};
-      json choice = {{"index", 0}};
-      if (chat) choice["delta"] = std::move(delta);
-      else choice["text"] = delta.is_string() ? delta : json("");
-      if (!logprobs.is_null()) choice["logprobs"] = std::move(logprobs);
-      choice["finish_reason"] = std::move(finish);
-      c["choices"] = json::array({choice});
-      return c;
-    };
-    // A streamed chunk carries the logprobs of the tokens produced since the previous chunk (the text of
-    // a token may follow its entry by a chunk when the decoder or the parser held it back).
-    auto chunk_logprobs = [=]() { return req.logprobs ? take_logprobs() : json(); };
-    auto deliver = [=](const OutputParser::Delta& d) {
-      st->content += d.content;
-      st->reasoning += d.reasoning;
-      if (!req.stream) {
-        st->calls.insert(st->calls.end(), d.tool_calls.begin(), d.tool_calls.end());
-        return;
-      }
-      if (!chat) {
-        if (!d.content.empty()) sse(chunk_of(json(d.content), nullptr, chunk_logprobs()));
-        return;
-      }
-      json delta = json::object();
-      if (st->first) {
-        delta["role"] = "assistant";
-        st->first = false;
-      }
-      if (!d.reasoning.empty()) delta["reasoning_content"] = d.reasoning;
-      if (!d.content.empty()) delta["content"] = d.content;
-      if (!d.tool_calls.empty()) {
-        json calls = json::array();
-        for (const auto& c : d.tool_calls) {
-          calls.push_back({{"index", static_cast<int>(st->calls.size())},
-                           {"id", new_id("call_")},
-                           {"type", "function"},
-                           {"function", {{"name", c.name}, {"arguments", c.arguments}}}});
-          st->calls.push_back(c);
-        }
-        delta["tool_calls"] = calls;
-      }
-      if (delta.size() > 0) sse(chunk_of(delta, nullptr, chunk_logprobs()));
-    };
-
-    job.sink.text = [=](const std::string& piece) {
-      stop_ticks();
-      deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}});
-    };
-    if (req.logprobs) {
-      // One entry per produced token, in vLLM's shapes. `token` is the token's text (U+FFFD where a
-      // character is split across tokens, as dump_json writes it) and `bytes` its exact bytes, so a client
-      // can reassemble a character from its pieces. text_offset counts characters of the output text (a
-      // byte that is not a continuation byte starts one), so a character split across tokens counts once.
-      const Tokenizer* tok = ctx_.tok;
-      auto token_json = [tok](const TokenLogprob& e) {
-        const std::string text = tok->token_bytes(e.token);
-        json bytes = json::array();
-        for (const unsigned char c : text) bytes.push_back(static_cast<int>(c));
-        return json{{"token", text}, {"logprob", e.logprob}, {"bytes", bytes}};
+    auto fan = std::make_shared<Fan>();
+    fan->left = req.n;
+    for (int i = 0; i < req.n; ++i) fan->choices.push_back(nullptr);
+    // One choice's callbacks: its index in the response, its own parser and logprobs.
+    auto sink_for = [&](const int index) {
+      JobSink sink;
+      auto st = std::make_shared<State>(chat && req.reasoning, req.tools);
+      auto fresh_logprobs = [chat]() {
+        return chat ? json(json::array())
+                    : json{{"tokens", json::array()}, {"token_logprobs", json::array()}, {"top_logprobs", json::array()},
+                           {"text_offset", json::array()}};
       };
-      const int k = req.top_logprobs;
-      job.sink.logprobs = [=](const std::vector<TokenLogprob>& entries) {
-        if (entries.empty()) return;
-        if (chat) {
-          json e = token_json(entries[0]);
-          json top = json::array();
-          for (size_t i = 0; i < entries.size() && i < static_cast<size_t>(k); ++i) top.push_back(token_json(entries[i]));
-          e["top_logprobs"] = std::move(top);
-          st->logprobs.push_back(std::move(e));
+      st->logprobs = fresh_logprobs();
+      auto pending_logprobs = [=]() { return chat ? !st->logprobs.empty() : !st->logprobs["tokens"].empty(); };
+      auto take_logprobs = [=]() {  // choices[0].logprobs from what has been collected, which starts afresh
+        json out = chat ? json{{"content", st->logprobs}} : st->logprobs;
+        st->logprobs = fresh_logprobs();
+        return out;
+      };
+
+      auto sse = [ex, fan](const json& chunk) {
+        if (fan->closed) return;  // an error answered for every choice
+        std::string data = "data: " + dump_json(chunk) + "\n\n";
+        post(ex, [data](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(data).send(); });
+      };
+      // Before the first write of any kind (the first token, done, or error): no keep-alive after it.
+      auto stop_ticks = [=]() {
+        if (!fan->keepalive) return;
+        fan->keepalive = false;
+        stop_keepalive(ex);
+      };
+      auto chunk_of = [=](json delta, json finish, json logprobs = json()) {
+        json c = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
+                  {"model", model}};
+        json choice = {{"index", index}};
+        if (chat) choice["delta"] = std::move(delta);
+        else choice["text"] = delta.is_string() ? delta : json("");
+        if (!logprobs.is_null()) choice["logprobs"] = std::move(logprobs);
+        choice["finish_reason"] = std::move(finish);
+        c["choices"] = json::array({choice});
+        return c;
+      };
+      // A streamed chunk carries the logprobs of the tokens produced since the previous chunk (the text of
+      // a token may follow its entry by a chunk when the decoder or the parser held it back).
+      auto chunk_logprobs = [=]() { return req.logprobs ? take_logprobs() : json(); };
+      auto deliver = [=](const OutputParser::Delta& d) {
+        st->content += d.content;
+        st->reasoning += d.reasoning;
+        if (!req.stream) {
+          st->calls.insert(st->calls.end(), d.tool_calls.begin(), d.tool_calls.end());
           return;
         }
-        const std::string text = tok->token_bytes(entries[0].token);
-        json top = json::object();
-        for (const TokenLogprob& e : entries) top[tok->token_bytes(e.token)] = e.logprob;
-        st->logprobs["tokens"].push_back(text);
-        st->logprobs["token_logprobs"].push_back(entries[0].logprob);
-        st->logprobs["top_logprobs"].push_back(std::move(top));
-        st->logprobs["text_offset"].push_back(st->text_chars);
-        for (const unsigned char c : text) st->text_chars += (c & 0xC0) != 0x80;
-      };
-    }
-    job.sink.error = [=](const std::string& msg, const std::string& code) {
-      stop_ticks();
-      const json error = error_body(msg, error_type(code), code);
-      if (req.stream) {  // the headers are out: end the stream properly after the error
-        const std::string tail = stream_error_tail(error, chunk_of(json::object(), kStreamErrorFinish));
-        post(ex, [tail](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(tail).sendWithEOM(); });
-      } else {
-        const int status = code == kContextLengthExceeded ? 400 : 500;
-        post(ex, [error, status](proxygen::ResponseHandler* d) { send_json(d, status, error); });
-      }
-    };
-    job.sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached,
-                        int reasoning_tokens) {
-      stop_ticks();
-      if (chat) deliver(st->parser.finish());
-      const std::string finish = !st->calls.empty() && finish_in == "stop" ? "tool_calls" : finish_in;
-      json usage = {{"prompt_tokens", prompt_tokens},
-                    {"completion_tokens", completion_tokens},
-                    {"total_tokens", prompt_tokens + completion_tokens},
-                    {"prompt_tokens_details", {{"cached_tokens", cached}}}};
-      if (chat) usage["completion_tokens_details"] = {{"reasoning_tokens", reasoning_tokens}};
-      if (req.stream) {
-        // Entries still pending (their text held back to the end) ride on the finish chunk.
-        sse(chunk_of(json::object(), finish, req.logprobs && pending_logprobs() ? take_logprobs() : json()));
-        if (req.include_usage) {
-          json u = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
-                    {"model", model}, {"choices", json::array()}, {"usage", usage}};
-          sse(u);
+        if (!chat) {
+          if (!d.content.empty()) sse(chunk_of(json(d.content), nullptr, chunk_logprobs()));
+          return;
         }
-        post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).body("data: [DONE]\n\n").sendWithEOM(); });
-        return;
-      }
-      json choice = {{"index", 0}, {"finish_reason", finish}};
-      if (chat) {
-        json msg = {{"role", "assistant"}, {"content", st->content.empty() && !st->calls.empty() ? json() : json(st->content)}};
-        if (!st->reasoning.empty()) msg["reasoning_content"] = st->reasoning;
-        if (!st->calls.empty()) {
+        json delta = json::object();
+        if (st->first) {
+          delta["role"] = "assistant";
+          st->first = false;
+        }
+        if (!d.reasoning.empty()) delta["reasoning_content"] = d.reasoning;
+        if (!d.content.empty()) delta["content"] = d.content;
+        if (!d.tool_calls.empty()) {
           json calls = json::array();
-          for (const auto& c : st->calls)
-            calls.push_back({{"id", new_id("call_")}, {"type", "function"},
+          for (const auto& c : d.tool_calls) {
+            calls.push_back({{"index", static_cast<int>(st->calls.size())},
+                             {"id", new_id("call_")},
+                             {"type", "function"},
                              {"function", {{"name", c.name}, {"arguments", c.arguments}}}});
-          msg["tool_calls"] = calls;
+            st->calls.push_back(c);
+          }
+          delta["tool_calls"] = calls;
         }
-        choice["message"] = msg;
-      } else {
-        choice["text"] = st->content;
+        if (delta.size() > 0) sse(chunk_of(delta, nullptr, chunk_logprobs()));
+      };
+
+      sink.text = [=](const std::string& piece) {
+        stop_ticks();
+        deliver(chat ? st->parser.push(piece) : OutputParser::Delta{{}, piece, {}});
+      };
+      if (req.logprobs) {
+        // One entry per produced token, in vLLM's shapes. `token` is the token's text (U+FFFD where a
+        // character is split across tokens, as dump_json writes it) and `bytes` its exact bytes, so a client
+        // can reassemble a character from its pieces. text_offset counts characters of the output text (a
+        // byte that is not a continuation byte starts one), so a character split across tokens counts once.
+        const Tokenizer* tok = ctx_.tok;
+        auto token_json = [tok](const TokenLogprob& e) {
+          const std::string text = tok->token_bytes(e.token);
+          json bytes = json::array();
+          for (const unsigned char c : text) bytes.push_back(static_cast<int>(c));
+          return json{{"token", text}, {"logprob", e.logprob}, {"bytes", bytes}};
+        };
+        const int k = req.top_logprobs;
+        sink.logprobs = [=](const std::vector<TokenLogprob>& entries) {
+          if (entries.empty()) return;
+          if (chat) {
+            json e = token_json(entries[0]);
+            json top = json::array();
+            for (size_t i = 0; i < entries.size() && i < static_cast<size_t>(k); ++i) top.push_back(token_json(entries[i]));
+            e["top_logprobs"] = std::move(top);
+            st->logprobs.push_back(std::move(e));
+            return;
+          }
+          const std::string text = tok->token_bytes(entries[0].token);
+          json top = json::object();
+          for (const TokenLogprob& e : entries) top[tok->token_bytes(e.token)] = e.logprob;
+          st->logprobs["tokens"].push_back(text);
+          st->logprobs["token_logprobs"].push_back(entries[0].logprob);
+          st->logprobs["top_logprobs"].push_back(std::move(top));
+          st->logprobs["text_offset"].push_back(st->text_chars);
+          for (const unsigned char c : text) st->text_chars += (c & 0xC0) != 0x80;
+        };
       }
-      if (req.logprobs) choice["logprobs"] = take_logprobs();
-      json body = {{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
-                   {"model", model}, {"choices", json::array({choice})}, {"usage", usage}};
-      post(ex, [body](proxygen::ResponseHandler* d) { send_json(d, 200, body); });
+      sink.error = [=](const std::string& msg, const std::string& code) {
+        stop_ticks();
+        if (fan->closed) return;
+        const json error = error_body(msg, error_type(code), code);
+        if (req.stream) {  // the headers are out: end the stream properly after the error
+          const std::string tail = stream_error_tail(error, chunk_of(json::object(), kStreamErrorFinish));
+          post(ex, [tail](proxygen::ResponseHandler* d) { ResponseBuilder(d).body(tail).sendWithEOM(); });
+        } else {
+          const int status = code == kContextLengthExceeded ? 400 : 500;
+          post(ex, [error, status](proxygen::ResponseHandler* d) { send_json(d, status, error); });
+        }
+        fan->closed = true;
+        if (req.n > 1) ex->cancelled->store(true);  // the other choices stop: the response is over
+      };
+      sink.done = [=](const std::string& finish_in, int prompt_tokens, int completion_tokens, int cached,
+                          int reasoning_tokens) {
+        stop_ticks();
+        if (fan->closed) return;
+        if (chat) deliver(st->parser.finish());
+        const std::string finish = !st->calls.empty() && finish_in == "stop" ? "tool_calls" : finish_in;
+        // The response's usage counts the prompt once, as its first choice saw it, and every choice's output.
+        fan->completion += completion_tokens;
+        fan->reasoning += reasoning_tokens;
+        if (index == 0) fan->cached = cached;
+        const bool last = --fan->left == 0;
+        json usage = {{"prompt_tokens", prompt_tokens},
+                      {"completion_tokens", fan->completion},
+                      {"total_tokens", prompt_tokens + fan->completion},
+                      {"prompt_tokens_details", {{"cached_tokens", fan->cached}}}};
+        if (chat) usage["completion_tokens_details"] = {{"reasoning_tokens", fan->reasoning}};
+        if (req.stream) {
+          // Entries still pending (their text held back to the end) ride on the finish chunk.
+          sse(chunk_of(json::object(), finish, req.logprobs && pending_logprobs() ? take_logprobs() : json()));
+          if (!last) return;
+          if (req.include_usage) {
+            json u = {{"id", id}, {"object", chat ? "chat.completion.chunk" : "text_completion"}, {"created", created},
+                      {"model", model}, {"choices", json::array()}, {"usage", usage}};
+            sse(u);
+          }
+          post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).body("data: [DONE]\n\n").sendWithEOM(); });
+          return;
+        }
+        json choice = {{"index", index}, {"finish_reason", finish}};
+        if (chat) {
+          json msg = {{"role", "assistant"}, {"content", st->content.empty() && !st->calls.empty() ? json() : json(st->content)}};
+          if (!st->reasoning.empty()) msg["reasoning_content"] = st->reasoning;
+          if (!st->calls.empty()) {
+            json calls = json::array();
+            for (const auto& c : st->calls)
+              calls.push_back({{"id", new_id("call_")}, {"type", "function"},
+                               {"function", {{"name", c.name}, {"arguments", c.arguments}}}});
+            msg["tool_calls"] = calls;
+          }
+          choice["message"] = msg;
+        } else {
+          choice["text"] = st->content;
+        }
+        if (req.logprobs) choice["logprobs"] = take_logprobs();
+        fan->choices[index] = std::move(choice);
+        if (!last) return;
+        json body = {{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
+                     {"model", model}, {"choices", fan->choices}, {"usage", usage}};
+        post(ex, [body](proxygen::ResponseHandler* d) { send_json(d, 200, body); });
+      };
+      return sink;
     };
+    job.sink = sink_for(0);
+    for (int i = 1; i < req.n; ++i) {
+      Job fork;
+      fork.received = job.received;
+      fork.req = req;
+      fork.req.n = 1;
+      fork.req.session_key.clear();
+      // Not seed + i: a token's seed is the request's seed plus the history's length, which would give one choice's
+      // stream shifted by a token. (A seed of 0 is a random one: every session draws its own.)
+      if (req.sampling.seed != 0) fork.req.sampling.seed = req.sampling.seed + uint64_t(i) * 0x9E3779B97F4A7C15ull;
+      fork.prompt = job.prompt;
+      fork.images = job.images;
+      fork.lora = job.lora;
+      fork.cancelled = job.cancelled;
+      fork.sink = sink_for(i);
+      fork.fork = true;
+      job.forks.push_back(std::move(fork));
+    }
     if (req.stream && ctx_.keepalive_ms > 0) {  // an SSE comment, which every conforming parser ignores (API §3)
-      st->keepalive = true;
+      fan->keepalive = true;
       arm_keepalive(ex, ctx_.keepalive_ms, [](proxygen::ResponseHandler* d) {
         ResponseBuilder(d).body(std::string(": keep-alive\n\n")).send();
       });
@@ -1869,7 +2047,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = 8;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -1932,6 +2110,7 @@ int main(int argc, char** argv) {
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--auto-size") auto_size = std::stol(next());
     else if (a == "--fair-pairing") fair_pairing = std::stol(next());
+    else if (a == "--fanout-plain-above") fanout_plain_above = std::stol(next());
     else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
@@ -2052,7 +2231,8 @@ int main(int argc, char** argv) {
   for (auto [var, dst] : {std::pair<const char*, long*>{"RAGON_HOST_RESERVE_MB", &host_reserve_mb},
                           std::pair<const char*, long*>{"RAGON_ADMIT_RESERVE_MB", &admit_reserve_mb},
                           std::pair<const char*, long*>{"RAGON_AUTO_SIZE", &auto_size},
-                          std::pair<const char*, long*>{"RAGON_FAIR_PAIRING", &fair_pairing}})
+                          std::pair<const char*, long*>{"RAGON_FAIR_PAIRING", &fair_pairing},
+                          std::pair<const char*, long*>{"RAGON_FANOUT_PLAIN_ABOVE", &fanout_plain_above}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -2202,7 +2382,8 @@ int main(int argc, char** argv) {
               << "\n";
   }
   std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
-  ragon::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0);
+  ragon::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0,
+                                     static_cast<int>(fanout_plain_above));
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;

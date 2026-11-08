@@ -75,6 +75,10 @@
 // NAME.hf_bf16.bf16, and production's NAME.sgl.bf16 when present): relative L2 error and the worst token's cosine
 // against the FP32 tower, beside the reference's own. --vision-bench times the tower per image.
 //
+// --fanout-check (BATCHING P4d; needs --sessions 2 or more; with or without --draft) decodes one prompt per session
+// plainly alone (step, sample), then all together in one pass per step (step_batch), and passes only if each sequence's
+// tokens, every step's logits bit for bit, its state and its drafter context are the same. Greedy, sampled with a seed
+// on the GPU's top K, and sampled with no top_k (the host sees every logit); the sessions in order and reversed.
 // --batch-check (M4 §4, stage 3; needs --draft and --sessions 2) takes the prompts in pairs (A, B) and decodes
 // each pair as a batch of two (Engine::speculate_batch: one verify pass over both sequences' rows), --max-tokens
 // each, greedily and sampled (--temperature, default 1, seeded by --seed or 1). Four runs per pair and mode: both
@@ -94,6 +98,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -334,6 +339,8 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2;
   std::string draft, lora;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
+  bool fanout_check = false;
+  bool fork_check = false;
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
   double draft_off_below = -1;  // the drafter-off guard (BACKLOG 10): the engine's default unless given
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
@@ -386,6 +393,8 @@ int main(int argc, char** argv) {
     else if (a == "--chunk-check") chunk_check = std::stoi(next());
     else if (a == "--interleave-check") interleave_check = true;
     else if (a == "--batch-check") batch_check = true;
+    else if (a == "--fanout-check") fanout_check = true;
+    else if (a == "--fork-check") fork_check = true;
     else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
@@ -946,6 +955,238 @@ int main(int argc, char** argv) {
       }
       std::printf(failures ? "BATCH CHECK FAILED\n" : "batch check passed\n");
       return failures ? 1 : 0;
+    }
+    if (fanout_check) {
+      const int n = engine.sessions();
+      if (n < 2 || prompts.empty()) throw std::runtime_error("--fanout-check needs --sessions 2 and a prompt");
+      auto digest = [](const std::vector<float>& l) {
+        uint64_t h = 14695981039346656037ull;
+        for (float f : l) {
+          uint32_t b;
+          std::memcpy(&b, &f, sizeof b);
+          h = (h ^ b) * 1099511628211ull;
+        }
+        return h;
+      };
+      auto start = [&](Seq& q, int session, const ragon::SamplingParams& sp) {
+        q.session = session;
+        q.sp = sp;
+        activate(session, "", true);
+        engine.prefill(prompts[session % prompts.size()], nullptr, false, IMG);
+        q.pending = {engine.sample(engine.logits(), q.sp, engine.history())};
+      };
+      auto emit = [&](Seq& q) {
+        for (int t : q.pending) {
+          q.out.push_back(t);
+          if (is_end(t) || static_cast<int>(q.out.size()) >= max_tokens) return q.done = true;
+        }
+        return false;
+      };
+      struct Case {
+        const char* name;
+        float temperature;
+        int top_k;
+      };
+      bool failed = false;
+      for (const Case& cs : {Case{"greedy", 0.f, 20}, Case{"top_k 40", 0.8f, 40}, Case{"no top_k", 0.8f, 0}}) {
+        ragon::SamplingParams sp;
+        sp.temperature = cs.temperature;
+        sp.top_k = cs.top_k;
+        sp.top_p = 0.9f;
+        sp.seed = 7;
+        std::vector<Result> alone(n);
+        std::vector<std::vector<uint64_t>> alone_l(n);
+        engine.reset_all();
+        for (int i = 0; i < n; ++i) {
+          Seq q;
+          start(q, i, sp);
+          while (!emit(q)) {
+            const std::vector<float>& l = engine.step(q.pending.back());
+            alone_l[i].push_back(digest(l));
+            q.pending = {engine.sample(l, q.sp, engine.history())};
+          }
+          alone[i] = result_of(q);
+        }
+        for (const bool reversed : {false, true}) {
+          engine.reset_all();
+          std::vector<Seq> seqs(n);
+          std::vector<std::vector<uint64_t>> l(n);
+          std::vector<std::vector<float>> rows(n);
+          for (int i = 0; i < n; ++i) start(seqs[i], i, sp);
+          const auto t0 = std::chrono::steady_clock::now();
+          long tokens = 0;
+          while (true) {
+            std::vector<ragon::Engine::SeqStep> steps;
+            std::vector<int> in;
+            for (int k = 0; k < n; ++k) {
+              const int i = reversed ? n - 1 - k : k;
+              if (seqs[i].done || emit(seqs[i])) continue;
+              ragon::Engine::SeqStep st;
+              st.session = i;
+              st.anchor = seqs[i].pending.back();
+              st.params = &seqs[i].sp;
+              st.row_logits = &rows[i];
+              steps.push_back(st);
+              in.push_back(i);
+            }
+            if (steps.empty()) break;
+            engine.step_batch(steps);
+            for (size_t k = 0; k < steps.size(); ++k) {
+              if (steps[k].error) std::rethrow_exception(steps[k].error);
+              seqs[in[k]].pending = steps[k].out;
+              l[in[k]].push_back(digest(rows[in[k]]));
+              ++tokens;
+            }
+          }
+          const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          std::printf("fanout %s %s: %d sequences, %.1f tok/s\n", cs.name, reversed ? "reversed" : "in order", n,
+                      tokens / dt);
+          for (int i = 0; i < n; ++i) {
+            const Result r = result_of(seqs[i]);
+            const bool same = r.tokens == alone[i].tokens && r.hash == alone[i].hash && r.draft == alone[i].draft;
+            if (same && l[i] == alone_l[i]) continue;
+            failed = true;
+            size_t at = 0;
+            while (at < l[i].size() && at < alone_l[i].size() && l[i][at] == alone_l[i][at]) ++at;
+            std::printf("  sequence %d differs: tokens %s, state %s, drafter %s, logits from step %zu\n", i,
+                        r.tokens == alone[i].tokens ? "same" : "DIFFER", r.hash == alone[i].hash ? "same" : "DIFFER",
+                        r.draft == alone[i].draft ? "same" : "DIFFER", at);
+          }
+        }
+      }
+      std::printf(failed ? "FANOUT CHECK FAILED\n" : "fanout check passed\n");
+      return failed ? 1 : 0;
+    }
+    if (fork_check) {
+      // BATCHING P4d, the probabilities test: N forks of one prompt against N separate requests with that prompt, each
+      // prefilled from scratch. Every step's logits (hence every probability), every token, the state and the drafter's
+      // context must be the same bit for bit, with a prompt ending inside a KV page and one ending on a page boundary.
+      const int n = engine.sessions();
+      if (n < 2 || prompts.empty()) throw std::runtime_error("--fork-check needs --sessions 2 and a prompt");
+      auto digest = [](const std::vector<float>& l) {
+        uint64_t h = 14695981039346656037ull;
+        for (float f : l) {
+          uint32_t b;
+          std::memcpy(&b, &f, sizeof b);
+          h = (h ^ b) * 1099511628211ull;
+        }
+        return h;
+      };
+      std::vector<int> longest = *std::max_element(
+          prompts.begin(), prompts.end(), [](const auto& a, const auto& b) { return a.size() < b.size(); });
+      const size_t page = 64;  // KvPool::kPageTokens
+      if (longest.size() < 2 * page) throw std::runtime_error("--fork-check needs a prompt of two pages");
+      const size_t boundary = longest.size() / page * page;
+      struct Case {
+        const char* name;
+        float temperature;
+        int top_k;
+      };
+      struct Arm {
+        std::vector<std::vector<uint64_t>> first, steps;
+        std::vector<Result> results;
+      };
+      bool failed = false;
+      for (const size_t len : {boundary, boundary - page + 17}) {
+        const std::vector<int> prompt(longest.begin(), longest.begin() + len);
+        for (const Case& cs : {Case{"greedy", 0.f, 20}, Case{"top_k 40", 0.8f, 40}, Case{"no top_k", 0.8f, 0}}) {
+          std::vector<ragon::SamplingParams> params(n);
+          for (int i = 0; i < n; ++i) {
+            params[i].temperature = cs.temperature;
+            params[i].top_k = cs.top_k;
+            params[i].top_p = 0.9f;
+            params[i].seed = 7 + uint64_t(i) * 0x9E3779B97F4A7C15ull;
+          }
+          auto decode = [&](std::vector<Seq>& seqs, std::vector<std::vector<uint64_t>>& l) {
+            auto emit = [&](Seq& q) {
+              for (int t : q.pending) {
+                q.out.push_back(t);
+                if (is_end(t) || static_cast<int>(q.out.size()) >= max_tokens) return q.done = true;
+              }
+              return false;
+            };
+            std::vector<std::vector<float>> rows(n);
+            long tokens = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            while (true) {
+              std::vector<ragon::Engine::SeqStep> steps;
+              std::vector<int> in;
+              for (int i = 0; i < n; ++i) {
+                if (seqs[i].done || emit(seqs[i])) continue;
+                ragon::Engine::SeqStep st;
+                st.session = i;
+                st.anchor = seqs[i].pending.back();
+                st.params = &seqs[i].sp;
+                st.row_logits = &rows[i];
+                steps.push_back(st);
+                in.push_back(i);
+              }
+              if (steps.empty()) break;
+              engine.step_batch(steps);
+              for (size_t k = 0; k < steps.size(); ++k) {
+                if (steps[k].error) std::rethrow_exception(steps[k].error);
+                seqs[in[k]].pending = steps[k].out;
+                l[in[k]].push_back(digest(rows[in[k]]));
+                ++tokens;
+              }
+            }
+            return tokens / std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          };
+          auto arm = [&](bool forked, double* rate, double* setup) {
+            Arm a;
+            a.steps.resize(n);
+            a.first.resize(n);
+            std::vector<Seq> seqs(n);
+            engine.reset_all();
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<float> prompt_logits;
+            for (int i = 0; i < n; ++i) {
+              seqs[i].session = i;
+              seqs[i].sp = params[i];
+              activate(i, "", true);
+              if (i == 0 || !forked) prompt_logits = engine.prefill(prompt, nullptr, true, nullptr);
+              else {
+                engine.fork_session(0);
+                prompt_logits = engine.logits();  // the scheduler's fork draws from these: the parent's, unchanged
+              }
+              a.first[i].push_back(digest(prompt_logits));
+              seqs[i].pending = {engine.sample(prompt_logits, seqs[i].sp, engine.history())};
+            }
+            *setup = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            *rate = decode(seqs, a.steps);
+            for (int i = 0; i < n; ++i) a.results.push_back(result_of(seqs[i]));
+            return a;
+          };
+          double rate0, rate1, setup0, setup1;
+          const Arm separate = arm(false, &rate0, &setup0), forks = arm(true, &rate1, &setup1);
+          std::printf("fork %s, prompt %zu: %d sequences; separate %.2f s then %.1f tok/s, forked %.2f s then %.1f tok/s\n",
+                      cs.name, len, n, setup0, rate0, setup1, rate1);
+          std::set<std::vector<int>> distinct;
+          for (int i = 0; i < n; ++i) {
+            distinct.insert(forks.results[i].tokens);
+            const Result& a = separate.results[i];
+            const Result& b = forks.results[i];
+            if (a.tokens == b.tokens && a.hash == b.hash && a.draft == b.draft && separate.steps[i] == forks.steps[i] &&
+                separate.first[i] == forks.first[i])
+              continue;
+            failed = true;
+            size_t at = 0;
+            while (at < separate.steps[i].size() && at < forks.steps[i].size() &&
+                   separate.steps[i][at] == forks.steps[i][at])
+              ++at;
+            std::printf("  fork %d differs: prompt logits %s, tokens %s, state %s, drafter %s, logits from step %zu\n", i,
+                        separate.first[i] == forks.first[i] ? "same" : "DIFFER", a.tokens == b.tokens ? "same" : "DIFFER",
+                        a.hash == b.hash ? "same" : "DIFFER", a.draft == b.draft ? "same" : "DIFFER", at);
+          }
+          // Distinct seeds must give forks of their own: seeds that only shift one stream would pass the rest.
+          if (cs.temperature > 0.f && static_cast<int>(distinct.size()) < std::max(2, n / 2)) {
+            failed = true;
+            std::printf("  only %zu distinct answers among %d sampled forks\n", distinct.size(), n);
+          }
+        }
+      }
+      std::printf(failed ? "FORK CHECK FAILED\n" : "fork check passed\n");
+      return failed ? 1 : 0;
     }
     if (prefix_check) {
       auto argmax = [](const std::vector<float>& l) { return int(std::max_element(l.begin(), l.end()) - l.begin()); };

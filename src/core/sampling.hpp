@@ -42,4 +42,9 @@ void require_finite_topk(std::span<const float> vals, std::span<const int> ids, 
 int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
                   std::mt19937_64& rng);
 
+// sample_logits' draw, from a row's top k values (descending) and their ids, for a temperature above zero and no
+// penalties: the same token from the same generator, so a row sampled from its top k on the GPU is one sampled from
+// all its logits (Engine::step_batch). Equal values may sit in another order; the distribution does not change.
+int sample_topk(std::span<const float> vals, std::span<const int> ids, const SamplingParams& p, std::mt19937_64& rng);
+
 }  // namespace ragon

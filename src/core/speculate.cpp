@@ -187,17 +187,9 @@ void Engine::alloc_drafter() {
   dcand_ = alloc<int>(size_t(B) * d.selector_top_k);
   dhp_ = alloc<float>(size_t(B) * d.selector_rank);
   dscores_ = alloc<float>(size_t(B) * d.selector_top_k * d.selector_top_k);
-  topk_scratch_ = alloc<float>(kernels::topk_scratch_floats(B, 64));
-  vals_dev_ = alloc<float>(size_t(B) * 64);
-  ids_out_dev_ = alloc<int>(size_t(B) * 64);
+  alloc_verify_rows();
   if (d.selector_top_k > 16) throw std::runtime_error("drafter selector_top_k > 16");
   const int C = c.lin_conv_channels();
-  for (size_t i = 0; i < s_->gdn.size(); ++i) {
-    v_pre_.push_back(alloc<float>(size_t(B) * C));
-    v_post_.push_back(alloc<float>(size_t(B) * C));
-    v_g_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
-    v_beta_.push_back(alloc<float>(size_t(B) * c.lin_v_heads));
-  }
   conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
   set_draft_block(opts_.draft_block);
   // Tree verification (BACKLOG 26).

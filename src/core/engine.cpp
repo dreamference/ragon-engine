@@ -247,6 +247,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
                  draft_->nvfp4_copies()
                      ? ("NVFP4 (relative squared error " + std::to_string(draft_->nvfp4_rel_sq_error()) + ")").c_str()
                      : "BF16");
+  } else if (opts_.sessions > 1) {
+    alloc_verify_rows();  // for step_batch
   }
   if (sessions_.size() > 1) std::fprintf(stderr, "sessions: %zu resident\n", sessions_.size());
   logits_.resize(c.vocab);
@@ -693,6 +695,7 @@ SpecStats Engine::spec_stats_total() const {
     t.lookup_steps += a.lookup_steps;
     t.lookup_accepted += a.lookup_accepted;
     t.batched_steps += a.batched_steps;
+    t.fanout_steps += a.fanout_steps;
     t.tree_steps += a.tree_steps;
     t.tree_branch_steps += a.tree_branch_steps;
     t.tree_off_chain += a.tree_off_chain;

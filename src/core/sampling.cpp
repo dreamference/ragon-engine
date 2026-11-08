@@ -41,10 +41,17 @@ int sample_logits(std::span<const float> logits, const SamplingParams& p, std::s
   std::iota(idx.begin(), idx.end(), 0);
   std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return l[a] > l[b]; });
   idx.resize(k);
+  std::vector<float> top(k);
+  for (int i = 0; i < k; ++i) top[i] = l[idx[i]];
+  return sample_topk(top, idx, p, rng);
+}
+
+int sample_topk(std::span<const float> vals, std::span<const int> ids, const SamplingParams& p, std::mt19937_64& rng) {
+  const int k = static_cast<int>(vals.size());
   std::vector<double> probs(k);
-  const double mx = l[idx[0]];
+  const double mx = vals[0];
   double sum = 0;
-  for (int i = 0; i < k; ++i) sum += probs[i] = std::exp((l[idx[i]] - mx) / p.temperature);
+  for (int i = 0; i < k; ++i) sum += probs[i] = std::exp((vals[i] - mx) / p.temperature);
   for (double& pr : probs) pr /= sum;
   int keep = k;
   if (p.top_p < 1.f) {
@@ -64,7 +71,7 @@ int sample_logits(std::span<const float> logits, const SamplingParams& p, std::s
     keep = std::max(n, 1);
   }
   std::discrete_distribution<int> dist(probs.begin(), probs.begin() + keep);
-  return idx[dist(rng)];
+  return ids[dist(rng)];
 }
 
 }  // namespace ragon
