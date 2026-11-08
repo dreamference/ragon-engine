@@ -1088,7 +1088,11 @@ int main(int argc, char** argv) {
       for (const bool long_q : {false, true}) {
         std::vector<std::vector<int>> prompt(n);
         for (int i = 0; i < n; ++i) {
-          const size_t len = long_q ? 5 + (size_t(i) * 97) % 380 : 8 + (size_t(i) * 13) % 56;
+          static const int qlen = [] {
+            const char* e = std::getenv("RAGON_JOINT_QLEN");  // measurement: every short question this long
+            return e ? std::atoi(e) : 0;
+          }();
+          const size_t len = long_q ? 5 + (size_t(i) * 97) % 380 : qlen > 0 ? size_t(qlen) : 8 + (size_t(i) * 13) % 56;
           const size_t at = (size_t(i) * 131) % (prefix.size() - len);
           prompt[i] = prefix;
           prompt[i].insert(prompt[i].end(), prefix.begin() + at, prefix.begin() + at + len);
