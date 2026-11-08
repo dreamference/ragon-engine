@@ -286,6 +286,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   else inpass_ = false;
   commit_overlap_ = opts_.commit_overlap && draft_ != nullptr;
   if (const char* e = std::getenv("RAGON_COMMIT_OVERLAP")) commit_overlap_ = draft_ != nullptr && std::atoi(e) != 0;
+  if (const char* e = std::getenv("RAGON_COMMIT_STATE_BATCH")) commit_state_batch_ = std::atoi(e) != 0;
   if (commit_overlap_) {
     check(cudaStreamCreateWithFlags(&commit_stream_, cudaStreamNonBlocking), "commit stream");
     check(cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming), "commit event");

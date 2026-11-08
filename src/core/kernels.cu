@@ -538,7 +538,8 @@ __global__ void gdn_conv_commit_seqs_kernel(float* __restrict__ mixed, SeqPtrs<f
   float s0 = st[c * 3], s1 = st[c * 3 + 1], s2 = st[c * 3 + 2];
   const float w0 = __bfloat162float(w[c * 4]), w1 = __bfloat162float(w[c * 4 + 1]);
   const float w2 = __bfloat162float(w[c * 4 + 2]), w3 = __bfloat162float(w[c * 4 + 3]);
-  for (int t = b.row0[sq]; t < b.row0[sq + 1]; ++t) {
+  const int end = b.row1[sq] > 0 ? b.row1[sq] : b.row0[sq + 1];
+  for (int t = b.row0[sq]; t < end; ++t) {
     const float xv = mixed[static_cast<size_t>(t) * C + c];
     const float o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
     s0 = s1;
@@ -560,8 +561,9 @@ __global__ void __launch_bounds__(32)
   const int sq = blockIdx.y;
   const size_t r0 = b.row0[sq];
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
+  const int end = b.row1[sq] > 0 ? b.row1[sq] : b.row0[sq + 1];
   gdn_recurrent_body(mixed + r0 * C, g + r0 * HV, beta + r0 * HV, state.p[sq], state.p[sq], out + r0 * HV * kGdnDv,
-                     b.row0[sq + 1] - b.row0[sq], H, HV, blockIdx.x);
+                     end - b.row0[sq], H, HV, blockIdx.x);
 }
 
 // The verify's recurrence over several sequences in one launch (M4 stage 4): blockIdx.y is the sequence, its rows

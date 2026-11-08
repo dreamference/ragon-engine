@@ -63,6 +63,9 @@ struct SeqBatch {
   const int* pos_dev = nullptr;    // a captured graph: sequence i's position is pos_dev[i]
   int rdelta[kMaxSeqs] = {};       // the sequences' rope deltas (DevPos::rdelta)
   const int* rdelta_dev = nullptr; // a captured graph: sequence i's rope delta is rdelta_dev[i]
+  // The commit kernels only: sequence i's rows end at row1[i] when it is set (a wide step's accepted rows, which leave
+  // gaps between the sequences), else at row0[i + 1].
+  int row1[kMaxSeqs] = {};
 };
 template <typename T>
 struct SeqPtrs {

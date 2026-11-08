@@ -66,6 +66,32 @@ void Engine::commit_seqs(std::span<Session* const> rows, cudaStream_t st, float*
   }
 }
 
+void Engine::commit_state_seqs(std::span<Session* const> ss, std::span<const int> row0, std::span<const int> rows) {
+  const ModelConfig& c = model_->config();
+  kernels::SeqBatch sb;
+  sb.n = static_cast<int>(ss.size());
+  for (int i = 0; i < sb.n; ++i) {
+    sb.row0[i] = row0[i];
+    sb.row1[i] = row0[i] + rows[i];
+  }
+  sb.row0[sb.n] = sb.row1[sb.n - 1];
+  for (int li = 0; li < c.layers; ++li) {
+    const LayerWeights& L = model_->layers()[li];
+    if (L.full) continue;  // the verify already wrote the KV
+    const int slot = layer_slot_[li];
+    kernels::SeqPtrs<float> conv, gdn;
+    for (int i = 0; i < sb.n; ++i) {
+      conv.p[i] = ss[i]->conv[slot];
+      gdn.p[i] = ss[i]->gdn[slot];
+    }
+    kernels::gdn_conv_commit_seqs(v_pre_[slot], conv, L.conv, sb, c.lin_conv_channels(), commit_stream_);
+    kernels::gdn_recurrent_commit_seqs(v_post_[slot], v_g_[slot], v_beta_[slot], gdn, commit_core_, sb, c.lin_k_heads,
+                                       c.lin_v_heads, commit_stream_);
+  }
+  check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
+  commit_pending_ = true;
+}
+
 kernels::SeqGroups Engine::cascade_groups(std::span<const Seg> segs) const {
   kernels::SeqGroups g;
   // RAGON_CASCADE=0: every sequence over all its keys, for a comparison.

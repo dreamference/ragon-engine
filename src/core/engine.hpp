@@ -660,6 +660,7 @@ class Engine {
   // recurrent state, the verify's saved inputs or commit_core_ on stream_ (every forward pass, the state copies,
   // resets and hashes) joins first; the draft and the drafter's context KV (draft_materialize) do not need to.
   bool commit_overlap_ = false;
+  bool commit_state_batch_ = true;  // speculate_batch: commit_state_seqs, not one replay per sequence
   bool commit_pending_ = false;
   cudaStream_t commit_stream_ = nullptr;
   cudaEvent_t commit_done_ = nullptr;
@@ -712,6 +713,10 @@ class Engine {
   void alloc_verify_rows();  // the buffers a Verify pass keeps its rows in: with a drafter, or for step_batch
   // step_batch's commit: rows 0 .. n - 1 into their sessions' DeltaNet state, in one launch per kernel and layer.
   void commit_seqs(std::span<Session* const> rows, cudaStream_t st, float* out);
+  // speculate_batch's commit beside the next draft: sequence i's rows row0[i] .. row0[i] + rows[i] - 1 into its
+  // session's DeltaNet state on commit_stream_, in one launch per kernel and layer (the per-sequence replay's
+  // arithmetic, sequence by sequence), then commit_done_.
+  void commit_state_seqs(std::span<Session* const> ss, std::span<const int> row0, std::span<const int> rows);
   void alloc_sparse_head();
   // The drafter's head over n sequences' E rows each of dh_: dunary_ and dcand_ (the top K16 values and token ids per
   // row); sequence i's from the sparse head over masks[i] (its session's fixed list and context, BACKLOG 19), or the
