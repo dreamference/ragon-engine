@@ -9,6 +9,7 @@
 //              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
 //              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
 //              [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
+//              [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N]
 //
 // --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
 // its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
@@ -43,6 +44,15 @@
 // drafter pass, and probes the drafter once every 16 plain steps until the mean is back at X + 0.25
 // (core/draft_guard.hpp). Greedy output is the same token for token; counted in /spec_stats (drafter_off_steps,
 // drafter_switches) and /metrics (ragon:drafter_off_steps_total, ragon:drafter_switches_total).
+//
+// Fan-out (BATCHING P4d and §5.8): --fanout-plain-above N (RAGON_FANOUT_PLAIN_ABOVE; default 6 with a drafter, 1
+// without, 0 never) has every decoding request take plain batched steps above N decoding requests; --fanout-gang-above
+// N (RAGON_FANOUT_GANG_ABOVE; default the plain threshold) runs the short question prefills together above N live
+// requests. --fanout-default on|off (RAGON_FANOUT_DEFAULT 1/0; default on, stage 11): with a drafter, above 7
+// drafting requests every one speculates with the gang block, --fanout-draft-block N (RAGON_FANOUT_DRAFT_BLOCK;
+// default 2, 0 for --draft-block, at most --draft-block), and the plain threshold holds there only when
+// --fanout-plain-above is given; at 7 or fewer nothing changes. Off is the server before stage 11. Greedy output is
+// the same token for token either way.
 //
 // --graphs runs each speculative step's draft, verify and commit as captured CUDA graphs (M3); --pdl launches
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
@@ -431,7 +441,8 @@ struct Running {
 class Scheduler {
  public:
   Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0,
-            bool fair_pairing = false, int fanout_plain_above = 0, int fanout_gang_above = -1)
+            bool fair_pairing = false, int fanout_plain_above = 0, int fanout_gang_above = -1,
+            bool fanout_plain_explicit = true, int fanout_wide_above = 0, int fanout_wide_block = 0)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
@@ -440,6 +451,10 @@ class Scheduler {
         fair_pairing_(fair_pairing),
         fanout_plain_above_(fanout_plain_above),
         fanout_gang_above_(fanout_gang_above < 0 ? fanout_plain_above : fanout_gang_above),
+        fanout_plain_explicit_(fanout_plain_explicit),
+        fanout_wide_above_(fanout_wide_above),
+        base_block_(ctx.engine->draft_block()),
+        wide_block_(fanout_wide_block > 0 ? fanout_wide_block : ctx.engine->draft_block()),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -766,6 +781,7 @@ class Scheduler {
     while (admit()) {
       if (running_.empty()) continue;
       kv_gauges();
+      fanout_regime();  // before kv_room and batch_with: both read the draft block
       size_t k = turn_++ % running_.size();
       // A side chunk whose pass is done is finished (and the next one launched) before anything else, so the side
       // stream does not wait out another request's step.
@@ -836,10 +852,31 @@ class Scheduler {
   // greedy output is unchanged (a plain row's logits are a verify row's) and a sampled one keeps its distribution.
   // Without a drafter nothing speculates, so the threshold is 1: two decoding requests already share a pass.
   bool fanout_plain() const {
-    if (fanout_plain_above_ <= 0) return false;
+    if (fanout_plain_above_ <= 0 || (wide_ && !fanout_plain_explicit_)) return false;
     int decoding = 0;
     for (const auto& o : running_) decoding += !o->prefilling;
     return decoding > fanout_plain_above_;
+  }
+  // The wide regime (BATCHING §5.8 stage 11, the default since 2026-11-08): above fanout_wide_above_ drafting requests
+  // (7; decoding, with a drafter for their sampling) every one of them speculates, gang-sized: the plain threshold no
+  // longer holds unless --fanout-plain-above was given, and the engine's draft block is the gang block (2: 32 requests
+  // x 2 rows fill a 64-row verify). At fewer the server is what it was (plain above 6, the global block, trees). A
+  // change of block drops the captured graphs (Engine::set_draft_block), so it waits while a side chunk is in flight
+  // and the regime with it. Called once a turn, before anything reads the block. --fanout-default off: never wide.
+  void fanout_regime() {
+    if (fanout_wide_above_ <= 0) return;
+    int drafting = 0;
+    for (const auto& o : running_) drafting += !o->prefilling && o->spec;
+    Engine& eng = *ctx_.engine;
+    const bool before = wide_;
+    wide_ = drafting > fanout_wide_above_;
+    const int block = wide_ && !fanout_plain() ? wide_block_ : base_block_;
+    if (block == eng.draft_block()) return;
+    if (eng.side_busy()) {
+      wide_ = before;
+      return;
+    }
+    eng.set_draft_block(block);
   }
   // Fan-out's question prefills (BATCHING P4d): above --fanout-gang-above live requests (by default the plain
   // threshold), the short prefills waiting (at most a chunk left: a fork's question after a shared context) run ahead
@@ -1548,6 +1585,10 @@ class Scheduler {
   bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
   int fanout_plain_above_;  // --fanout-plain-above: fanout_plain(), 0 for never
   int fanout_gang_above_;   // --fanout-gang-above: gang_prefill() and burst_more(), 0 for never, -1 as plain
+  bool fanout_plain_explicit_;  // --fanout-plain-above was given: it holds in the wide regime too
+  int fanout_wide_above_;       // the wide regime above this many drafting requests (fanout_regime()), 0 for never
+  int base_block_, wide_block_;  // the draft block below and in the wide regime (--draft-block, --fanout-draft-block)
+  bool wide_ = false;            // this turn is in the wide regime (fanout_regime())
   bool gang_unit_ = false;     // this turn's unit is a gang_prefill()
   bool gang_holding_ = false;  // the decode passes are holding for short prefills, since gang_t0_
   std::chrono::steady_clock::time_point gang_t0_;
@@ -2300,6 +2341,10 @@ class Factory : public proxygen::RequestHandlerFactory {
 
 // Above this many decoding requests a server with a drafter stops speculating (BATCHING P4d, measured there).
 constexpr long kFanoutPlainAboveDrafting = 6;
+// The wide regime's defaults (BATCHING §5.8 stage 11): above this many drafting requests every one speculates with
+// the gang block, whatever the plain threshold says (--fanout-default off: never).
+constexpr int kFanoutWideAboveDrafting = 7;
+constexpr long kFanoutWideBlock = 2;
 
 int main(int argc, char** argv) try {
   std::string model_dir, host = "0.0.0.0", name;
@@ -2316,7 +2361,7 @@ int main(int argc, char** argv) try {
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
   long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = -1,
-       fanout_gang_above = -1;
+       fanout_gang_above = -1, fanout_default = 1, fanout_draft_block = -1;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -2383,6 +2428,15 @@ int main(int argc, char** argv) try {
     else if (a == "--fair-pairing") fair_pairing = std::stol(next());
     else if (a == "--fanout-plain-above") fanout_plain_above = std::stol(next());
     else if (a == "--fanout-gang-above") fanout_gang_above = std::stol(next());
+    else if (a == "--fanout-draft-block") fanout_draft_block = std::stol(next());
+    else if (a == "--fanout-default") {
+      const std::string v = next();
+      if (v != "on" && v != "off" && v != "1" && v != "0") {
+        std::cerr << "--fanout-default must be on or off\n";
+        return 2;
+      }
+      fanout_default = v == "on" || v == "1";
+    }
     else if (a == "--plan-only") plan_only = true;
     else if (a == "--repetition-detection") repetition_arg = next();
     else if (a == "--repetition-report") repetition_report = next();
@@ -2398,7 +2452,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2538,7 +2592,9 @@ int main(int argc, char** argv) try {
                           std::pair<const char*, long*>{"RAGON_AUTO_SIZE", &auto_size},
                           std::pair<const char*, long*>{"RAGON_FAIR_PAIRING", &fair_pairing},
                           std::pair<const char*, long*>{"RAGON_FANOUT_PLAIN_ABOVE", &fanout_plain_above},
-                          std::pair<const char*, long*>{"RAGON_FANOUT_GANG_ABOVE", &fanout_gang_above}})
+                          std::pair<const char*, long*>{"RAGON_FANOUT_GANG_ABOVE", &fanout_gang_above},
+                          std::pair<const char*, long*>{"RAGON_FANOUT_DEFAULT", &fanout_default},
+                          std::pair<const char*, long*>{"RAGON_FANOUT_DRAFT_BLOCK", &fanout_draft_block}})
     if (const char* e = std::getenv(var)) {
       try {
         *dst = std::stol(e);
@@ -2697,12 +2753,31 @@ int main(int argc, char** argv) try {
               << "\n";
   }
   std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
+  const bool plain_explicit = fanout_plain_above >= 0;
   if (fanout_plain_above < 0) fanout_plain_above = draft_dir.empty() ? 1 : kFanoutPlainAboveDrafting;
   // The fork prefills gang above the same count unless told otherwise (BATCHING §5.8: speculation under fan-out needs
   // the forks started together as much as plain steps do).
   if (fanout_gang_above < 0) fanout_gang_above = fanout_plain_above;
+  // The wide regime (BATCHING §5.8 stage 11): with a drafter and --fanout-default on, above 7 drafting requests every
+  // one speculates with the gang block (--fanout-draft-block, 2; 0 keeps --draft-block), unless --fanout-plain-above
+  // was given. The drafter's buffers are sized for --draft-block at start, so the gang block cannot exceed it.
+  if (fanout_draft_block < 0) fanout_draft_block = kFanoutWideBlock;
+  if (fanout_draft_block == 0) fanout_draft_block = draft_block;
+  if (fanout_draft_block < 2 || fanout_draft_block > draft_block) {
+    std::cerr << "--fanout-draft-block must be 0 or in [2, --draft-block]\n";
+    return 2;
+  }
+  const int wide_above = fanout_default && !draft_dir.empty() ? kFanoutWideAboveDrafting : 0;
+  if (wide_above > 0)
+    std::fprintf(stderr, "fanout: plain above %ld decoding%s, gang above %ld; above %d drafting: draft block %ld%s\n",
+                 fanout_plain_above, plain_explicit ? "" : " up to the wide regime", fanout_gang_above, wide_above,
+                 fanout_draft_block, plain_explicit ? "" : ", never plain");
+  else
+    std::fprintf(stderr, "fanout: plain above %ld decoding, gang above %ld; no wide regime\n", fanout_plain_above,
+                 fanout_gang_above);
   ragon::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0,
-                                     static_cast<int>(fanout_plain_above), static_cast<int>(fanout_gang_above));
+                                     static_cast<int>(fanout_plain_above), static_cast<int>(fanout_gang_above),
+                                     plain_explicit, wide_above, static_cast<int>(fanout_draft_block));
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;
