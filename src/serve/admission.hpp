@@ -236,7 +236,8 @@ inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_contex
 
 // Auto-size (BATCHING §5.6): the most sessions chosen without --sessions, and the shortest context chosen without
 // --max-context. The cap is the engine's kMaxSeqs (P4e, 2026-11-08; 4 before): a fan-out's forks are sessions, so a
-// default start must allow 32 of them; memory, not the cap, decides how many fit (7 at 262,144 on node-b paged, 3 flat).
+// default start must allow 32 of them; memory, not the cap, decides how many fit (measured with the drafter at 110.5 GB available:
+// 6 at 262,144 paged, 3 flat; 22 and 13 at a given 65,536; 32 and 24 at a given 32,768).
 inline constexpr int kAutoSessionsCap = 32;
 inline constexpr int kAutoContextFloor = 32768;
 // What ragon-serve runs when it does not size itself (--auto-size 0, or MemAvailable unreadable): today's defaults.
