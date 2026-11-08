@@ -186,7 +186,7 @@ __device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const 
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
     const bool valid = key < khi;
-    const int src = key < pos0 ? key : pos0 + path[min(key - pos0, kMaxStreamRows - 1)];
+    const int src = key < pos0 ? key : pos0 + path[min(key - pos0, kMaxSeqRows - 1)];
     const size_t off = kv_off(pages, kvh, valid ? src : 0, hs, ps) + 8 * c;  // src may be in another page
     cp_async16(ks + j * KS + 8 * c, kcache + off, valid);
     cp_async16(vs + j * KS + 8 * c, vcache + off, valid);

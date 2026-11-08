@@ -578,7 +578,7 @@ class Engine {
   void linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready = false,
                            const kernels::LoraGemm* lora = nullptr);
   // The prefill path (quantized activations, prefill_gemm.cu) or the rows path (stream_gemm.cu)?
-  bool quantized(int M) const { return quantized_ || M > kRowsMax; }
+  bool quantized(int M) const { return quantized_ || M > kernels::kMaxStreamRows; }
   static constexpr int kRowsMax = 32;  // kernels::kMaxStreamRows
   static constexpr int kAttnSlice = 256;
   static constexpr int kResumeAlign = 32;  // kept states sit at multiples of this (the DeltaNet's chunk)  // prefill attention: queries per call (bounds the partials' scratch)

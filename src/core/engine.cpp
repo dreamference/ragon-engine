@@ -745,7 +745,7 @@ int Engine::kv_step_rows(const Session& s, bool spec) const {
   // A tree verify's rows (speculate(): the chain's first tree_chain drafts and the anchor, then tree_nodes nodes), or
   // the block; never more than the rows path takes.
   const int tree = opts_.tree_nodes > 0 ? std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes : 0;
-  return std::min({std::max(B, tree), int(kernels::kMaxStreamRows), room});
+  return std::min({std::max(B, tree), int(kernels::kMaxSeqRows), room});
 }
 
 int Engine::kv_pages_free() {
@@ -1003,7 +1003,7 @@ uint64_t Engine::draft_hash() {
 }
 
 void Engine::set_draft_block(int b) {
-  if (b < 2 || b > kernels::kMaxStreamRows) throw std::runtime_error("draft block must be in [2, 32]");
+  if (b < 2 || b > kernels::kMaxSeqRows) throw std::runtime_error("draft block must be in [2, 32]");
   if (b != opts_.draft_block) clear_graphs();  // they were captured for the old block
   opts_.draft_block = b;
 }
@@ -1361,15 +1361,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // FP32 for its shrink; without, nothing below changes.
   const kernels::LoraRows lrows = lora_rows(segs);
   const bool lora_on = lrows.n > 0;
-  if (verify && !rows) throw std::runtime_error("verify: at most 32 rows");
+  if (verify && !rows) throw std::runtime_error("verify: at most 64 rows");
   NvtxRange range(verify ? "verify" : M == 1 ? "decode" : "prefill_chunk");
   const int H = c.hidden, I = c.intermediate, C = c.lin_conv_channels(), Vs = c.lin_value_size();
   const int qsize = c.heads * c.head_dim;
   // RAGON_PROFILE=1: synchronize after each phase and add up its wall time (slow; for finding hot spots).
   auto t_last = std::chrono::steady_clock::now();
-  const char* kind = verify ? "verify/" : M == 1 ? "decode/" : rows ? "rows/" : "prefill/";
-  // Each kind's pass count under "<kind>passes" (printed with the seconds' unit), so a phase's total divides into its
-  // cost a pass (BATCHING §5.8).
+  // A verify wider than one sequence's rows (a batch of 33 to 64) under its own name, and each kind's pass count under
+  // "<kind>passes" (printed with the seconds' unit), so a phase's total divides into its cost a pass (BATCHING §5.8).
+  const char* kind = verify ? M > kernels::kMaxSeqRows ? "verify_wide/" : "verify/"
+                     : M == 1 ? "decode/" : rows ? "rows/" : "prefill/";
   if (profile_) phase_seconds_[std::string(kind) + "passes"] += 1;
   auto mark = [&](const char* phase) {
     if (!profile_) return;
