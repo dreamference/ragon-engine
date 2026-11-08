@@ -174,7 +174,7 @@ void Engine::alloc_drafter() {
   cap_ = alloc<__nv_bfloat16>(size_t(R) * cap_stride_);
   // Each session's context KV is a ring (M4 §1): the window, kRingSlack positions of slack, and a commit's rows.
   constexpr int kRingSlack = 6144;
-  ring_ = d.sliding_window + kRingSlack + kernels::kMaxStreamRows;
+  ring_ = d.sliding_window + kRingSlack + kernels::kMaxSeqRows;
   for (Session& s : sessions_)
     for (int l = 0; l < d.layers; ++l) {
       s.dkc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
@@ -429,7 +429,7 @@ void Engine::draft_head(int n, int E, const uint8_t* const* masks) {
 bool Engine::tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const {
   const int rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
   return opts_.tree_nodes > 0 && !use_lookup && !want_logits && B == opts_.draft_block &&
-         rows <= kernels::kMaxStreamRows && s.pos + rows <= opts_.max_context;
+         rows <= kernels::kMaxSeqRows && s.pos + rows <= opts_.max_context;
 }
 
 bool Engine::can_speculate(const SamplingParams& p) const {
@@ -613,7 +613,7 @@ void Engine::draft_materialize_seqs(std::span<Session* const> seqs) {
 void Engine::linear_draft_kproj(const Bf16Weight& w, const Fp4Weight& w4, const float* x, int M, float* y) {
   if (!w4.w) return linear_bf16_drafter(w, x, M, y);
   // Without the BF16 original only the rows path is there; a drafter pass never has more rows (pin_->draft_ids).
-  if (M > kernels::kMaxStreamRows) throw std::runtime_error("the drafter's NVFP4 conv projection over > 32 rows");
+  if (M > kernels::kMaxStreamRows) throw std::runtime_error("the drafter's NVFP4 conv projection over > 64 rows");
   kernels::to_half_rows(x, M, w4.K, xh_, xinv_, stream_);
   kernels::stream_gemm_nvfp4(xh_, xinv_, M, w4.w, w4.table, w4.scale2, y, w4.N, w4.K, stream_);
 }
