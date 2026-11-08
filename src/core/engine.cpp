@@ -1346,6 +1346,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     sb.pos_dev = pos_dev_;
     sb.rdelta_dev = rdelta_dev_;
   }
+  const kernels::SeqGroups groups = joint && !use_dev_pos_ ? cascade_groups(segs) : kernels::SeqGroups{};
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
@@ -1490,8 +1491,12 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         }
         kernels::attn_prepare_seqs(q_gate_, k_, v_, L.q_norm, L.k_norm, sb, c.heads, c.kv_heads, c.head_dim, c.rotary_dim,
                                    c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg);
-        kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
-                                     use_dev_pos_ ? opts_.max_context : 0, pg);
+        if (groups.n > 0)
+          kernels::attention_rows_cascade(q_, kcr, vcr, sb, groups, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_,
+                                          stream_, pg);
+        else
+          kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
+                                       use_dev_pos_ ? opts_.max_context : 0, pg);
       }
       for (const Seg& g : joint ? std::span<const Seg>() : segs) {
         const size_t r0 = g.row0;
@@ -1686,7 +1691,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         mark("gdn_proj");
       } else {
       // The prefill path convolves out of place: the projection goes to t2_ (free until the MLP).
-      float* qkv_out = verify ? v_pre_[slot] : quantized_ ? t2_ : mixed;
+      // A plain fan-out step (verify_commits_) keeps every row, so its state is written in the pass, not by a second run.
+      float* qkv_out = verify ? (verify_commits_ ? mixed : v_pre_[slot]) : quantized_ ? t2_ : mixed;
       linear_fp8_multi({{&L.in_qkv, qkv_out}, {&L.in_z, z_}}, xn_, M, xn_half, prefill_site(LoraSite::Gdn, xn_, H, "gdn_proj"));
       if (lora_on && !quantized_) {
         mark("gdn_proj");
@@ -1709,7 +1715,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       }
       mark("gdn_proj");
       const bool keep = quantized_ && keep_at > 0 && keep_at < M;
-      if (verify && joint) {  // per sequence (M4 §2), from its own conv window, left unwritten
+      if (verify && joint && verify_commits_) {
+        kernels::SeqPtrs<float> st;
+        for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
+        kernels::gdn_conv_commit_seqs(mixed, st, L.conv, sb, C, stream_);
+      } else if (verify && joint) {  // per sequence (M4 §2), from its own conv window, left unwritten
         check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
               "verify inputs");
         kernels::SeqPtrs<const float> st;
@@ -1741,7 +1751,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       if (quantized_)
         kernels::gdn_recurrent_prefill(mixed, g, beta, s_->gdn[slot], core_, M, c.lin_k_heads, c.lin_v_heads, s_->pos,
                                        stream_, keep ? keep_target().gdn[slot] : nullptr, keep_at);
-      else if (joint) {  // a verify: each sequence from its own state, left unwritten
+      else if (joint && verify_commits_) {
+        kernels::SeqPtrs<float> st;
+        for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
+        kernels::gdn_recurrent_commit_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, c.lin_v_heads, stream_);
+      } else if (joint) {  // a verify: each sequence from its own state, left unwritten
         kernels::SeqPtrs<const float> st;
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
         kernels::gdn_recurrent_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, c.lin_v_heads, stream_);
@@ -2098,6 +2112,17 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   const int reuse = plan.reuse;
   s_->pos = reuse;
   truncate_history(reuse);
+  // The pass below rewrites the snap this prompt resumes from. A prompt that extends a long one leaves that point behind
+  // for good, and the other forks of the same context would resume at the store's last entry, thousands of tokens back
+  // (the store fills from the start of a prompt): when the snap is a chunk or more past that entry, it joins the store.
+  // Taken for every such prompt, since the next fork may arrive a moment after this one.
+  if (!from_kv && plan.src_from == &s_->snap && branch_checkpoints_ && !ckpt_slots_.empty() && reuse > 0 &&
+      reuse <= opts_.checkpoint_limit) {
+    int furthest = 0;
+    for (const Checkpoint& k : ckpts_)
+      if (k.pos <= reuse && k.pos > furthest && ckpt_match(k, prompt, prefix_hash, s_->scope)) furthest = k.pos;
+    if (reuse - furthest >= opts_.prefill_chunk) save_checkpoint(reuse, cur.ckpt_epoch, &s_->snap, true);
+  }
   if (draft_ && window > reuse) s_->dkv_lo = window;
   if (kv_book_) {
     // P4b: the pages up to the prompt's end and kKvGrowthPages more, mapped now (taken at admission, so a prefill never

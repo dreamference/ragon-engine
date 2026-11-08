@@ -668,6 +668,51 @@ __global__ void __launch_bounds__(ROWS * 2)
                                          blockIdx.x - blocks.blk0[sq], blockIdx.y, blockIdx.z, nullptr, pg.p[sq]);
 }
 
+// The cascade's two phases (attention_rows_cascade). First the keys a group of sequences shares, once, over all its rows
+// as one sequence's: x blocks [blk0[g], blk0[g + 1]) belong to group g, and its partials land at those rows of `scratch`.
+struct AttnGroups {
+  SeqGroups g;
+  int blk0[kMaxSeqGroups + 1];
+};
+template <int ROWS, int TK, int NS, bool BULK>
+__global__ void __launch_bounds__(ROWS * 2)
+    attention_shared_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+                            SeqBatch b, AttnGroups gr, int Hq, int Hkv, int splits, int chunk,
+                            float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg) {
+  pdl_begin();  // first statement: see launch.cuh
+  int g = 0;
+  while (g + 1 < gr.g.n && static_cast<int>(blockIdx.x) >= gr.blk0[g + 1]) ++g;
+  constexpr int D = kMmaD;
+  const int first = gr.g.seq0[g], cut = gr.g.cut[g];
+  const size_t r0 = b.row0[first];
+  attention_mma_body<ROWS, TK, NS, BULK, false, 1>(q + r0 * Hq * D, kc.p[first], vc.p[first], cut,
+                                                   b.row0[gr.g.seq1[g]] - b.row0[first], Hq, Hkv, splits, chunk,
+                                                   scratch + r0 * Hq * splits * (D + 2), hs, ps, pf, blockIdx.x - gr.blk0[g],
+                                                   blockIdx.y, blockIdx.z, nullptr, pg.p[first], cut);
+}
+// Then each sequence's own keys, from its cut[i] (0: all of them) on; z counts the ranges from zbase.
+struct AttnCuts {
+  int cut[kMaxSeqs];
+  int zbase;
+};
+template <int ROWS, int TK, int NS, bool BULK>
+__global__ void __launch_bounds__(ROWS * 2)
+    attention_suffix_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+                            SeqBatch b, AttnBlocks blocks, AttnCuts cuts, int Hq, int Hkv, int splits, int chunk,
+                            float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg) {
+  pdl_begin();  // first statement: see launch.cuh
+  int sq = 0;
+  while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
+  constexpr int D = kMmaD;
+  const size_t r0 = b.row0[sq];
+  const int split = blockIdx.z + cuts.zbase;
+  if ((split + 1) * chunk <= cuts.cut[sq]) return;  // a range the first phase finished for this sequence
+  attention_mma_body<ROWS, TK, NS, BULK, false, 2>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq),
+                                                   b.row0[sq + 1] - b.row0[sq], Hq, Hkv, splits, chunk,
+                                                   scratch + r0 * Hq * splits * (D + 2), hs, ps, pf, blockIdx.x - blocks.blk0[sq],
+                                                   blockIdx.y, split, nullptr, pg.p[sq], cuts.cut[sq]);
+}
+
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
                                          float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
@@ -963,6 +1008,18 @@ void prepare_kernels() {
   check(cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_shared_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_shared_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_suffix_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_suffix_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
   configured = true;
 }
 
@@ -1006,6 +1063,56 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
                     g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true> : attention_mma_seqs_kernel<rows, tk, ns, false>,
                     dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
                     splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
+                    dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
+}
+
+void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+                            const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out,
+                            cudaStream_t s, SeqPtrs<const uint64_t> pages) {
+  if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  if (b.pos_dev) throw std::runtime_error("attention_rows_cascade: positions on the host only (no captured graph)");
+  if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
+  if (groups.n < 1 || groups.n > kMaxSeqGroups) throw std::runtime_error("attention_rows_cascade: no groups");
+  constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
+  const int chunk = attention_chunk();
+  int ctx = 0;
+  for (int i = 0; i < b.n; ++i) ctx = std::max(ctx, b.pos[i] + b.row0[i + 1] - b.row0[i]);
+  const int splits = attention_rows_splits(ctx);
+  // The first phase: for each group, its rows as one staircase over the ranges below its cut; a range past a smaller
+  // group's cut writes an empty partial, which the second phase overwrites.
+  AttnGroups gr{};
+  gr.g = groups;
+  AttnCuts cuts{};
+  int zshared = 0;
+  for (int g = 0; g < groups.n; ++g) {
+    const int cut = groups.cut[g];
+    if (cut <= 0 || cut % tk || chunk % tk) throw std::runtime_error("attention_rows_cascade: a cut off the tile grid");
+    int r = 0;
+    for (int i = groups.seq0[g]; i < groups.seq1[g]; ++i) {
+      if (cut > b.pos[i]) throw std::runtime_error("attention_rows_cascade: a cut past a sequence's position");
+      cuts.cut[i] = cut;
+      r += b.row0[i + 1] - b.row0[i];
+    }
+    gr.blk0[g + 1] = gr.blk0[g] + (r * 6 + rows - 1) / rows;
+    zshared = std::max(zshared, (cut + chunk - 1) / chunk);
+  }
+  // The second: each sequence's rows over the ranges from the lowest cut's on.
+  cuts.zbase = splits;
+  AttnBlocks blocks{};
+  for (int i = 0; i < b.n; ++i) {
+    blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
+    cuts.zbase = std::min(cuts.zbase, cuts.cut[i] / chunk);
+  }
+  prepare_kernels();
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_shared",
+                    g_attn_bulk ? attention_shared_kernel<rows, tk, ns, true> : attention_shared_kernel<rows, tk, ns, false>,
+                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
+                    splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
+  launch_kernel_pdl(pdl_attention_enabled(), "attention_suffix",
+                    g_attn_bulk ? attention_suffix_kernel<rows, tk, ns, true> : attention_suffix_kernel<rows, tk, ns, false>,
+                    dim3(blocks.blk0[b.n], Hkv, splits - cuts.zbase), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks,
+                    cuts, Hq, Hkv, splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }

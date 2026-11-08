@@ -2,6 +2,7 @@
 // sessions' plain steps, one row each, in one pass. Kept apart from speculate.cpp: no speculation here and nothing of
 // the one-stream path.
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,9 @@
 namespace ragon {
 
 namespace {
+// The shortest shared run worth a launch of its own (a range of attention_chunk()'s default size).
+constexpr int kCascadeMinKeys = 4096;
+
 void check(cudaError_t e, const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string("fan-out: ") + what + ": " + cudaGetErrorString(e));
 }
@@ -62,6 +66,41 @@ void Engine::commit_seqs(std::span<Session* const> rows, cudaStream_t st, float*
   }
 }
 
+kernels::SeqGroups Engine::cascade_groups(std::span<const Seg> segs) const {
+  kernels::SeqGroups g;
+  // RAGON_CASCADE=0: every sequence over all its keys, for a comparison.
+  static const bool on = [] {
+    const char* e = std::getenv("RAGON_CASCADE");
+    return !e || std::atoi(e) != 0;
+  }();
+  if (!kv_book_ || !on || kernels::attention_chunk() % kernels::kKvPageTokens) return g;
+  const int n = static_cast<int>(segs.size());
+  // Pages wholly behind a session's position: every row of it sees all their keys and nothing writes them.
+  const auto behind = [](const Session& s) {
+    return std::min<int>(s.pos / kernels::kKvPageTokens, static_cast<int>(s.kv_ids.size()));
+  };
+  for (int i = 0; i < n;) {
+    const Session& a = *segs[i].s;
+    int run = behind(a), j = i + 1;
+    for (; j < n; ++j) {
+      const Session& b = *segs[j].s;
+      const int limit = std::min(run, behind(b));
+      int common = 0;
+      while (common < limit && a.kv_ids[common] != 0 && a.kv_ids[common] == b.kv_ids[common]) ++common;
+      if (common * kernels::kKvPageTokens < kCascadeMinKeys) break;
+      run = common;
+    }
+    if (j - i >= 2) {
+      g.seq0[g.n] = i;
+      g.seq1[g.n] = j;
+      g.cut[g.n] = run * kernels::kKvPageTokens;
+      ++g.n;
+    }
+    i = j;
+  }
+  return g;
+}
+
 bool Engine::can_step_batch(int session) const {
   return topk_scratch_ && opts_.max_context - sessions_.at(session).pos >= 1;
 }
@@ -99,7 +138,22 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
     ks[i] = row_top_k(*seqs[i].params);
     kmax = std::max(kmax, ks[i]);
   }
+  // Every row of two or more is kept, whatever its sampling does (a row that fails resets its session below), so the
+  // pass writes the DeltaNet state itself; one row takes the single-sequence path and its commit.
+  auto t_prof = std::chrono::steady_clock::now();
+  auto prof = [&](const char* phase) {
+    if (!profile_) return;
+    check(cudaStreamSynchronize(stream_), phase);
+    const auto now = std::chrono::steady_clock::now();
+    phase_seconds_[std::string("fanout/") + phase] += std::chrono::duration<double>(now - t_prof).count();
+    t_prof = now;
+  };
+  if (profile_ && fanout_last_.time_since_epoch().count())
+    phase_seconds_["fanout/between"] += std::chrono::duration<double>(t_prof - fanout_last_).count();
+  verify_commits_ = n > 1;
   forward_rows(pin_->rows, n, Pass::Verify, -1, segs);
+  verify_commits_ = false;
+  prof("forward");
   kernels::topk_rows(logits_dev_, n, static_cast<int>(vocab), kmax, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
   const size_t top = size_t(n) * kmax;
   check(cudaMemcpyAsync(pin_->topk_vals, vals_dev_, top * sizeof(float), cudaMemcpyDeviceToHost, stream_), "topk");
@@ -116,6 +170,7 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
           "row logits");
   }
   check(cudaStreamSynchronize(stream_), "step");
+  prof("topk");
   // Every row's token, as sample() after step() draws it: the history holds the anchor, the seed counts it.
   std::vector<Session*> ok;
   for (int i = 0; i < n; ++i) {
@@ -143,9 +198,9 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
       seqs[i].error = std::current_exception();
     }
   }
-  // Commit: in one launch per kernel unless a row failed (its row must not write, and the joint kernels take a run).
+  prof("sample");
   quantized_ = false;
-  if (static_cast<int>(ok.size()) == n) {
+  if (n == 1 && !ok.empty()) {
     if (commit_overlap_) {
       commit_seqs(ok, commit_stream_, commit_core_);
       check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
@@ -153,13 +208,8 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
     } else {
       commit_seqs(ok, stream_, core_);
     }
-  } else {
-    for (int i = 0; i < n; ++i) {
-      if (seqs[i].error) continue;
-      s_ = &sessions_[seqs[i].session];
-      commit(i, 1, stream_, core_);
-    }
   }
+  prof("commit");
   for (int i = 0; i < n; ++i) {
     Session& s = sessions_[seqs[i].session];
     s_ = &s;
@@ -172,6 +222,8 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
     s.spec.fanout_steps += 1;
   }
   check(cudaStreamSynchronize(stream_), "commit");
+  prof("materialize");
+  if (profile_) fanout_last_ = std::chrono::steady_clock::now();
 }
 
 int Engine::kv_fork_need(int from, int to, const KvGone* gone) const {
