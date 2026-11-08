@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
   std::string draft, lora;
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool fanout_check = false;
-  bool fork_check = false;
+  bool fork_check = false, joint_check = false;
   bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false;
   double draft_off_below = -1;  // the drafter-off guard (BACKLOG 10): the engine's default unless given
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
@@ -395,6 +395,7 @@ int main(int argc, char** argv) {
     else if (a == "--batch-check") batch_check = true;
     else if (a == "--fanout-check") fanout_check = true;
     else if (a == "--fork-check") fork_check = true;
+    else if (a == "--joint-check") joint_check = true;
     else if (a == "--batch-bench") batch_check = batch_bench = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
@@ -1055,6 +1056,154 @@ int main(int argc, char** argv) {
         }
       }
       std::printf(failed ? "FANOUT CHECK FAILED\n" : "fanout check passed\n");
+      return failed ? 1 : 0;
+    }
+    if (joint_check) {
+      // Fan-out's joint question prefill (BATCHING P4d): N forks of one prompt, each with a question of its own, the
+      // questions prefilled one by one (prefill_chunk) against together (prefill_joint). Each question's logits, the state
+      // and drafter context it leaves, and every greedy step after it must be the same bit for bit. Two sets: short
+      // questions that fit one pass, and long ones that take several.
+      const int n = engine.sessions();
+      if (n < 2 || prompts.empty()) throw std::runtime_error("--joint-check needs --sessions 2 and a prompt");
+      auto digest = [](const std::vector<float>& l) {
+        uint64_t h = 14695981039346656037ull;
+        for (float f : l) {
+          uint32_t b;
+          std::memcpy(&b, &f, sizeof b);
+          h = (h ^ b) * 1099511628211ull;
+        }
+        return h;
+      };
+      const std::vector<int> prefix = *std::max_element(
+          prompts.begin(), prompts.end(), [](const auto& a, const auto& b) { return a.size() < b.size(); });
+      if (prefix.size() < 512) throw std::runtime_error("--joint-check needs a prompt of 512 tokens");
+      struct Arm {
+        std::vector<uint64_t> first, hash, draft;
+        std::vector<std::vector<uint64_t>> steps;
+        std::vector<Result> results;
+        int joint = 0;
+        double seconds = 0;
+      };
+      bool failed = false;
+      for (const bool long_q : {false, true}) {
+        std::vector<std::vector<int>> prompt(n);
+        for (int i = 0; i < n; ++i) {
+          const size_t len = long_q ? 5 + (size_t(i) * 97) % 380 : 8 + (size_t(i) * 13) % 56;
+          const size_t at = (size_t(i) * 131) % (prefix.size() - len);
+          prompt[i] = prefix;
+          prompt[i].insert(prompt[i].end(), prefix.begin() + at, prefix.begin() + at + len);
+        }
+        auto arm = [&](bool joint) {
+          Arm a;
+          a.first.resize(n);
+          a.steps.resize(n);
+          std::vector<Seq> seqs(n);
+          engine.reset_all();
+          activate(0, "", true);
+          engine.prefill(prefix, nullptr, true, nullptr);
+          for (int i = 1; i < n; ++i) {
+            activate(i, "", true);
+            engine.fork_session(0);
+          }
+          std::vector<ragon::Engine::PrefillCursor> curs;
+          curs.reserve(n);
+          for (int i = 0; i < n; ++i) {
+            activate(i, "", false);
+            curs.push_back(engine.begin_prefill(prompt[i], false, nullptr));
+          }
+          auto take = [&](int i) {
+            seqs[i].session = i;
+            seqs[i].sp.temperature = 0.f;
+            a.first[i] = digest(engine.logits());
+            seqs[i].pending = {engine.sample(engine.logits(), seqs[i].sp, engine.history())};
+          };
+          const auto t0 = std::chrono::steady_clock::now();
+          std::vector<ragon::Engine::PrefillCursor*> together;
+          std::vector<int> idx;
+          for (int i = 0; i < n; ++i) {
+            if (joint && engine.joint_eligible(curs[i])) {
+              together.push_back(&curs[i]);
+              idx.push_back(i);
+              continue;
+            }
+            activate(i, "", false);
+            while (!engine.prefill_chunk(curs[i])) {
+            }
+            take(i);
+          }
+          if (!together.empty()) {
+            const std::vector<std::exception_ptr> errs = engine.prefill_joint(together);
+            for (size_t k = 0; k < together.size(); ++k) {
+              if (errs[k]) std::rethrow_exception(errs[k]);
+              engine.joint_select(static_cast<int>(k));
+              take(idx[k]);
+            }
+          }
+          a.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          a.joint = static_cast<int>(together.size());
+          for (int i = 0; i < n; ++i) {
+            engine.select_session(i);
+            a.hash.push_back(engine.state_hash());
+            a.draft.push_back(engine.draft_hash());
+          }
+          std::vector<std::vector<float>> rows(n);
+          while (true) {
+            std::vector<ragon::Engine::SeqStep> steps;
+            std::vector<int> in;
+            for (int i = 0; i < n; ++i) {
+              Seq& q = seqs[i];
+              if (q.done) continue;
+              for (int t : q.pending) {
+                q.out.push_back(t);
+                if (is_end(t) || static_cast<int>(q.out.size()) >= max_tokens) q.done = true;
+                if (q.done) break;
+              }
+              if (q.done) continue;
+              ragon::Engine::SeqStep st;
+              st.session = i;
+              st.anchor = q.pending.back();
+              st.params = &q.sp;
+              st.row_logits = &rows[i];
+              steps.push_back(st);
+              in.push_back(i);
+            }
+            if (steps.empty()) break;
+            engine.step_batch(steps);
+            for (size_t k = 0; k < steps.size(); ++k) {
+              if (steps[k].error) std::rethrow_exception(steps[k].error);
+              seqs[in[k]].pending = steps[k].out;
+              a.steps[in[k]].push_back(digest(rows[in[k]]));
+            }
+          }
+          for (int i = 0; i < n; ++i) a.results.push_back(result_of(seqs[i]));
+          return a;
+        };
+        const Arm serial = arm(false), joint = arm(true);
+        size_t rows = 0;
+        for (int i = 0; i < n; ++i) rows += prompt[i].size() - prefix.size();
+        std::printf("joint %s questions (%zu rows): %d sequences, %d joint; serial %.3f s, joint %.3f s\n",
+                    long_q ? "long" : "short", rows, n, joint.joint, serial.seconds, joint.seconds);
+        if (joint.joint < n / 2) {
+          failed = true;
+          std::printf("  only %d of %d questions took the joint pass\n", joint.joint, n);
+        }
+        for (int i = 0; i < n; ++i) {
+          const Result& a = serial.results[i];
+          const Result& b = joint.results[i];
+          if (serial.first[i] == joint.first[i] && serial.hash[i] == joint.hash[i] && serial.draft[i] == joint.draft[i] &&
+              a == b && serial.steps[i] == joint.steps[i])
+            continue;
+          failed = true;
+          size_t at = 0;
+          while (at < serial.steps[i].size() && at < joint.steps[i].size() && serial.steps[i][at] == joint.steps[i][at])
+            ++at;
+          std::printf("  sequence %d differs: question logits %s, state %s, drafter %s, tokens %s, logits from step %zu\n",
+                      i, serial.first[i] == joint.first[i] ? "same" : "DIFFER",
+                      serial.hash[i] == joint.hash[i] ? "same" : "DIFFER",
+                      serial.draft[i] == joint.draft[i] ? "same" : "DIFFER", a.tokens == b.tokens ? "same" : "DIFFER", at);
+        }
+      }
+      std::printf(failed ? "JOINT CHECK FAILED\n" : "joint check passed\n");
       return failed ? 1 : 0;
     }
     if (fork_check) {
