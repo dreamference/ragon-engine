@@ -82,7 +82,7 @@ def api_n(a, prefix, questions, rep):
                       "toks_min": min(pieces), "toks_max": max(pieces),
                       "span_tok_s": round(inside / (end - start), 1) if end > start else 0,
                       "wall_tok_s": round(sum(pieces) / (t1 - t0), 1),
-                      "spec_delta": {k: after[k] - before[k] for k in ("batched_steps", "fanout_steps")}}), flush=True)
+                      "spec_delta": {k: after[k] - before[k] for k in ("batched_steps", "fanout_steps") if k in after}}), flush=True)
 
 
 def main():

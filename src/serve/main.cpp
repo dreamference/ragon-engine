@@ -757,6 +757,7 @@ class Scheduler {
   // Fan-out (BATCHING P4d): above --fanout-plain-above decoding requests, a speculative block no longer fits enough
   // of them in one pass, and one row each decodes more in total. Every decoder then takes plain steps, together;
   // greedy output is unchanged (a plain row's logits are a verify row's) and a sampled one keeps its distribution.
+  // Without a drafter nothing speculates, so the threshold is 1: two decoding requests already share a pass.
   bool fanout_plain() const {
     if (fanout_plain_above_ <= 0) return false;
     int decoding = 0;
@@ -2080,6 +2081,9 @@ class Factory : public proxygen::RequestHandlerFactory {
 }  // namespace
 }  // namespace ragon::serve
 
+// Above this many decoding requests a server with a drafter stops speculating (BATCHING P4d, measured there).
+constexpr long kFanoutPlainAboveDrafting = 6;
+
 int main(int argc, char** argv) {
   std::string model_dir, host = "0.0.0.0", name;
   double draft_off_below = 1.5;  // the drafter-off guard (BACKLOG 10)
@@ -2092,7 +2096,7 @@ int main(int argc, char** argv) {
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = 8;
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = -1;
   double protect_seconds = 30;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -2427,6 +2431,7 @@ int main(int argc, char** argv) {
               << "\n";
   }
   std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
+  if (fanout_plain_above < 0) fanout_plain_above = draft_dir.empty() ? 1 : kFanoutPlainAboveDrafting;
   ragon::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0,
                                      static_cast<int>(fanout_plain_above));
 
