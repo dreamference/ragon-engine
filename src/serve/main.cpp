@@ -169,7 +169,7 @@ struct Metrics {
               {"tree_branch_steps", spec.tree_branch_steps}, {"tree_off_chain", spec.tree_off_chain},
               {"sparse_steps", spec.sparse_steps}, {"sparse_fallbacks", spec.sparse_fallbacks},
               {"drafter_off_steps", spec.drafter_off_steps}, {"drafter_switches", spec.drafter_switches},
-              {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
+              {"ride_steps", spec.ride_steps}, {"shadow_total_steps", spec.shadow_total_steps}, {"shadow_dflash_all", spec.shadow_dflash_all},
               {"shadow_best", spec.shadow_best}};
     for (int b = 0; b < 5; ++b) {
       j["shadow_steps"].push_back(spec.shadow_steps[b]);
@@ -881,6 +881,17 @@ class Scheduler {
     }();
     return spec_turn(r) && (alone || !ctx_.engine->drafter_off(r.job.session, r.job.req.sampling));
   }
+  // BATCHING §5.8 stage 10: a speculative turn whose drafter guard is off (a rider) joins a batch of drafting requests
+  // as one row of its verify (Engine::speculate_batch) instead of a plain pass of its own. RAGON_RIDE_ALONG=0 keeps the
+  // separate plain pass (step_batch), for a comparison.
+  static bool ride_along() {
+    static const bool on = [] {
+      const char* e = std::getenv("RAGON_RIDE_ALONG");
+      return !e || std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  bool rider(const Running& r) const { return spec_turn(r) && !spec_step(r); }
   // Whether r's next decode step can join the batch of the kind it would take alone.
   bool batchable_now(const Running& r) const {
     if (r.prefilling) return false;
@@ -895,6 +906,10 @@ class Scheduler {
     if (!batchable_now(r)) return b;
     b.push_back(&r);
     Engine& eng = *ctx_.engine;
+    if (ride_along() && spec_turn(r)) {
+      if (ride_batch(b).size() >= 2 && spec_step(*b[0])) return b;
+      b.resize(1);  // no drafter to ride with: the batch of r's own kind, as before
+    }
     // A batch is all speculative or all plain; a plain one takes one row per request.
     const bool spec = spec_step(r);
     const int fit = spec ? kernels::kMaxStreamRows / eng.draft_block() : std::min(kernels::kMaxStreamRows, kernels::kMaxSeqs);
@@ -914,6 +929,37 @@ class Scheduler {
         b.push_back(o.get());
       }
     }
+    return b;
+  }
+  // batch_with for a speculative turn when riders join (b holds r): the drafting partners in partner order while their
+  // blocks fit, then the riders in the rows left (one each), at most kMaxSeqs requests; the drafters first, as
+  // speculate_batch takes them. batch_with forms the batch of r's own kind instead when none of them drafts.
+  std::vector<Running*>& ride_batch(std::vector<Running*>& b) const {
+    Engine& eng = *ctx_.engine;
+    Running& r = *b[0];
+    const auto rows_of = [&](const Running& o) { return spec_step(o) ? eng.draft_block() : 1; };
+    int rows = rows_of(r);
+    int kv_need = eng.kv_paged() ? eng.kv_step_need(r.job.session, spec_step(r)) : 0;
+    const int kv_free = eng.kv_paged() ? eng.kv_pages_free() : 0;
+    const std::vector<size_t> order = partner_order();
+    for (const bool drafting : {true, false})
+      for (size_t i : order) {
+        const auto& o = running_[i];
+        if (o.get() == &r || static_cast<int>(b.size()) >= kernels::kMaxSeqs || !spec_turn(*o) ||
+            spec_step(*o) != drafting || !batchable_now(*o) || rows + rows_of(*o) > kernels::kMaxStreamRows)
+          continue;
+        if (eng.kv_paged()) {
+          const int n = eng.kv_step_need(o->job.session, drafting);
+          if (kv_need + n > kv_free) {
+            if (trace_.on()) cand_[i].state = 2;
+            continue;
+          }
+          kv_need += n;
+        }
+        rows += rows_of(*o);
+        b.push_back(o.get());
+      }
+    std::stable_partition(b.begin(), b.end(), [&](const Running* o) { return spec_step(*o); });
     return b;
   }
   // The order the running requests are tried in as partners (serve/pairing.hpp): running order, or with
@@ -1098,7 +1144,7 @@ class Scheduler {
   // the requests that end are added to `ended`. A non-finite row fails only its own request.
   void batch_step(const std::vector<Running*>& batch, std::vector<Running*>& ended) {
     Engine& eng = *ctx_.engine;
-    const bool spec = spec_step(*batch[0]);
+    const bool spec = spec_step(*batch[0]);  // a drafter first, if the batch has one (ride_batch)
     std::vector<Engine::SeqStep> steps(batch.size());
     const auto now = std::chrono::steady_clock::now();
     for (size_t i = 0; i < batch.size(); ++i) {
@@ -1113,7 +1159,7 @@ class Scheduler {
       steps[i].anchor = r.pending.back();
       steps[i].params = &r.job.req.sampling;
       steps[i].row_logits = r.job.req.logprobs ? &r.rows : nullptr;
-      steps[i].drafter_off = !spec && spec_turn(r);
+      steps[i].drafter_off = rider(r);  // in a speculative batch, a rider (speculate_batch)
     }
     ++decode_passes_;
     try {

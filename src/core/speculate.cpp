@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -156,6 +157,7 @@ struct Engine::StepPlan {
   std::vector<int> path;
   int accepted = 0, next = 0;
   bool failed = false;
+  bool ride = false;  // a drafter-off sequence's one plain row in the batch's verify (speculate_batch)
 };
 
 void Engine::alloc_drafter() {
@@ -1171,8 +1173,9 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 
 bool Engine::can_batch(int session, const SamplingParams& p) const {
   const Session& s = sessions_.at(session);
-  // A session whose drafter-off guard has its next step plain takes it alone (speculate() runs it), as a request that
-  // decodes plainly does: a batch's verify holds speculative steps only. A probe is a speculative step and may join.
+  // A session whose drafter-off guard has its next step plain is no drafting member of a batch: it takes that step
+  // alone (speculate()), in step_batch, or as a rider marked drafter_off in speculate_batch. A probe is a speculative
+  // step and may join.
   return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block && !drafter_off(session, p);
 }
 
@@ -1213,12 +1216,22 @@ bool Engine::cascade_batch(std::span<const StepPlan> plans) const {
 
 void Engine::speculate_batch(std::span<SeqStep> seqs) {
   if (seqs.empty()) return;
+  // A sequence marked drafter_off rides along (BATCHING §5.8 stage 10): its guard has the step plain, so it adds one
+  // row (its anchor) to the verify and commits it as a step that accepted nothing, which is the plain step's state,
+  // ring entry and token (speculate()'s comment on the guard). Riders come after every drafting sequence, and at least
+  // one sequence drafts (a batch of riders only is step_batch's).
+  int nd = 0;
   for (const SeqStep& q : seqs) {
     if (q.session < 0 || q.session >= sessions() || !q.params) throw std::runtime_error("speculate_batch: bad entry");
-    if (!can_batch(q.session, *q.params)) throw std::runtime_error("speculate_batch: a sequence cannot join the batch");
+    if (q.drafter_off ? !(can_step_batch(q.session) && drafter_off(q.session, *q.params))
+                      : !can_batch(q.session, *q.params))
+      throw std::runtime_error("speculate_batch: a sequence cannot join the batch");
+    if (!q.drafter_off && &q != &seqs[nd]) throw std::runtime_error("speculate_batch: a drafting sequence after a rider");
+    nd += !q.drafter_off;
     for (const SeqStep& o : seqs)
       if (&o != &q && o.session == q.session) throw std::runtime_error("speculate_batch: a session twice");
   }
+  if (nd == 0) throw std::runtime_error("speculate_batch: no sequence drafts");
   if (seqs.size() == 1) {  // a batch of one is the one-row step (graphs and all)
     SeqStep& q = seqs[0];
     select_session(q.session);
@@ -1234,7 +1247,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   if (n > kernels::kMaxSeqs) throw std::runtime_error("speculate_batch: more sequences than kMaxSeqs");
   if (kv_book_) {  // P4b: every sequence's verify pages first, all or nothing (see speculate)
     int need = 0;
-    for (const SeqStep& q : seqs) need += kv_step_need(q.session, true);
+    for (const SeqStep& q : seqs) need += kv_step_need(q.session, !q.drafter_off);
     if (need > kv_book_->free_pages()) kv_retire(false);
     if (need > kv_book_->free_pages()) kv_retire(true);
     if (need > kv_book_->free_pages())
@@ -1242,7 +1255,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
                             std::to_string(kv_book_->free_pages()) + " free");
     for (const SeqStep& q : seqs) {
       Session& s = sessions_[q.session];
-      kv_ensure(s, s.pos, s.pos + kv_step_rows(s, true), stream_);
+      kv_ensure(s, s.pos, s.pos + kv_step_rows(s, !q.drafter_off), stream_);
     }
   }
   const size_t vocab = model_->config().vocab;
@@ -1257,11 +1270,21 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     sp.s = &sessions_[seqs[i].session];
     sp.p = seqs[i].params;
     sp.anchor = seqs[i].anchor;
-    plan_begin(sp, B);
-    any_lookup = any_lookup || sp.use_lookup;
     // A session on an adapter as -1 - its index: its graphs have the adapter launches, the base's do not (LORA §3).
     order[i] = sp.s->lora_slot >= 0 ? -1 - seqs[i].session : seqs[i].session;
+    if (i >= nd) {  // a rider: its anchor's row, its top K as step_batch takes it
+      sp.ride = true;
+      sp.greedy = sp.p->temperature <= 0.f;
+      sp.rows.assign(1, sp.anchor);
+      sp.E = 0;
+      sp.V = 1;
+      sp.K = sp.greedy ? 1 : sp.p->top_k;
+      continue;
+    }
+    plan_begin(sp, B);
+    any_lookup = any_lookup || sp.use_lookup;
   }
+  if (nd < n) order.push_back(std::numeric_limits<int>::min() + nd);  // the riders' graphs are their batch's own
   // 1. The drafter over every sequence's block at once (stage 4), then each sequence's lattice walk; a batch with a
   // lookup chain (whose rows replace the drafter's) drafts per sequence, eagerly, as stage 3 did. With step graphs
   // the batch's draft, verify and commits replay as graphs keyed by the order of its sessions.
@@ -1288,17 +1311,20 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     }
   }
   if (together) {
-    for (int i = 0; i < n; ++i) {
+    const std::span<StepPlan> drafting = std::span<StepPlan>(plans).first(nd);
+    for (int i = 0; i < nd; ++i) {
       pin_->draft_ids[i * B] = plans[i].anchor;
       for (int j = 1; j < B; ++j) pin_->draft_ids[i * B + j] = draft_->config().mask_token;
     }
     // BACKLOG 19: each sequence takes the head its session takes alone (bit i: the sparse one), and the graph is the
-    // batch's for that combination.
+    // batch's for that combination. Riders do not draft.
     unsigned sparse = 0;
-    for (int i = 0; i < n; ++i) sparse |= sparse_head_sync(*plans[i].s) ? 1u << i : 0u;
-    if (graph) run_graph(sparse ? bg->draft_sparse[sparse] : bg->draft, "draft", [&] { draft_batch_launch(plans, B, sparse); });
-    else draft_batch_launch(plans, B, sparse);
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < nd; ++i) sparse |= sparse_head_sync(*plans[i].s) ? 1u << i : 0u;
+    if (graph)
+      run_graph(sparse ? bg->draft_sparse[sparse] : bg->draft, "draft", [&] { draft_batch_launch(drafting, B, sparse); });
+    else
+      draft_batch_launch(drafting, B, sparse);
+    for (int i = 0; i < nd; ++i) {
       const bool si = (sparse >> i) & 1u;
       plans[i].s->sh_last_sparse = si;
       if (si) ++plans[i].s->spec.sparse_steps;
@@ -1307,17 +1333,17 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     // BACKLOG 26: each sequence's tree, as it takes one alone, while the rows left hold the sequences after it. At the
     // default shape two trees fit the tier (2 x 16 rows); a batch with a lookup chain verifies chains.
     const int tree_rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
-    int used = 0;
-    for (int i = 0; i < n; ++i) {
+    int used = n - nd;  // the riders' rows
+    for (int i = 0; i < nd; ++i) {
       const float* scores = pin_->scores + size_t(i) * E * K16 * K16;
       plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, scores);
-      if (trees && used + tree_rows + (n - 1 - i) * B <= kernels::kMaxStreamRows)
+      if (trees && used + tree_rows + (nd - 1 - i) * B <= kernels::kMaxStreamRows)
         plan_tree(plans[i], B, scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
       used += plans[i].V;
     }
   } else {
     for (StepPlan& sp : plans) {
-      if (sp.use_lookup) continue;
+      if (sp.use_lookup || sp.ride) continue;
       s_ = sp.s;
       plan_draft(sp, B, false);
     }
@@ -1350,6 +1376,16 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     StepPlan& sp = plans[i];
     const size_t at = size_t(sp.row0) * 64;
     try {
+      if (sp.ride) {  // the token step_batch draws for this row (its anchor counted in the history the seed sees)
+        const SamplingParams& p = *sp.p;
+        const float* vals = pin_->topk_vals + at;
+        const int* ids = pin_->topk_ids + at;
+        if (p.seed != 0 && p.temperature > 0.f) sp.s->rng.seed(p.seed + sp.s->history.size() + 1);
+        require_finite_topk({vals, size_t(sp.K)}, {ids, size_t(sp.K)}, static_cast<int>(vocab));
+        sp.accepted = 0;
+        sp.next = sp.K == 1 && sp.greedy ? ids[0] : sample_topk({vals, size_t(sp.K)}, {ids, size_t(sp.K)}, p, sp.s->rng);
+        continue;
+      }
       plan_accept(sp, pin_->topk_vals + at, pin_->topk_ids + at);
       if (sp.tree) plan_gather(sp);
     } catch (const NonFiniteLogits&) {
@@ -1406,9 +1442,18 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   const double verify_s = std::chrono::duration<double>(t2 - t1).count(), commit_s = seconds_since(t2);
   for (size_t i = 0; i < plans.size(); ++i) {
     StepPlan& sp = plans[i];
+    if (sp.ride) {  // counted as speculate()'s plain step: the guard's count to its next probe
+      sp.s->guard.plain();
+      sp.s->spec.drafter_off_steps += 1;
+      sp.s->spec.ride_steps += 1;
+    }
     if (sp.failed) {
       s_ = sp.s;
       reset_session();
+      continue;
+    }
+    if (sp.ride) {
+      seqs[i].out = {sp.next};
       continue;
     }
     // The batch's wall times, charged to each sequence in it (its step period).
