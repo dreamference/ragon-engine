@@ -1,5 +1,5 @@
 # BATCHING P4d: `n`, a request's choices. The first prefills, the others start as forks of its session.
-# Run against a server with --kv-pages and at least eight sessions; a smaller one still answers (forks queue).
+# Run against a server with the page pool (the default; not --kv-flat) and at least eight sessions; a smaller one still answers (forks queue).
 
 import threading
 
