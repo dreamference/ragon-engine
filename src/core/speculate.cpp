@@ -124,6 +124,17 @@ std::FILE* hidden_dump_file() {
   return f;
 }
 
+// Whether the environment variable is set to a non-zero number (a switch for a comparison).
+bool env_flag(const char* name) {
+  const char* e = std::getenv(name);
+  return e && std::atoi(e) != 0;
+}
+
+// The most sessions in a batch of cascade groups that still draft trees (BATCHING §5.8): at 4 forks of 32K a tree's
+// acceptance is worth more than the shared reads it costs the verify (65 against 61 tok/s), at 27 it is not (one tree
+// made a step 490 ms against about 210).
+constexpr int kCascadeTreesUpTo = 4;
+
 }  // namespace
 
 // One sequence's part of a speculative step on the host: what speculate() kept in locals, so a batch can hold
@@ -1194,6 +1205,12 @@ void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
   }
 }
 
+bool Engine::cascade_batch(std::span<const StepPlan> plans) const {
+  std::vector<Seg> segs;  // the groups read only each sequence's session
+  for (const StepPlan& sp : plans) segs.push_back({sp.s, 0, 0, nullptr});
+  return cascade_groups(segs).n > 0;
+}
+
 void Engine::speculate_batch(std::span<SeqStep> seqs) {
   if (seqs.empty()) return;
   for (const SeqStep& q : seqs) {
@@ -1250,6 +1267,13 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   // the batch's draft, verify and commits replay as graphs keyed by the order of its sessions.
   const bool together = !any_lookup;
   const bool graph = graphs_ && together;
+  // Sessions sharing a prefix's pages (cascade groups, BATCHING §5.8) verify jointly, the shared keys read once a group,
+  // unless a sequence verifies a tree, which makes the pass sequence by sequence. Above kCascadeTreesUpTo sessions the
+  // shared reads are worth more than a tree's acceptance, so none is planned. A joint verify runs eagerly, since a
+  // captured pass takes no groups. RAGON_CASCADE_TREES=1 keeps the trees, RAGON_CASCADE_GRAPH=1 the graphed verify, each
+  // for a comparison.
+  static const bool keep_trees = env_flag("RAGON_CASCADE_TREES"), graph_verify = env_flag("RAGON_CASCADE_GRAPH");
+  const bool cascade = cascade_batch(plans), trees = !cascade || keep_trees || n <= kCascadeTreesUpTo;
   BatchGraphs* bg = graph ? &batch_graphs_[order] : nullptr;
   if (graph) {  // the positions every graph of this step reads
     for (int i = 0; i < n; ++i) pin_->seq_pos[i] = plans[i].s->pos;
@@ -1287,7 +1311,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     for (int i = 0; i < n; ++i) {
       const float* scores = pin_->scores + size_t(i) * E * K16 * K16;
       plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, scores);
-      if (used + tree_rows + (n - 1 - i) * B <= kernels::kMaxStreamRows)
+      if (trees && used + tree_rows + (n - 1 - i) * B <= kernels::kMaxStreamRows)
         plan_tree(plans[i], B, scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
       used += plans[i].V;
     }
@@ -1312,7 +1336,9 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   // sequence: the verify wrote no state of it, its commit is skipped and its session reset.
   for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
   join_commit();  // the previous step's DeltaNet replays, beside this step's draft until here
-  if (graph) {
+  bool any_tree = false;
+  for (const StepPlan& sp : plans) any_tree = any_tree || sp.tree;
+  if (graph && !(cascade && !any_tree && !graph_verify)) {
     std::vector<int> ks(n);  // each sequence's top K, and whether it is a tree (a full one: its rows are fixed)
     for (int i = 0; i < n; ++i) ks[i] = 2 * plans[i].K + (plans[i].tree ? 1 : 0);
     run_graph(bg->verify[ks], "verify", [&] { verify_batch_launch(plans, V); });

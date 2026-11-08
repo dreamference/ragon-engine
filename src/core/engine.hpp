@@ -736,6 +736,8 @@ class Engine {
   void plan_count(StepPlan& sp);                               // the session's counters and shadow records
   // The batch's verify: every plan's rows (pin_->rows) in one pass, then each sequence's top K at its rows.
   void verify_batch_launch(std::span<StepPlan> plans, int V);
+  // Whether the batch's sessions form cascade groups (cascade_groups), which its joint verify then reads.
+  bool cascade_batch(std::span<const StepPlan> plans) const;
   // The drafter over the blocks of every plan's session at once (M4 stage 4): pin_->draft_ids (B rows per
   // sequence) -> pin_->cand and pin_->scores (E = B - 1 rows per sequence, in order).
   void draft_batch_launch(std::span<StepPlan> plans, int B, unsigned sparse = 0);  // bit i: sequence i's sparse head
