@@ -1368,6 +1368,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // RAGON_PROFILE=1: synchronize after each phase and add up its wall time (slow; for finding hot spots).
   auto t_last = std::chrono::steady_clock::now();
   const char* kind = verify ? "verify/" : M == 1 ? "decode/" : rows ? "rows/" : "prefill/";
+  // Each kind's pass count under "<kind>passes" (printed with the seconds' unit), so a phase's total divides into its
+  // cost a pass (BATCHING §5.8).
+  if (profile_) phase_seconds_[std::string(kind) + "passes"] += 1;
   auto mark = [&](const char* phase) {
     if (!profile_) return;
     check(cudaStreamSynchronize(stream_), phase);

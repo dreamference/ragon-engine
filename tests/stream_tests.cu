@@ -1001,12 +1001,14 @@ void bench_groups() {
       {"ffn gate|up fp4", true, 5120, 2, 64, {17408, 17408}},       {"ffn down fp4", true, 17408, 1, 64, {5120}},
       {"lm head fp4", true, 5120, 1, 1, {248320}},
   };
-  // RAGON_BENCH_MS=1,12,16,...: the row counts timed (at most 16 of them; default 1, 12, 16, 24, 32).
+  // RAGON_BENCH_MS=1,12,16,...: the row counts timed (at most 16 of them, each 1 to kMaxStreamRows; default 1, 12, 16,
+  // 24, 32).
   std::vector<int> Ms{1, 12, 16, 24, 32};
   if (const char* e = std::getenv("RAGON_BENCH_MS")) {
     Ms.clear();
     for (const char* p = e; *p && Ms.size() < 16;) {
-      Ms.push_back(std::atoi(p));
+      const int m = std::atoi(p);
+      if (m >= 1 && m <= ragon::kernels::kMaxStreamRows) Ms.push_back(m);  // a pass's rows, never past the buffers
       while (*p && *p != ',') ++p;
       if (*p == ',') ++p;
     }
@@ -1033,12 +1035,13 @@ void bench_groups() {
     fill_random_kernel<<<1024, 256>>>(reinterpret_cast<uint32_t*>(w), bytes * copies / 4, 7);
     float *x, *y[3], *xinv;
     __half* xh;
-    cudaMalloc(&x, size_t(32) * gr.K * sizeof(float));
-    fill_random_kernel<<<64, 256>>>(reinterpret_cast<uint32_t*>(x), size_t(32) * gr.K, 9);  // finite floats
-    cudaMalloc(&xh, size_t(32) * gr.K * sizeof(__half));
-    cudaMalloc(&xinv, 32 * sizeof(float));
-    for (int i = 0; i < gr.n; ++i) cudaMalloc(&y[i], size_t(32) * gr.N[i] * sizeof(float));
-    ragon::kernels::to_half_rows(x, 32, gr.K, xh, xinv, nullptr);
+    const int R = ragon::kernels::kMaxStreamRows;  // the widest pass the stream GEMMs take
+    cudaMalloc(&x, size_t(R) * gr.K * sizeof(float));
+    fill_random_kernel<<<64, 256>>>(reinterpret_cast<uint32_t*>(x), size_t(R) * gr.K, 9);  // finite floats
+    cudaMalloc(&xh, size_t(R) * gr.K * sizeof(__half));
+    cudaMalloc(&xinv, R * sizeof(float));
+    for (int i = 0; i < gr.n; ++i) cudaMalloc(&y[i], size_t(R) * gr.N[i] * sizeof(float));
+    ragon::kernels::to_half_rows(x, R, gr.K, xh, xinv, nullptr);
     cudaEvent_t a, b;
     cudaEventCreate(&a), cudaEventCreate(&b);
     std::printf("group %-17s %6.1f MB x%-2d", gr.name, bytes / 1e6, gr.count);
