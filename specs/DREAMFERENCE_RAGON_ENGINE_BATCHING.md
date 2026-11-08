@@ -358,6 +358,25 @@ Where a 64-row pass goes (`RAGON_PROFILE`, which turns graphs off and synchroniz
 
 Is 250 tok/s reachable with the rows path on this GPU? Not with this tier: 237 ms needs about 12 ms off the 249 ms no-graph step, and 65 off the graphed one. The step's GEMMs floor at about 80 ms (17.56 GB at 221 GB/s) and lose bandwidth at 64 rows; with the cascade, the weight-bound phases (about 150 ms of the warm 183 ms verify), not attention, keep 237 out of reach. What would be needed: the cascade under graphs (the groups as device data, or the wide verify run eagerly), plus a GEMM tier that holds 220 GB/s at 64 rows. Then 128 rows (B 4, 465 ms) is the next question; at 64 rows' GB/s it is not worth a stage 9. Kept for that: the profile counts each kind's passes (`<kind>passes`), and `--bench-groups` times up to `kMaxStreamRows` rows.
 
+**Stage 9, landed: the 64-row pass, its verify eager and joint** (2026-11-07). Three changes on stage 8's build, 32 forks x B 2 (`--fanout-plain-above 0 --fanout-gang-above 6 --draft-block 2`), outputs sha-identical to the base build at every rep:
+
+- A joint verify runs eagerly. A captured pass takes no cascade groups (`cascade_groups` needs the positions and page lists on the host), so `speculate_batch` launches the verify outside the graph when the batch is cascade groups with no tree (`cascade_batch`); the drafts stay graphed. At cap 32 the same choice gives 154 tok/s against 138.
+- A batch of cascade groups wider than `kCascadeTreesUpTo` (4) sessions drafts no tree: one tree makes the pass non-joint, the attention goes sequence by sequence and the step takes about 490 ms instead of 210. At 8 forks x 2 rows no trees give 112 tok/s against 67 with them; at 4 forks of 32K at the default block a tree is worth more than the shared reads (65 against 61), so a batch of 4 keeps its trees and graphs.
+- Requests whose drafter guard is off step together in one plain pass (`step_batch`, `SeqStep::drafter_off`) instead of one one-row unit each, for every multi-session server.
+
+`RAGON_CASCADE_GRAPH=1`, `RAGON_CASCADE_TREES=1` and `RAGON_DRAFTER_OFF_ALONE=1` bring each old behaviour back for measuring.
+
+| rep (span / wall tok/s) | stage 8, verify graphed | the eager verify alone | stage 9 |
+| --- | ---: | ---: | ---: |
+| 0 (5 forks' guard off) | 63.0 | 63.7 | 159.5 / 145.0 |
+| 1 | 185.6 / 165.6 | 223.0 / 194.3 | 230.4 / 201.8 |
+| 2 | 182.3 / 164.0 | 218.2 / 190.7 | 227.6 / 197.7 |
+| 3 (65 guard-off steps) | | 157.4 | 160.4 |
+
+Plain is 201 at every rep. A warm step of 32 sessions takes 252.7 ms, back to back: draft 21.6, verify 204, the rest sampling and commit. Where a wide verify goes (`RAGON_PROFILE`, graphs off, 108 passes over two reps, ms a pass): FFN 59.6, DeltaNet projections 46.6, DeltaNet recurrence 22.9, attention 20.6 (106 before the cascade held), attention projections 9.5, lm_head 3.9, conv 2.0. Row-invariance and the gates held at cap 64: ctest, `--fanout-check 32`, `--joint-check 32`, `--batch-check paged` at the default block and at `--block 32` (which the cap-32 build, base included, refuses: two sessions' drafts need 64 rows), the 33-session server test, and agentlong one stream 16/16 byte-identical at 82.1 s against 82.0. At the default config 4 forks run as before (verify 112-117 ms a step against 115-119), and from 7 drafting requests fan-out runs plain (8 forks: 78 tok/s).
+
+Why rep 0 is slower: its questions trip five forks' drafter guards, which before this stage ran as five serial one-row units after every batch step and as a 25-second tail, and left a 27-session batch with room for one tree. With both fixed, a rep-0 step is the 27-session wide pass (223-228 ms) followed by a plain pass of the five (95-97 ms). What would close most of the rest, not built: the guard-off requests ride in the wide verify as one-row segments (59 rows of 64), with no second pass a step; estimated about 188 tok/s for rep 0. The production default stays plain above 6 drafting requests; the 64-row pass is behind the flags above until the ride-along makes rep 0 beat plain.
+
 ## 6. Phases
 
 Each phase merges into main once its exactness gate passes and nothing regresses (one stream's agentlong tokens/s within noise of main, every earlier gate still green). Expected gains are from §3.1's model and are measured, not assumed, at each gate.
