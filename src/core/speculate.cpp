@@ -1397,12 +1397,28 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
                           size_t(k) * vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_),
           "row logits");
   }
+  // With the commit beside the next draft, every sequence's DeltaNet replay in one launch per kernel and layer: one
+  // replay per sequence (a graph each, a few small blocks per launch) left a 32-wide step's next verify waiting ~39 ms
+  // on commit_done_ (BATCHING §5.8 stage 10).
+  bool state_batched = false;
+  if (commit_overlap_ && commit_state_batch_) {
+    std::vector<Session*> ss;
+    std::vector<int> r0, kk;
+    for (const StepPlan& sp : plans) {
+      if (sp.failed) continue;
+      ss.push_back(sp.s);
+      r0.push_back(sp.row0);
+      kk.push_back(sp.accepted + 1);
+    }
+    state_batched = !ss.empty() && ss.size() <= size_t(kernels::kMaxSeqs);
+    if (state_batched) commit_state_seqs(ss, r0, kk);
+  }
   for (int i = 0; i < n; ++i) {
     StepPlan& sp = plans[i];
     if (sp.failed) continue;
     const int k = sp.accepted + 1;
     s_ = sp.s;
-    if (commit_overlap_) commit_state_async(sp.row0, k, graph);
+    if (commit_overlap_ && !state_batched) commit_state_async(sp.row0, k, graph);
     if (graph) {
       // Slot i's commit reads its position from pos_dev_[i] and its rows from row0 (which depends on whether the
       // sequences before it took trees); slot 0's is the one-row step's own commit graph (the same rows, the same
