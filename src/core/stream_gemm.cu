@@ -188,14 +188,18 @@ template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, b
           int GROUPS = 1, typename Wait>
 __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
                                                  const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
-                                                 int bx, int by, Wait&& wait) {
+                                                 int bx, int by, Wait&& wait, int tok0 = 0) {
   // Several matrices with the same input in one launch (q|k|v, gate|up, ...): this block's matrix.
   int pi = 0;
   while (pi + 1 < pr.count && bx >= pr.block0[pi + 1]) ++pi;
   const uint8_t* __restrict__ w = pr.w[pi];
   const float gscale = pr.gscale[pi];
-  float* __restrict__ y = pr.y[pi];
   const int N = pr.N[pi];
+  // tok0 (stream_gemm_pair_kernel): this block's tokens start at row tok0 of x, xinv and y.
+  float* __restrict__ y = pr.y[pi] + static_cast<size_t>(tok0) * N;
+  x += static_cast<size_t>(tok0) * K;
+  xinv += tok0;
+  M -= tok0;
   using Red = float[kWarps][TILES * 16][NT * 8 + 1];
   __shared__ float red_static[DYNRED ? 1 : kWarps][TILES * 16][NT * 8 + 1];
   extern __shared__ __align__(16) unsigned char mk_dyn_smem[];
@@ -374,6 +378,28 @@ __global__ void __launch_bounds__(kWarps * 32)
                        int ksplit, float* __restrict__ part) {
   stream_gemm_body<NT, TILES, FP4, PF, CODED, false, false, false, GROUPS>(x, xinv, M, pr, K, ksplit, part, blockIdx.x,
                                                                            blockIdx.y, PdlBegin{});
+}
+
+// 33 to 64 rows (batching P1b): two blocks per tile, each the one-group body on its half of the tokens (tok0 0 or
+// NT x 8), the two neighbouring blocks (b & 1) so that the second read of a weight chunk is an L2 hit. Four tiles
+// per block: every block reads the whole of x for its rows, M / (4 x TILES) activation bytes per weight byte from L2,
+// and past 32 rows that traffic, not DRAM or the MMAs, capped the two-group launch (8 bytes per weight byte at 64
+// rows; four tiles over 32 tokens are 2). Four tiles' warp-reduction buffer passes the 48 KB of static shared
+// memory, so it is the launch's dynamic one (DYNRED). Each element's arithmetic is the one-group body's, so the bits
+// are the same.
+template <int NT, int TILES>
+constexpr size_t pair_red_bytes() {
+  return size_t(kWarps) * TILES * 16 * (NT * 8 + 1) * sizeof(float);
+}
+
+template <int NT, int TILES, bool FP4, int PF, bool CODED = false>
+__global__ void __launch_bounds__(kWarps * 32)
+    stream_gemm_pair_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
+                            int K) {
+  constexpr bool dyn = pair_red_bytes<NT, TILES>() > 48 * 1024;
+  const int b = blockIdx.x;
+  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, dyn, false, 1>(x, xinv, M, pr, K, 1, nullptr, b >> 1, 0,
+                                                                     PdlBegin{}, (b & 1) * NT * 8);
 }
 
 template <int NT, int GROUPS = 1>
@@ -607,7 +633,7 @@ float* split_buffer(size_t floats) {
   return buf;
 }
 
-template <int NT, int TILES, bool FP4, int PF, bool CODED, int GROUPS = 1>
+template <int NT, int TILES, bool FP4, int PF, bool CODED, int GROUPS = 1, bool PAIR = false>
 void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   StreamProblems pr{};
   int blocks = 0;
@@ -621,6 +647,18 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
     blocks += (t[i].N + TILES * 16 - 1) / (TILES * 16);
   }
   pr.count = n;
+  if constexpr (PAIR) {
+    constexpr size_t red = pair_red_bytes<NT, TILES>();
+    constexpr size_t smem = red > 48 * 1024 ? red : 0;
+    if constexpr (smem > 0) {
+      static const cudaError_t set = cudaFuncSetAttribute(stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED>,
+                                                          cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+      if (set != cudaSuccess) throw std::runtime_error(std::string("stream_gemm pair: ") + cudaGetErrorString(set));
+    }
+    launch_kernel("stream_gemm pair", stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED>, dim3(2 * blocks),
+                  dim3(kWarps * 32), smem, s, x, xinv, M, pr, K);
+    return;
+  }
   const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
@@ -658,6 +696,11 @@ bool nt3_on() {
   return on;
 }
 
+bool sg64_pair_on() {
+  static const bool on = sg_env("RAGON_SG64", 1) != 0;
+  return on;
+}
+
 template <int NT, bool FP4, int PF, bool CODED, int GROUPS = 1>
 void launch_t(int tiles, const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   if (tiles == 1) launch<NT, 1, FP4, PF, CODED, GROUPS>(x, xinv, M, t, n, K, s);
@@ -689,6 +732,26 @@ void launch_k(int tiles, const __half* x, const float* xinv, int M, const Stream
   }
 }
 
+// 33 to 64 rows: the pair launch, four tiles, one chunk in flight per warp (B64 measured 2026-11-08 with
+// ragon-stream-tests --bench-groups: the step's GEMMs at M = 64 90 ms, two groups 102-104 ms; at M = 48 83 against
+// 88 ms; two chunks in flight 95-97 ms at 64). RAGON_SG64=0 (experiment) brings back the two groups (P1),
+// RAGON_SG64_PF=2 two chunks in flight.
+template <int NT, bool FP4>
+void launch_pair(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
+  static const int pf = sg_env("RAGON_SG64_PF", 1);
+  const bool coded = FP4 && t[0].wscale != nullptr;
+  if (coded) {
+    if constexpr (FP4) {
+      if (pf == 2) launch<NT, 4, FP4, 2, true, 1, true>(x, xinv, M, t, n, K, s);
+      else launch<NT, 4, FP4, 1, true, 1, true>(x, xinv, M, t, n, K, s);
+    }
+  } else if (pf == 2) {
+    launch<NT, 4, FP4, 2, false, 1, true>(x, xinv, M, t, n, K, s);
+  } else {
+    launch<NT, 4, FP4, 1, false, 1, true>(x, xinv, M, t, n, K, s);
+  }
+}
+
 template <bool FP4>
 void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   if (K % kChunk != 0) throw std::runtime_error("stream_gemm: K must be a multiple of 128");
@@ -716,8 +779,12 @@ void dispatch(const __half* x, const float* xinv, int M, const StreamTarget* t, 
   else if (M <= 16) launch_k<2, FP4>(narrow ? tn : tw, x, xinv, M, t, n, K, s);
   else if (M <= 24 && nt3_on()) launch_k<3, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
   else if (M <= 32) launch_k<4, FP4>(narrow ? tn4 : tw4, x, xinv, M, t, n, K, s);
-  // Batching P1: 33 to 64 rows as two groups over one weight stream (stream_gemm_body's GROUPS), two tiles per block.
-  else if (M <= 48 && nt3_on()) launch_k<3, FP4, 2>(2, x, xinv, M, t, n, K, s);
+  // 33 to 64 rows: two blocks per tile (launch_pair). P1, two groups over one weight stream (stream_gemm_body's
+  // GROUPS), two tiles per block, is RAGON_SG64=0.
+  else if (sg64_pair_on()) {
+    if (M <= 48 && nt3_on()) launch_pair<3, FP4>(x, xinv, M, t, n, K, s);
+    else launch_pair<4, FP4>(x, xinv, M, t, n, K, s);
+  } else if (M <= 48 && nt3_on()) launch_k<3, FP4, 2>(2, x, xinv, M, t, n, K, s);
   else launch_k<4, FP4, 2>(2, x, xinv, M, t, n, K, s);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) throw std::runtime_error(std::string("stream_gemm: ") + cudaGetErrorString(e));
