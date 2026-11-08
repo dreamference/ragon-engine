@@ -6,7 +6,7 @@ Part of the ragon-engine specification; the index is [README.md](./README.md). W
 
 ## 1. Model of execution
 
-- **Two requests at a time.** The HTTP threads (two) parse requests and stream events back; one engine thread takes jobs from a queue in arrival order and runs up to `--batch` (2) at once, each in its own resident session: a prefill chunk alternates with the other request's decode steps (M4 stage 2), and two requests that both decode speculatively verify their rows in one pass (M4 stage 3). A third request waits in the queue ([drafts/M4 §3](./drafts/M4-sessions-and-batches.md)).
+- **`--batch` requests at a time.** The HTTP threads (two) parse requests and stream events back; one engine thread takes jobs from a queue in arrival order and runs up to `--batch` at once (the limit is below, at most `kAutoSessionsCap`), each in its own resident session: a prefill chunk alternates with the other requests' decode steps (M4 stage 2), and requests that decode speculatively verify their rows in one pass (M4 stage 3). One more waits in the queue ([drafts/M4 §3](./drafts/M4-sessions-and-batches.md)).
 - **Requests are tokenized on the HTTP thread**, so the context check (below) is answered before the job is queued.
 - **Cancellation.** A client that disconnects marks its job cancelled; the engine stops at the next emitted token and reports the request as finished with reason `stop`. A job still in the queue when its client leaves runs its prefill and stops at the first token.
 - **Limits.** The request body is capped at 64 MB (413 above it); an idle connection is closed after 30 minutes. There is no request timeout: a request runs until its token limit, a stop, the end of the context or a disconnect.
