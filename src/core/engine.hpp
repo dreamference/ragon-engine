@@ -224,6 +224,7 @@ struct SpecStats {
   // BACKLOG 10: plain one-row steps the drafter-off guard took instead of a speculative step (not counted in `steps`),
   // and its switches (off, or back on).
   long drafter_off_steps = 0, drafter_switches = 0;
+  long ride_steps = 0;  // BATCHING §5.8 stage 10: of those, the ones that rode in a batch's verify (speculate_batch)
   // Shadow scoring, per bucket of match length (3, 4-7, 8-15, 16-31, 32+): steps with a proposal, the
   // tokens the proposal would have had accepted (its agreement with what was generated next), and the
   // drafter's accepted tokens on the same steps. `shadow_best` adds up the better of the two per step.
@@ -358,7 +359,8 @@ class Engine {
     int rows = 0;              // the rows it verified in a batch: its block, or its tree (a batch of one: not set)
     std::exception_ptr error;  // a non-finite row (NonFiniteLogits): nothing committed, the session reset
     // step_batch: a speculative step taken plain because the drafter guard is off (drafter_off), counted as speculate()
-    // counts it (the guard's next probe, drafter_off_steps) instead of as a fan-out step.
+    // counts it (the guard's next probe, drafter_off_steps) instead of as a fan-out step. speculate_batch: such a step
+    // rides along, one row in the batch's verify after every drafting sequence (BATCHING §5.8 stage 10).
     bool drafter_off = false;
   };
   // Whether session i's next speculative step can join a batch: speculation possible for p and room for a full

@@ -702,6 +702,7 @@ SpecStats Engine::spec_stats_total() const {
     t.sparse_steps += a.sparse_steps;
     t.sparse_fallbacks += a.sparse_fallbacks;
     t.drafter_off_steps += a.drafter_off_steps;
+    t.ride_steps += a.ride_steps;
     t.drafter_switches += a.drafter_switches;
     for (int b = 0; b < 5; ++b) {
       t.shadow_steps[b] += a.shadow_steps[b];
