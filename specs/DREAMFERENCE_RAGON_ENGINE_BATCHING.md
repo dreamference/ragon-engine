@@ -265,17 +265,18 @@ The fused pass (C2, `forward_fused`) launches the same kernels and inherits the 
 
 | Forks | Drafter | Decode span tok/s: fan-out / main / SGLang | Wall tok/s: fan-out / main first burst / SGLang | MemAvailable minimum, GB: fan-out / main |
 | --- | --- | --- | --- | --- |
-| 32 | none | 202 / 11.4 / 211 | 152 / 8.9 / 187 | 18.7-19.0 / 18.8-18.9 |
-| 32 | loaded | 184 / 33-46 / 294 (8 drafts) | 141 / 22.5 / 247 | 17.5-18.5 / 16.6-16.8 |
-| 8 | none | 79 / 11.3 / 83 | 71 / 6.1 / - | 56.2 / 56.2 |
-| 8 | loaded | 75 / 54-55 / 100 (16 drafts, cap 8) | 66-67 / 10.0 / - | 52.0 / 51.7 |
-| 4 | none | 43 / 11.3 / - | 40 / 6.6 / - | 65.0 / 65.1 |
+| 32 | none | 202 / 11.4 / 211 | 180 (serial questions 152) / 8.9 / 187 | 18.7-19.0 / 18.8-18.9 |
+| 32 | loaded | 184 / 33-46 / 294 (8 drafts) | 164-165 (141) / 22.5 / 247 | 17.5-18.5 / 16.6-16.8 |
+| 8 | none | 79 / 11.3 / 83 | 75-76 (71) / 6.1 / - | 56.2 / 56.2 |
+| 8 | loaded | 75 / 54-55 / 100 (16 drafts, cap 8) | 72-73 (66-67) / 10.0 / - | 52.0 / 51.7 |
+| 4 | none | 43 / 11.3 / - | 41 (40) / 6.6 / - | 65.0 / 65.1 |
 | 4 | loaded | 63 / 35-65 / - | 58-60 / 11.2 / - | 61.6 / 61.4 |
 
 Main's first burst pays a whole prefill per fork, which sharing removes (361 s against 21 s at 32 forks, no drafter); on later bursts its wall tok/s at 8 forks is 11.2 without a drafter and 56 with one. One stream is unchanged: agentlong 16/16 turns byte-identical to main in two alternating runs, 64.39 and 64.22 tok/s against 64.32 and 64.31, prefill tokens 520,529 and 783 verify passes both; one fork without a drafter 11.4 tok/s on both.
 
+**The questions' prefill, joint.** The forks' question prefills run as one prefill pass (`Engine::prefill_joint`): `forward_rows` takes several segments, each with its own attention and DeltaNet state, keep point and last row, at most `prefill_chunk` rows, and the lm_head is one GEMM over the segments' last rows. `ragon-run --joint-check` proves it bitwise equal to the serial prefills (32 and 8 sessions, also with `RAGON_JOINT_LM_ROWS=1`, the per-row lm_head): 32 short questions 4.25 s serial against 0.79 s joint, 8 sessions 1.07 against 0.26 s. A question that crosses a chunk bound or soft checkpoint, an image, a LoRA adapter or `--prefill-bf16` keeps the serial path (with long questions 19 of 32 went joint, 6.63 against 4.82 s). In the serve the gang's held prefills run as one "joint" unit, and a burst of short prefills is admitted in one turn (admission took one job a turn, so each question was prefilled alone before the next fork arrived). `RAGON_JOINT_PREFILL=0` restores both. The wall column above shows joint with serial in brackets, alternating on one box: 32 forks without a drafter 180.4 and 180.3 against 153.7 and 151.9, span 202 on both; MemAvailable minimum 18.4 GB against 18.8. 4 forks with a drafter are unchanged (54-59 against 55-61, noisy). One stream: agentlong 16/16 turns byte-identical to main in two more alternating runs, 64.29 and 64.19 against 64.31 and 64.31 tok/s.
+
 What is left, none of it needed for exactness:
-- **The questions' prefill.** 32 serial passes of about 85 rows take 5.3 s of the 21 s wall, about 3 s more than SGLang's. `forward_rows` allows several sequences only in a verify; one joint prefill pass over several cursors (per-segment state, keep point and last row, at most `prefill_chunk` rows) is estimated at about 1.8 s, wall about 180 tok/s.
 - **With a drafter above the threshold**: keeping the rings up costs about 16 ms a pass (184 against 202).
 - **The last 4% without one**: about 158 ms a pass against SGLang's 151.6, the same slope per fork (2.26 against 2.2 ms). A persistent N-sequence DeltaNet kernel (§5.2) is the untried lever; the recurrent step is 6.4 GB of memory traffic a pass and may be bandwidth-bound.
 - **Speculation at 32 forks**: SGLang's 294 takes 32 forks of 9 rows; `kRowsMax` is 32, so it needs the 64+ row pass.
