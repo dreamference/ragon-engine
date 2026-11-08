@@ -75,8 +75,9 @@ void plan_only() {
   check(start_plan(c, kWeights, kScratchBytes, true, 8, 262144, 1000, 0, paged).refusal.empty(), "no reserve: no check");
 }
 
-// Auto-size with --kv-pages: n sessions fit when the pool holds one conversation at max_context and n x max_context / 2
-// positions (kPagedFitShare); the flat plan's n full slots are not asked for.
+// Auto-size with --kv-pages: given sessions fit when the pool holds one conversation at max_context and n x max_context / 2
+// positions (kPagedFitShare); sessions chosen here ask for the full pool, n x max_context positions (kAutoPagedFitShare,
+// P4e), so an auto-sized paged start picks what flat picks.
 void paged_auto_size() {
   const ragon::ModelConfig c = qwen();
   const size_t vis = kScratchBytes + (size_t(1100 + 512) << 20);  // images on, the default 512 MB cache
@@ -96,19 +97,25 @@ void paged_auto_size() {
                   describe_kv_pool(sp.plan).c_str(), q.sessions, q.max_context);
       check(flat.max_context == 262144 && flat.sessions == 3, "flat: three sessions at 262,144 on node-b");
       check(p.sized && p.sessions_auto && p.context_auto, "paged: chosen here");
-      check(p.sessions == 4 && p.max_context == 262144, "paged: four sessions at 262,144 on node-b");
-      check(q.sessions == 4 && q.max_context == 262144, "paged with a 1 GB store: four at 262,144");
+      check(p.sessions == 3 && p.max_context == 262144, "paged: three sessions at 262,144 on node-b, as flat");
+      check(q.sessions == 3 && q.max_context == 262144, "paged with a 1 GB store: three at 262,144");
+      check(sp.plan.kv_pool_pages == 3L * 4096, "paged: the pool is the three sessions' full context");
       check(sp.refusal.empty(), "paged: the choice starts");
     }
-  // The rule bites: a host whose pool holds one conversation at 262,144 but not 4 x 131,072 positions runs fewer.
+  // The rule bites: a host whose pool holds one conversation at 262,144 but not two runs one; four given still start.
   // Pool pages = (avail - weights - n x ~0.5 GB - scratch - reserve) / 4 MiB; 8,192 pages are 32 GiB.
   const long tight = 16384 + 22383 + 4096 + 2048 + 24576;  // reserve, weights, scratch, sessions' fixed, 24 GiB pool
   const SizeChoice t = choose(tight, kScratchBytes, paged);
   const StartPlan tp = start_plan(c, kWeights, kScratchBytes, true, t.sessions, t.max_context, tight, kReserve, paged);
   std::printf("avail %ld MiB: paged %d x %d (pool %s)\n", tight, t.sessions, t.max_context,
               describe_kv_pool(tp.plan).c_str());
-  check(t.max_context == 262144 && t.sessions >= 2 && t.sessions < 4, "a smaller pool: fewer sessions at 262,144");
-  check(tp.plan.kv_pool_pages >= long(t.sessions) * 4096 / kPagedFitShare, "the chosen sessions satisfy the rule");
+  check(t.max_context == 262144 && t.sessions == 1, "a smaller pool: one session at 262,144");
+  check(tp.plan.kv_pool_pages >= long(t.sessions) * 4096 / kAutoPagedFitShare, "the chosen sessions satisfy the rule");
+  check(!paged_sessions_fit(start_plan(c, kWeights, kScratchBytes, true, 2, 262144, tight, kReserve, paged).plan, 2,
+                            262144, kAutoPagedFitShare),
+        "two do not fill their full context");
+  const SizeChoice tg = choose(tight, kScratchBytes, paged, 4);
+  check(tg.sessions == 4 && tg.max_context == 131072, "four given on the smaller pool: 131,072 at half the pool (as before)");
   check(!paged_sessions_fit(start_plan(c, kWeights, kScratchBytes, true, 4, 262144, tight, kReserve, paged).plan, 4,
                             262144),
         "four do not");
