@@ -96,8 +96,8 @@ void paged_auto_size() {
                   describe_kv_pool(sp.plan).c_str(), q.sessions, q.max_context);
       check(flat.max_context == 262144 && flat.sessions == 3, "flat: three sessions at 262,144 on node-b");
       check(p.sized && p.sessions_auto && p.context_auto, "paged: chosen here");
-      check(p.sessions == 7 && p.max_context == 262144, "paged: seven sessions at 262,144 on node-b (the pool, not the cap)");
-      check(q.sessions == 7 && q.max_context == 262144, "paged with a 1 GB store: seven at 262,144");
+      check(p.sessions == 4 && p.max_context == 262144, "paged: four sessions at 262,144 on node-b");
+      check(q.sessions == 4 && q.max_context == 262144, "paged with a 1 GB store: four at 262,144");
       check(sp.refusal.empty(), "paged: the choice starts");
     }
   // The rule bites: a host whose pool holds one conversation at 262,144 but not 4 x 131,072 positions runs fewer.
@@ -127,12 +127,6 @@ void paged_auto_size() {
   check(op.plan.kv_pool_pages == 4096 && op.refusal.empty(), "one session at 262,144 starts with 4,096 pages");
   // Without --kv-pages auto-size is unchanged (the flat plan).
   check(choose(kNodeB, kScratchBytes, {}).sessions == 3, "flat unchanged");
-  // P4e: the cap is kMaxSeqs (32), so a given 32K context on node-b takes 32 sessions paged (a fan-out's forks), and
-  // flat, where every session holds its whole slot, as many as memory allows.
-  const SizeChoice f32 = choose(kNodeB, kScratchBytes, paged, {}, 32768);
-  std::printf("32K given on node-b: paged %d, flat %d\n", f32.sessions, choose(kNodeB, kScratchBytes, {}, {}, 32768).sessions);
-  check(f32.sessions == kAutoSessionsCap && kAutoSessionsCap == 32, "paged at 32K: the cap, 32 sessions");
-  check(choose(kNodeB, kScratchBytes, {}, {}, 32768).sessions == 26, "flat at 32K: 26, what memory allows");
 }
 
 }  // namespace

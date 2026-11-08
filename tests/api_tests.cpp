@@ -1068,13 +1068,13 @@ EOF
       EXPECT(a.sessions == 4 && a.max_context == 131072 && !a.sessions_auto && a.context_auto);
       EXPECT(!fits(4, 262144, nodeb, kScratchBytes) && fits(4, 131072, nodeb, kScratchBytes));
     }
-    // --max-context given: only the sessions are chosen, as many as fit up to the cap (kMaxSeqs since P4e; 4 before).
+    // --max-context given: only the sessions are chosen, up to the cap of four.
     {
       const SizeChoice a = choose(nodeb, vis, {}, 262144);
       EXPECT(a.sessions == 3 && a.max_context == 262144 && a.sessions_auto && !a.context_auto);
       const SizeChoice b = choose(nodeb, kScratchBytes, {}, 65536);
-      EXPECT(b.sessions == 14 && b.max_context == 65536 && b.sessions < kAutoSessionsCap);
-      EXPECT(fits(14, 65536, nodeb, kScratchBytes) && !fits(15, 65536, nodeb, kScratchBytes));  // the memory stops it
+      EXPECT(b.sessions == kAutoSessionsCap && b.max_context == 65536);
+      EXPECT(fits(kAutoSessionsCap + 1, 65536, nodeb, kScratchBytes));  // the cap, not the memory, stops it
     }
     // Both given: today's check exactly, nothing chosen (an over-large pair is left to the start check to refuse).
     {
@@ -1110,7 +1110,7 @@ EOF
     // A model without max_position_embeddings is sized from today's default context, never beyond it.
     {
       const SizeChoice a = choose_size(c, w, kScratchBytes, true, nodeb, reserve, 0, {}, {});
-      EXPECT(a.max_context == kDefaultContext && a.sessions == 14);  // as many as fit flat at 65,536
+      EXPECT(a.max_context == kDefaultContext && a.sessions == kAutoSessionsCap);
     }
     // The full context read from config.json: under text_config when there is one, else at the top; 0 without.
     const std::string cfg = "/tmp/ragon-api-tests-config.json";
