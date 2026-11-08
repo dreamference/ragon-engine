@@ -594,6 +594,9 @@ void set_draft_attention_keys(int u);
 // position, and draft_attention with each sequence's queries over its own ring and its own block (b's rows).
 void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16* norm, const SeqBatch& b, float theta,
                         float eps, cudaStream_t s);
+// draft_store_kv with each row at its sequence's position, into that sequence's rings (kc.p[i], vc.p[i]).
+void draft_store_kv_seqs(const float* k, const float* v, int kv_size, SeqPtrs<__nv_bfloat16> kc,
+                         SeqPtrs<__nv_bfloat16> vc, int ring, const SeqBatch& b, cudaStream_t s);
 void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc, int ring,
                           const float* kb, const float* vb, const SeqBatch& b, int window_left, int Hq, int Hkv,
                           float* out, cudaStream_t s);

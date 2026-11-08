@@ -698,6 +698,10 @@ class Engine {
   void commit_state_async(int row0, int n, bool graph);  // the replay on commit_stream_, then commit_done_
   // Target features -> the drafter's context KV at positions pos0 .. pos0 + rows - 1.
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
+  // The plain fan-out step's upkeep (BATCHING §5.8): sequence i's one row (cap_ row i) at its own position, into its own
+  // rings, all rows in one pass; the rings come out as draft_materialize(1, pos, i) for each leaves them.
+  void draft_materialize_seqs(std::span<Session* const> seqs);
+  void draft_context(int rows, int cap_row0);  // fc over the target features, then the hidden norm, into dctx_
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
   void alloc_verify_rows();  // the buffers a Verify pass keeps its rows in: with a drafter, or for step_batch
