@@ -3,7 +3,7 @@
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ragon-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
-//              [--draft DIR [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
+//              [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
@@ -74,6 +74,15 @@
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
 //
+// --drafter ID=DIR (repeatable) and --drafter-routes FILE (MULTI_DRAFTER §5): resident drafters beside `--draft DIR`,
+// which is `general` (`--drafter general=DIR` says the same). All are loaded at start, counted by the start plan, and
+// must share general's shape. The routes file is the workload table, {"work":"work","ask":"ask","*":"general"}; without
+// one every request goes to general. A request's drafter comes from its hint (`"ragon": {"workload": ...}`, or
+// `ragon_workload` in Codex's x-codex-turn-metadata), else from its tools and last item. The output never depends on
+// it. The response says which in `x-ragon-drafter`; /spec_stats has per-drafter counters (`drafters`), how each was
+// chosen (`drafter_chosen`) and the resident sessions taken over to another drafter (`drafter_changes`); /metrics
+// labels ragon:spec_drafted_tokens_total and ragon:spec_accepted_tokens_total with `drafter`.
+//
 // --plan-only: print the start plan (sessions, batch, context, planned_bytes; with paged KV the page pool, which
 // planned_bytes includes, and the host reserve) as one JSON line on stdout and exit 0 before
 // anything is allocated; the launcher's pre-load host-safety check runs it so it checks the engine's own plan.
@@ -108,6 +117,8 @@
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -136,6 +147,16 @@ struct Metrics {
   double prompt_tokens = 0, cached_tokens = 0, generation_tokens = 0, verify_calls = 0;
   double e2e_sum = 0, e2e_count = 0, ttft_sum = 0, ttft_count = 0;
   double accepted_drafts = 0, drafted = 0;
+  // Per resident drafter (MULTI_DRAFTER §2.5), by id; empty without a drafter. The ids are entered before the server
+  // starts, so every series exists from zero.
+  struct DrafterCounters {
+    double requests = 0, steps = 0, drafted = 0, accepted = 0, draft_seconds = 0, commit_seconds = 0;
+  };
+  std::map<std::string, DrafterCounters> by_drafter;
+  // A resident session taken over to another drafter (§2.3): how many, and those requests' prefills (the new turn's
+  // tokens included). Not the drafter-off guard's `drafter_switches`.
+  double drafter_changes = 0, drafter_change_tokens = 0, drafter_change_seconds = 0;
+  double chosen_declared = 0, chosen_inferred = 0, chosen_default = 0;
   double nonfinite = 0;  // requests ended because the logits were not finite
   double repetition_stops = 0;  // requests ended by the repetition stop rule (API §9)
   double memory_refusals = 0;   // requests answered 503 because host memory was below the admission reserve
@@ -176,6 +197,16 @@ struct Metrics {
       j["shadow_lookup"].push_back(spec.shadow_lookup[b]);
       j["shadow_dflash"].push_back(spec.shadow_dflash[b]);
     }
+    if (!by_drafter.empty()) {
+      json per = json::object();
+      for (const auto& [id, c] : by_drafter)
+        per[id] = {{"requests", c.requests}, {"steps", c.steps}, {"drafted", c.drafted}, {"accepted", c.accepted},
+                   {"draft_seconds", c.draft_seconds}, {"commit_seconds", c.commit_seconds}};
+      j["drafters"] = per;
+      j["drafter_changes"] = {{"count", drafter_changes}, {"prefill_tokens", drafter_change_tokens},
+                              {"prefill_seconds", drafter_change_seconds}};
+      j["drafter_chosen"] = {{"declared", chosen_declared}, {"inferred", chosen_inferred}, {"default", chosen_default}};
+    }
     return j;
   }
 
@@ -197,8 +228,22 @@ struct Metrics {
     counter("sglang:e2e_request_latency_seconds_count", e2e_count, "Requests.");
     counter("sglang:time_to_first_token_seconds_sum", ttft_sum, "Time to first token, sum.");
     counter("sglang:time_to_first_token_seconds_count", ttft_count, "Time to first token, count.");
-    counter("ragon:spec_drafted_tokens_total", drafted, "Drafted tokens offered to the verify.");
-    counter("ragon:spec_accepted_tokens_total", accepted_drafts, "Drafted tokens accepted.");
+    // With a drafter loaded these two carry its id (MULTI_DRAFTER §2.5), one series per resident drafter.
+    auto per_drafter = [&](const char* name, double DrafterCounters::*field, double total, const char* help) {
+      if (by_drafter.empty()) return counter(name, total, help);
+      out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " counter\n";
+      for (const auto& [id, c] : by_drafter) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%.6f", c.*field);
+        out += std::string(name) + "{model_name=\"" + model + "\",drafter=\"" + id + "\"} " + buf + "\n";
+      }
+    };
+    per_drafter("ragon:spec_drafted_tokens_total", &DrafterCounters::drafted, drafted,
+                "Drafted tokens offered to the verify.");
+    per_drafter("ragon:spec_accepted_tokens_total", &DrafterCounters::accepted, accepted_drafts,
+                "Drafted tokens accepted.");
+    if (!by_drafter.empty())
+      counter("ragon:drafter_changes_total", drafter_changes, "Resident sessions taken over to another drafter.");
     counter("ragon:nonfinite_logits_total", nonfinite, "Requests ended because the logits were NaN or inf.");
     counter("ragon:repetition_stops_total", repetition_stops, "Requests ended by the repetition stop rule.");
     counter("ragon:memory_refusals_total", memory_refusals,
@@ -245,6 +290,7 @@ struct Metrics {
 
 struct ServerContext {
   Engine* engine = nullptr;
+  ragon::serve::DrafterRoutes drafter_routes;  // --drafter-routes (MULTI_DRAFTER §5.2)
   Tokenizer* tok = nullptr;
   std::string model_name;
   int im_end = -1;
@@ -358,6 +404,8 @@ struct Running {
   double ttft = -1;
   std::chrono::steady_clock::time_point t_decode, last_step;
   long steps0 = 0, drafted0 = 0, accepted0 = 0;
+  double draft_seconds0 = 0, commit_seconds0 = 0;
+  bool drafter_changed = false;  // its request took a resident session over to another drafter (MULTI_DRAFTER §2.3)
   int chunks_beside = 0;  // prefill chunks run while another request was decoding (contended size, or on the side)
   bool side_flight = false;  // one of its chunks is in flight on the engine's side stream
   bool yielding = false;     // its prefill is letting a shorter one go first, since yield_t0 (C1)
@@ -545,7 +593,8 @@ class Scheduler {
         eng.lora_upload(j.lora_slot, *j.lora);
         j.lora_upload = false;
       }
-      eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope, j.lora_slot);
+      r->drafter_changed =
+          eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope, j.lora_slot, j.req.drafter);
       try {
         r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
       } catch (const KvPoolExhausted&) {
@@ -644,7 +693,7 @@ class Scheduler {
         eng.lora_upload(j.lora_slot, *j.lora);
         j.lora_upload = false;
       }
-      eng.activate_session(s, j.req.session_key, true, j.req.share_scope, j.lora_slot);
+      eng.activate_session(s, j.req.session_key, true, j.req.share_scope, j.lora_slot, j.req.drafter);  // the parent's
       eng.fork_session(from);
     } catch (const KvPoolExhausted& e) {  // nothing changed: the count above was short, it waits
       std::fprintf(stderr, "KV pool: a fork of %zu tokens waits (%s)\n", j.prompt.size(), e.what());
@@ -1088,10 +1137,10 @@ class Scheduler {
   bool kv_admit_room(int s, const Job& j, bool* evicted = nullptr) {
     Engine& eng = *ctx_.engine;
     Engine::KvSource src;
-    eng.kv_admit_need(s, j.prompt, j.req.share_scope, &src);
+    eng.kv_admit_need(s, j.prompt, j.req.share_scope, &src, nullptr, false, j.req.drafter);
     return kv_make_room(
         [&](const Engine::KvGone* gone, bool from_scratch) {
-          return eng.kv_admit_need(s, j.prompt, j.req.share_scope, nullptr, gone, from_scratch);
+          return eng.kv_admit_need(s, j.prompt, j.req.share_scope, nullptr, gone, from_scratch, j.req.drafter);
         },
         s, src, evicted);
   }
@@ -1345,6 +1394,8 @@ class Scheduler {
     r.steps0 = s.steps;
     r.drafted0 = s.drafted;
     r.accepted0 = s.accepted;
+    r.draft_seconds0 = s.draft_seconds;
+    r.commit_seconds0 = s.commit_seconds;
     r.t_decode = r.last_step = std::chrono::steady_clock::now();
     r.dec.emplace(*ctx_.tok);
     r.stops.emplace(j.req.stop);
@@ -1447,6 +1498,22 @@ class Scheduler {
       }
       m.drafted += s.drafted - r.drafted0;
       m.accepted_drafts += s.accepted - r.accepted0;
+      if (!job.req.drafter_id.empty()) {
+        Metrics::DrafterCounters& d = m.by_drafter[job.req.drafter_id];
+        d.requests += 1;
+        d.steps += steps;
+        d.drafted += s.drafted - r.drafted0;
+        d.accepted += s.accepted - r.accepted0;
+        d.draft_seconds += s.draft_seconds - r.draft_seconds0;
+        d.commit_seconds += s.commit_seconds - r.commit_seconds0;
+        const std::string how = job.req.drafter_how;
+        (how == "declared" ? m.chosen_declared : how == "inferred" ? m.chosen_inferred : m.chosen_default) += 1;
+      }
+      if (r.drafter_changed) {
+        m.drafter_changes += 1;
+        m.drafter_change_tokens += stats.prefill_tokens;
+        m.drafter_change_seconds += stats.prefill_seconds;
+      }
       m.spec = eng.spec_stats_total();
     }
     // Step periods (M4 §3): mean and max, apart from those with another request's prefill chunk between.
@@ -1454,10 +1521,14 @@ class Scheduler {
     if (r.alone.n + r.beside.n > 0)
       std::snprintf(periods, sizeof periods, "; step period %.1f ms mean, %.1f max over %d; beside a prefill %.1f ms mean, %.1f max over %d",
                     r.alone.mean_ms(), 1e3 * r.alone.max, r.alone.n, r.beside.mean_ms(), 1e3 * r.beside.max, r.beside.n);
+    // Only with several drafters, so a one-drafter server's log reads as it always did.
+    const std::string drafter_note = eng.drafters() > 1 ? ", drafter " + job.req.drafter_id + " (" + job.req.drafter_how +
+                                                              (r.drafter_changed ? ", changed)" : ")")
+                                                        : "";
     std::fprintf(stderr,
-                 "request: session %d%s, %zu prompt tokens (%d reused%s), prefill %.2f s (%d chunks, %d beside a decode, "
+                 "request: session %d%s%s, %zu prompt tokens (%d reused%s), prefill %.2f s (%d chunks, %d beside a decode, "
                  "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes (%d batched)%s%s\n",
-                 job.session, job.fresh ? " (new)" : "", job.prompt.size(), stats.reused_tokens,
+                 job.session, job.fresh ? " (new)" : "", drafter_note.c_str(), job.prompt.size(), stats.reused_tokens,
                  stats.store_tokens > 0 ? ", from the prefix KV store" : "", stats.prefill_seconds,
                  stats.chunks, r.chunks_beside,
                  stats.compute_seconds > 0 ? stats.prefill_tokens / stats.compute_seconds : 0.0, r.produced, decode_s,
@@ -1551,18 +1622,18 @@ void emit_event(Exchange& ex, const std::string& type, json payload) {
   ResponseBuilder(ex.downstream).body("event: " + type + "\ndata: " + dump_json(payload) + "\n\n").send();
 }
 
-void send_json(proxygen::ResponseHandler* d, int status, const json& body) {
-  ResponseBuilder(d)
-      .status(status, status == 200   ? "OK"
-                      : status == 400 ? "Bad Request"
-                      : status == 401 ? "Unauthorized"
-                      : status == 403 ? "Forbidden"
-                      : status == 404 ? "Not Found"
-                      : status == 413 ? "Payload Too Large"
-                                      : "Error")
-      .header("Content-Type", "application/json")
-      .body(dump_json(body))
-      .sendWithEOM();
+void send_json(proxygen::ResponseHandler* d, int status, const json& body, const std::string& drafter = "") {
+  ResponseBuilder out(d);
+  out.status(status, status == 200   ? "OK"
+                     : status == 400 ? "Bad Request"
+                     : status == 401 ? "Unauthorized"
+                     : status == 403 ? "Forbidden"
+                     : status == 404 ? "Not Found"
+                     : status == 413 ? "Payload Too Large"
+                                     : "Error")
+      .header("Content-Type", "application/json");
+  if (!drafter.empty()) out.header("x-ragon-drafter", drafter);  // MULTI_DRAFTER §2.5: outside the body
+  out.body(dump_json(body)).sendWithEOM();
 }
 
 json error_body(const std::string& msg, const std::string& type, const std::string& code = "") {
@@ -1787,6 +1858,7 @@ class Handler : public proxygen::RequestHandler {
       job.req = parse_request(body, chat, ctx_.vision);
       job.req.share_scope = share_scope_;
       job.lora = resolve_adapter(job.req);
+      choose_drafter(job);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = job.req.prompt_ids.empty() ? ctx_.tok->encode(job.req.prompt_text) : job.req.prompt_ids;
       if (!job.req.prompt_ids.empty())
@@ -1816,11 +1888,10 @@ class Handler : public proxygen::RequestHandler {
     const Request req = job.req;
 
     if (req.stream) {
-      ResponseBuilder(downstream_)
-          .status(200, "OK")
-          .header("Content-Type", "text/event-stream")
-          .header("Cache-Control", "no-cache")
-          .send();
+      ResponseBuilder out(downstream_);
+      out.status(200, "OK").header("Content-Type", "text/event-stream").header("Cache-Control", "no-cache");
+      if (!req.drafter_id.empty()) out.header("x-ragon-drafter", req.drafter_id);  // MULTI_DRAFTER §2.5
+      out.send();
     }
     // Shared by the job's callbacks (engine thread only).
     struct State {
@@ -2019,7 +2090,7 @@ class Handler : public proxygen::RequestHandler {
         if (!last) return;
         json body = {{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
                      {"model", model}, {"choices", fan->choices}, {"usage", usage}};
-        post(ex, [body](proxygen::ResponseHandler* d) { send_json(d, 200, body); });
+        post(ex, [body, drafter = req.drafter_id](proxygen::ResponseHandler* d) { send_json(d, 200, body, drafter); });
       };
       return sink;
     };
@@ -2064,6 +2135,7 @@ class Handler : public proxygen::RequestHandler {
       job.req = parse_responses_request(json::parse(text), ctx_.vision);
       job.req.share_scope = share_scope_;
       job.lora = resolve_adapter(job.req);
+      choose_drafter(job);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = ctx_.tok->encode(job.req.prompt_text);
       attach_images(job);
@@ -2112,11 +2184,10 @@ class Handler : public proxygen::RequestHandler {
     auto deliver = [=](const OutputParser::Delta& d) { st->items.deliver(d); };
 
     if (req.stream) {
-      ResponseBuilder(downstream_)
-          .status(200, "OK")
-          .header("Content-Type", "text/event-stream")
-          .header("Cache-Control", "no-cache")
-          .send();
+      ResponseBuilder out(downstream_);
+      out.status(200, "OK").header("Content-Type", "text/event-stream").header("Cache-Control", "no-cache");
+      if (!req.drafter_id.empty()) out.header("x-ragon-drafter", req.drafter_id);  // MULTI_DRAFTER §2.5
+      out.send();
     }
     event("response.created", {{"response", response_obj("in_progress")}});
 
@@ -2169,7 +2240,7 @@ class Handler : public proxygen::RequestHandler {
         event(rep_incomplete ? "response.incomplete" : "response.completed", {{"response", resp}});
         post(ex, [](proxygen::ResponseHandler* d) { ResponseBuilder(d).sendWithEOM(); });
       } else {
-        post(ex, [resp](proxygen::ResponseHandler* d) { send_json(d, 200, resp); });
+        post(ex, [resp, drafter = req.drafter_id](proxygen::ResponseHandler* d) { send_json(d, 200, resp, drafter); });
       }
     };
     if (req.stream && ctx_.keepalive_ms > 0) {
@@ -2187,6 +2258,22 @@ class Handler : public proxygen::RequestHandler {
   ServerContext& ctx_;
   Scheduler& scheduler_;
   std::string method_, path_;
+  // Which resident drafter serves the request (MULTI_DRAFTER §2): from the request alone (§2.4). An adapter with a
+  // drafter part was trained on `general`, so its requests stay there.
+  void choose_drafter(Job& job) const {
+    const Engine& eng = *ctx_.engine;
+    Request& q = job.req;
+    if (!eng.has_drafter()) return;
+    ragon::serve::DrafterChoice c =
+        ctx_.drafter_routes.choose(q.workload, !q.tools.empty(), ragon::serve::tools_include_shell(q.tools), q.last_item);
+    if (job.lora && job.lora->has_drafter) c = {ragon::serve::kGeneralDrafter, "default"};
+    q.drafter = 0;
+    for (int i = 0; i < eng.drafters(); ++i)
+      if (eng.drafter_id(i) == c.id) q.drafter = i;
+    q.drafter_id = eng.drafter_id(q.drafter);
+    q.drafter_how = c.how;
+  }
+
   uint64_t share_scope_ = 0;  // X-Ragon-Share-Scope (P4c, share_scope_of)
   std::string authorization_;  // the Authorization header (the adapter routes' key)
   folly::IOBufQueue body_{folly::IOBufQueue::cacheChainLength()};
@@ -2214,11 +2301,13 @@ class Factory : public proxygen::RequestHandlerFactory {
 // Above this many decoding requests a server with a drafter stops speculating (BATCHING P4d, measured there).
 constexpr long kFanoutPlainAboveDrafting = 6;
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
   std::string model_dir, host = "0.0.0.0", name;
   double draft_off_below = 1.5;  // the drafter-off guard (BACKLOG 10)
   int port = 8000, max_context = 0, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1;
   std::string draft_dir, pretokenizer = "production";
+  std::vector<std::string> drafter_args;  // --drafter ID=DIR, repeatable (MULTI_DRAFTER §5.3)
+  std::string drafter_routes_file;
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
   bool kv_pages = false;  // the flat slots by default (P4d kept them: paged passes are slower, BATCHING §5.3)
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
@@ -2259,6 +2348,8 @@ int main(int argc, char** argv) {
     else if (a == "--vision-cache-mb") vision_cache_mb = std::stoi(next());
     else if (a == "--jpeg-decoder") jpeg = next();
     else if (a == "--draft") draft_dir = next();
+    else if (a == "--drafter") drafter_args.push_back(next());
+    else if (a == "--drafter-routes") drafter_routes_file = next();
     else if (a == "--draft-block") draft_block = std::stoi(next());
     else if (a == "--tree") tree_nodes = std::stoi(next());
     else if (a == "--draft-off-below") draft_off_below = std::stod(next());
@@ -2307,7 +2398,7 @@ int main(int argc, char** argv) {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2359,8 +2450,41 @@ int main(int argc, char** argv) {
     return 2;
   }
   ragon::Tokenizer tok(model_dir + "/tokenizer.json", pretokenizer == "production" ? ragon::kProductionPretokenizer : "");
+  // The resident drafters (MULTI_DRAFTER §5.3): `--draft DIR` is `general` alone, and every other id comes beside a
+  // `general`. A routes file that names a drafter not loaded is refused here, not on the first request it would send.
+  std::vector<std::pair<std::string, std::string>> extra_drafters;
+  ragon::serve::DrafterRoutes drafter_routes;
+  try {
+    for (const std::string& arg : drafter_args) {
+      const ragon::serve::DrafterArg d = ragon::serve::parse_drafter_arg(arg);
+      if (d.id == ragon::serve::kGeneralDrafter) {
+        if (!draft_dir.empty()) throw std::invalid_argument("--draft is the drafter general: give it once");
+        draft_dir = d.dir;
+      } else {
+        extra_drafters.emplace_back(d.id, d.dir);
+      }
+    }
+    if (!extra_drafters.empty() && draft_dir.empty())
+      throw std::invalid_argument("no drafter is general: add --draft DIR or --drafter general=DIR");
+    if (!drafter_routes_file.empty()) {
+      if (draft_dir.empty()) throw std::invalid_argument("--drafter-routes needs a drafter");
+      std::ifstream in(drafter_routes_file);
+      if (!in) throw std::invalid_argument("cannot read " + drafter_routes_file);
+      drafter_routes = ragon::serve::DrafterRoutes::parse(std::string(std::istreambuf_iterator<char>(in), {}));
+      for (const std::string& id : drafter_routes.targets()) {
+        const bool loaded = id == ragon::serve::kGeneralDrafter ||
+                            std::any_of(extra_drafters.begin(), extra_drafters.end(),
+                                        [&](const auto& d) { return d.first == id; });
+        if (!loaded) throw std::invalid_argument("the drafter routes name the drafter " + id + ", which is not loaded");
+      }
+    }
+  } catch (const std::invalid_argument& e) {
+    std::cerr << "ragon-serve: " << e.what() << "\n";
+    return 2;
+  }
   ragon::EngineOptions opts;
   opts.draft_dir = draft_dir;
+  opts.extra_drafters = extra_drafters;
   opts.draft_block = draft_block;
   opts.tree_nodes = tree_nodes;  // BACKLOG 26: 7 by default, 0 the chain alone (RAGON_TREE overrides)
   opts.draft_off_below = draft_off_below;  // BACKLOG 10: 1.5 by default, 0 the guard off (RAGON_DRAFT_OFF_BELOW overrides)
@@ -2433,7 +2557,14 @@ int main(int argc, char** argv) {
   {  // sizing and admission control at start (serve/admission.hpp; BATCHING §5.6), before anything is allocated
     namespace as = ragon::serve;
     const ragon::ModelConfig cfg = ragon::ModelConfig::from_file(model_dir + "/config.json");
-    const size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
+    // Every resident drafter's weights, from the declared budget (MULTI_DRAFTER §5.4): the reserve and the prefix store
+    // are not reduced for them. A session holds one drafter ring whichever drafter it runs, so the rings stay per session.
+    size_t weights = as::checkpoint_bytes(model_dir) + as::checkpoint_bytes(draft_dir);
+    for (const auto& [id, dir] : extra_drafters) {
+      const size_t bytes = as::checkpoint_bytes(dir);
+      weights += bytes;
+      std::cerr << "admission: drafter " << id << " counts " << bytes / 1e9 << " GB\n";
+    }
     // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
     // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
     const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0) +
@@ -2496,6 +2627,8 @@ int main(int argc, char** argv) {
 
   ragon::serve::ServerContext ctx;
   ctx.engine = &engine;
+  ctx.drafter_routes = drafter_routes;
+  for (int i = 0; i < engine.drafters(); ++i) ctx.metrics.by_drafter[engine.drafter_id(i)];
   ctx.tok = &tok;
   ctx.im_end = tok.token_id("<|im_end|>");
   static ragon::serve::ImageRegistry image_registry;
@@ -2586,4 +2719,7 @@ int main(int argc, char** argv) {
   std::thread t([&] { server.start(); });
   t.join();
   return 0;
+} catch (const std::exception& e) {  // a start that cannot go on (a drafter of another shape, say) is a refusal, not a core dump
+  std::cerr << "ragon-serve: " << e.what() << "\n";
+  return 2;
 }

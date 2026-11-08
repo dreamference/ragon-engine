@@ -11,6 +11,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "serve/drafter_routes.hpp"
+
 #include "core/engine.hpp"
 
 namespace ragon::serve {
@@ -83,6 +85,13 @@ struct Request {
   // The X-Ragon-Share-Scope header (P4c, share_scope_of): requests share KV prefixes (resident sessions, checkpoints,
   // the prefix KV store) only within one scope; 0 when the request carries none (the unscoped requests' scope).
   uint64_t share_scope = 0;
+  // The workload hint (MULTI_DRAFTER §2.1; empty: none we know) and the last input item, which §2.2's rule reads.
+  std::string workload;
+  LastItem last_item = LastItem::kNone;
+  // The resident drafter the server chose for it (§2.3), its id (empty: no drafter loaded) and how it was chosen.
+  int drafter = 0;
+  std::string drafter_id;
+  const char* drafter_how = "default";
   // `repetition_detection` (API §9): the fields the request set, -1 for those it left to the server's
   // default; `false` sets them all to 0 (off). resolve_repetition() makes the rule the request runs with.
   RepetitionDetection repetition{-1, -1, -1, -1};

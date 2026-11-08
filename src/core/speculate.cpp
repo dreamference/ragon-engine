@@ -57,6 +57,10 @@
 namespace ragon {
 namespace {
 
+// A batch's graphs on a drafter other than the first end their key with this minus the drafter (MULTI_DRAFTER §2.3): below
+// every session's entry in the key, -1 - a session's index at the lowest.
+constexpr int kBatchOrderDrafter = -1000000;
+
 struct NvtxRange {
   explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
   ~NvtxRange() { nvtxRangePop(); }
@@ -1284,11 +1288,21 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     plan_begin(sp, B);
     any_lookup = any_lookup || sp.use_lookup;
   }
+  // MULTI_DRAFTER §2.3: one drafter's pass covers the whole batch only when every sequence uses that drafter, and its
+  // graphs bake in the drafter's weights, so they are keyed by it. Sequences on different drafters draft one pass each.
+  // A rider drafts nothing, but its commit carries its drafter's ring forward, so it counts too.
+  const int drafter0 = plans[0].s->drafter;
+  bool same_drafter = true;
+  for (const StepPlan& sp : plans) same_drafter = same_drafter && sp.s->drafter == drafter0;
   if (nd < n) order.push_back(std::numeric_limits<int>::min() + nd);  // the riders' graphs are their batch's own
+  if (same_drafter) {
+    draft_ = drafters_[drafter0].get();
+    if (drafter0 > 0) order.push_back(kBatchOrderDrafter - drafter0);
+  }
   // 1. The drafter over every sequence's block at once (stage 4), then each sequence's lattice walk; a batch with a
   // lookup chain (whose rows replace the drafter's) drafts per sequence, eagerly, as stage 3 did. With step graphs
   // the batch's draft, verify and commits replay as graphs keyed by the order of its sessions.
-  const bool together = !any_lookup;
+  const bool together = !any_lookup && same_drafter;
   const bool graph = graphs_ && together;
   // Sessions sharing a prefix's pages (cascade groups, BATCHING §5.8) verify jointly, the shared keys read once a group,
   // unless a sequence verifies a tree, which makes the pass sequence by sequence. Above kCascadeTreesUpTo sessions the
@@ -1342,10 +1356,19 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       used += plans[i].V;
     }
   } else {
-    for (StepPlan& sp : plans) {
-      if (sp.use_lookup || sp.ride) continue;
-      s_ = sp.s;
+    // Per sequence, eagerly: a lookup chain's rows replace the drafter's, or the sequences use different drafters. With
+    // no lookup each takes its tree as above; each pass leaves its results in the first sequence's place. Riders do not
+    // draft.
+    const int tree_rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
+    int used = n - nd;  // the riders' rows
+    for (int i = 0; i < nd; ++i) {
+      StepPlan& sp = plans[i];
+      if (sp.use_lookup) continue;
+      bind_session(sp.s);
       plan_draft(sp, B, false);
+      if (!any_lookup && trees && used + tree_rows + (nd - 1 - i) * B <= kernels::kMaxStreamRows)
+        plan_tree(sp, B, pin_->scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
+      used += sp.V;
     }
   }
   int V = 0;
@@ -1425,7 +1448,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     StepPlan& sp = plans[i];
     if (sp.failed) continue;
     const int k = sp.accepted + 1;
-    s_ = sp.s;
+    bind_session(sp.s);
     if (commit_overlap_ && !state_batched) commit_state_async(sp.row0, k, graph);
     if (graph) {
       // Slot i's commit reads its position from pos_dev_[i] and its rows from row0 (which depends on whether the
@@ -1464,7 +1487,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       sp.s->spec.ride_steps += 1;
     }
     if (sp.failed) {
-      s_ = sp.s;
+      bind_session(sp.s);
       reset_session();
       continue;
     }

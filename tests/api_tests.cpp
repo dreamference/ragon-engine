@@ -413,6 +413,51 @@ int main() {
     EXPECT(ragon::serve::parse_request(json::parse(R"({"messages":[{"role":"user","content":"hi"}],
       "prompt_cache_key":"chat-1"})"), true).session_key == "chat-1");
   }
+  {
+    // MULTI_DRAFTER §2.1, §2.2: the workload hint on each route, what the request ended with, and what is refused.
+    namespace rs = ragon::serve;
+    const char* chat_user = R"({"messages":[{"role":"user","content":"hi"}],"ragon":{"workload":"ask"}})";
+    rs::Request r = rs::parse_request(json::parse(chat_user), true);
+    EXPECT(r.workload == "ask");
+    EXPECT(r.last_item == rs::LastItem::kUser);
+    r = rs::parse_request(json::parse(R"({"messages":[{"role":"user","content":"hi"},
+      {"role":"assistant","content":"","tool_calls":[{"id":"c","type":"function","function":{"name":"v","arguments":"{}"}}]},
+      {"role":"tool","tool_call_id":"c","content":"ok"}]})"), true);
+    EXPECT(r.workload.empty());
+    EXPECT(r.last_item == rs::LastItem::kToolResult);
+    r = rs::parse_request(json::parse(R"({"prompt":"hi","ragon":{"workload":"night"}})"), false);
+    EXPECT(r.workload == "night");
+    EXPECT(r.last_item == rs::LastItem::kNone);
+    EXPECT(rs::parse_request(json::parse(R"({"prompt":"hi","ragon":{"workload":"nonsense"}})"), false).workload.empty());
+    EXPECT(rs::parse_request(json::parse(R"({"prompt":"hi","ragon":5})"), false).workload.empty());
+    // Codex's per-turn metadata, and the documented form on the Responses route.
+    json meta = json::parse(R"({"input":"hi"})");
+    meta["client_metadata"]["x-codex-turn-metadata"] = R"({"turn_id":"t","ragon_workload":"phone"})";
+    EXPECT(rs::parse_responses_request(meta).workload == "phone");
+    meta["ragon"]["workload"] = "work";
+    EXPECT(rs::parse_responses_request(meta).workload == "work");
+    meta = json::parse(R"({"input":"hi","client_metadata":{"x-codex-turn-metadata":"{not json"}})");
+    EXPECT(rs::parse_responses_request(meta).workload.empty());
+    // A tool's output as the last item, and a custom apply_patch counted as a shell tool.
+    r = rs::parse_responses_request(json::parse(R"({"input":[
+      {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+      {"type":"function_call","call_id":"c","name":"v","arguments":"{}"},
+      {"type":"function_call_output","call_id":"c","output":"ok"}],
+      "tools":[{"type":"custom","name":"apply_patch","description":"edit"}]})"));
+    EXPECT(r.last_item == rs::LastItem::kToolResult);
+    EXPECT(rs::tools_include_shell(r.tools));
+    // API §8: a known key's malformed value is a 400 naming the key, on every route.
+    auto refused = [](auto&& parse) {
+      try {
+        parse();
+      } catch (const std::invalid_argument& e) {
+        return std::string(e.what()).find("ragon.workload") != std::string::npos;
+      }
+      return false;
+    };
+    EXPECT(refused([] { rs::parse_request(json::parse(R"({"prompt":"hi","ragon":{"workload":3}})"), false); }));
+    EXPECT(refused([] { rs::parse_responses_request(json::parse(R"({"input":"hi","ragon":{"workload":3}})")); }));
+  }
   // Bug classes from SGLang's and vLLM's trackers (reports/engine-issues.md, specs/DREAMFERENCE_RAGON_ENGINE_VALIDATION.md §18 "Known
   // pitfalls"). Each block names the upstream issue it guards against.
   const json edit_tools = json::parse(R"([{"type":"function","function":{"name":"edit","parameters":{"type":"object",

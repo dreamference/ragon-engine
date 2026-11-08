@@ -246,18 +246,22 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
       upkeep_rows.push_back(i);
     }
   if (draft_) {
-    if (n > 1 && static_cast<int>(upkeep.size()) == n) {
+    // MULTI_DRAFTER §2.3: a ring is its drafter's, so one pass covers the rows only when every session uses one drafter.
+    bool same_drafter = true;
+    for (const Session* u : upkeep) same_drafter = same_drafter && u->drafter == upkeep[0]->drafter;
+    if (n > 1 && static_cast<int>(upkeep.size()) == n && same_drafter) {
+      bind_session(upkeep[0]);
       draft_materialize_seqs(upkeep);
     } else {
       for (size_t j = 0; j < upkeep.size(); ++j) {
-        s_ = upkeep[j];
+        bind_session(upkeep[j]);
         draft_materialize(1, upkeep[j]->pos, upkeep_rows[j]);
       }
     }
   }
   for (int i = 0; i < n; ++i) {
     Session& s = sessions_[seqs[i].session];
-    s_ = &s;
+    bind_session(&s);
     if (seqs[i].drafter_off) {  // speculate()'s plain step: the guard's count to its next probe
       s.guard.plain();
       s.spec.drafter_off_steps += 1;
@@ -287,6 +291,8 @@ int Engine::kv_fork_need(int from, int to, const KvGone* gone) const {
 void Engine::fork_session(int from) {
   Session& parent = sessions_.at(from);
   if (&parent == s_) throw std::runtime_error("fork_session: a session is not forked onto itself");
+  if (parent.drafter != s_->drafter)  // the ring it adopts is its drafter's (MULTI_DRAFTER §2.3)
+    throw std::runtime_error("fork_session: the fork and its parent use different drafters");
   side_join();
   join_commit();
   const int L = static_cast<int>(parent.history.size());
