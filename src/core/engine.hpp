@@ -357,6 +357,9 @@ class Engine {
     std::vector<int> out;      // as speculate() returns: the accepted drafts, then the next token
     int rows = 0;              // the rows it verified in a batch: its block, or its tree (a batch of one: not set)
     std::exception_ptr error;  // a non-finite row (NonFiniteLogits): nothing committed, the session reset
+    // step_batch: a speculative step taken plain because the drafter guard is off (drafter_off), counted as speculate()
+    // counts it (the guard's next probe, drafter_off_steps) instead of as a fan-out step.
+    bool drafter_off = false;
   };
   // Whether session i's next speculative step can join a batch: speculation possible for p and room for a full
   // draft block (a shorter block or a plain step runs alone, M4 §2).
