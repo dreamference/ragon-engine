@@ -342,6 +342,22 @@ Sequences in a batch accept different numbers of tokens; there is no lockstep an
 
 What is measured toward it: the plain 32-row pass at 32 forks is 157 ms (FFN 52, DeltaNet recurrence 46, DeltaNet projections 29, attention 15, its projections 8, lm_head 3); a 32-row verify costs 131 ms over 8 forks and 166 over 16; P1's 33-64-row tier (§6) cost 129 against 119.6 ms at two sequences with the FFN megakernel lost above 32 rows; the stream GEMM is bus-bound at 32 rows (about 27 TFLOPS). The cost of a 64-128-row rows-path pass at 32 forks is not measured. The first step of the continuation is to measure it: `kMaxStreamRows` 64 with P1's tier, `--fanout-plain-above 0 --fanout-gang-above 6 --draft-block 2`, against the 237 / 295 ms budget; then 128 rows at B 4. The batched tree (item 3) adds 16-18 % on top. Using the prefill path's GEMM for the extra rows would drop row-invariance (a fork's tokens could differ from its plain step's): an owner's decision, not taken here.
 
+**Stage 8, measured and not landed: the 64-row pass** (2026-11-07). `kMaxStreamRows` 64 with P1's tier carried to fan-out (a new `kMaxSeqRows` 32 for everything one sequence owns: its block, tree, commit, the drafter's ring slack and the megakernels' tiers, which keep the separate kernels above 32 rows), 32 forks x B 2 (`--fanout-plain-above 0 --fanout-gang-above 6 --draft-block 2`). Row-invariance held: `--fanout-check 32`, `--joint-check 32` and `--batch-check paged` bitwise, the stream tests' 33-64-row cases green. The warm rep, each configuration on the same build:
+
+| configuration | span / wall tok/s | draft + verify ms a step | step period |
+| --- | --- | ---: | ---: |
+| plain, graphs (production) | 201 / 179 | 0 + 157 | 159 ms |
+| plain, no graphs | 201 / 178 | 0 + 157 | 159 ms |
+| 64 rows, graphs (production) | 185 / 165 | 22 + 264 | 302-304 ms |
+| 64 rows, no graphs (cascade attention) | 222 / 195 | 22 + 183 | 249 ms |
+| 64 rows, no graphs, `RAGON_CASCADE=0` | 182 / 163 | 21 + 243 | 310 ms |
+
+With graphs, as production runs, the step misses the 295 ms that beating plain needs, so the cap stays 32. The whole difference is the cascade attention: the shared 32K prefix read once for all forks instead of once per fork. `forward_rows` plans it only when `!use_dev_pos_` (`cascade_groups` needs each fork's position and page list on the host, and a captured graph replays with positions on the device), so a graphed verify reads the prefix 32 times. Without graphs it meets 295 (222 against 201) but not 237 (250 tok/s). The first rep of every speculative arm is 63-65 tok/s span (staggered joins, 70 tree steps, 337-382 ms a verify) against plain's 201: the rep-0 anomaly of the table above, reproduced in all four arms and still not understood.
+
+Where a 64-row pass goes (`RAGON_PROFILE`, which turns graphs off and synchronizes after each phase; averaged over both reps' 110 wide passes, rep 0's slower ones included, so the sum is above the warm verify's 183; ms a pass, beside plain's 32-row pass): attention 106 (15.6), FFN 62.5 (51.4), DeltaNet projections 47.1 (28.9), DeltaNet recurrence 24.8 (46.7, the batched state kernel), attention projections 9.8 (7.9), conv 4.9 (1.9), lm_head 4.0 (3.3): 259 against 156. The weight-bound GEMMs do not stay flat past 32 rows: the stream GEMM (`--bench-groups`, `RAGON_BENCH_MS`) reads FFN down at 235 / 221 / 210 / 195 / 167 GB/s at 1 / 32 / 33 / 48 / 64 rows and the lm_head at 235 / 222 / 222 / 216 / 183, so the second row group costs more than the shared weight read saves.
+
+Is 250 tok/s reachable with the rows path on this GPU? Not with this tier: 237 ms needs about 12 ms off the 249 ms no-graph step, and 65 off the graphed one. The step's GEMMs floor at about 80 ms (17.56 GB at 221 GB/s) and rise at 64 rows. Attention is the largest part even with the cascade. What would be needed: the cascade under graphs (the groups as device data, or the wide verify run eagerly), plus a GEMM tier that holds 220 GB/s at 64 rows. Then 128 rows (B 4, 465 ms) is the next question; at 64 rows' GB/s it is not worth a stage 9. Kept for that: the profile counts each kind's passes (`<kind>passes`), and `--bench-groups` times up to `kMaxStreamRows` rows.
+
 ## 6. Phases
 
 Each phase merges into main once its exactness gate passes and nothing regresses (one stream's agentlong tokens/s within noise of main, every earlier gate still green). Expected gains are from §3.1's model and are measured, not assumed, at each gate.
