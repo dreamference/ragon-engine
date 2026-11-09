@@ -228,10 +228,14 @@ inline std::string plan_json(int sessions, int batch, int max_context, const Mem
 // holds one conversation at max_context (as the start check asks) and n x max_context / kPagedFitShare positions, so
 // that n conversations at half the context can be resident at once. More than that is not asked: when n sessions
 // would need more pages than the pool has, the scheduler requeues (P4c), it does not refuse the start.
+// P4e: that share is for sessions the operator gives. Sessions auto-size picks itself ask for the full pool (`share`
+// kAutoPagedFitShare): n x max_context positions, as the flat plan's n slots, so that an auto-sized start plans what
+// flat did (no flags on second-puffin: 3 x 262,144, not 4 with the pool filled to the host reserve).
 inline constexpr long kPagedFitShare = 2;
-inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_context) {
-  const long half = long(sessions) * kv_pages_for(max_context) / kPagedFitShare;
-  return p.kv_pool_pages >= std::max(kv_pages_one_conversation(p, max_context), half);
+inline constexpr long kAutoPagedFitShare = 1;
+inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_context, long share = kPagedFitShare) {
+  const long need = long(sessions) * kv_pages_for(max_context) / share;
+  return p.kv_pool_pages >= std::max(kv_pages_one_conversation(p, max_context), need);
 }
 
 // Auto-size (BATCHING §5.6): the most sessions chosen without --sessions (the owner's cap on node-b until a larger
@@ -270,7 +274,8 @@ struct SizeChoice {
 // the given sessions, or one session, fit; then as many sessions as fit at it, up to kAutoSessionsCap. When nothing
 // fits, the given values or one session at the floor, which the start check then refuses (exit 3). With `auto_size`
 // off, MemAvailable unknown (`avail_mb` < 0) or no reserve to keep (`reserve_mb` <= 0), the defaults fill in.
-// With `kv` on (--kv-pages) "fits" is the paged plan's: start_plan does not refuse it and paged_sessions_fit holds.
+// With `kv` on (--kv-pages) "fits" is the paged plan's: start_plan does not refuse it and paged_sessions_fit holds, with
+// kPagedFitShare for given sessions and the full pool (kAutoPagedFitShare) for sessions chosen here.
 inline SizeChoice choose_size(const ModelConfig& c, size_t weight_bytes, size_t scratch, bool drafter, long avail_mb,
                               long reserve_mb, int full_context, std::optional<int> sessions,
                               std::optional<int> max_context, bool auto_size = true, const KvPlanInputs& kv = {}) {
@@ -287,7 +292,8 @@ inline SizeChoice choose_size(const ModelConfig& c, size_t weight_bytes, size_t 
   s.sized = true;
   auto fits = [&](int n, int ctx) {
     const StartPlan p = start_plan(c, weight_bytes, scratch, drafter, n, ctx, avail_mb, reserve_mb, kv);
-    return p.refusal.empty() && (!kv.on || paged_sessions_fit(p.plan, n, ctx));
+    return p.refusal.empty() &&
+           (!kv.on || paged_sessions_fit(p.plan, n, ctx, sessions ? kPagedFitShare : kAutoPagedFitShare));
   };
   if (full_context <= 0) full_context = kDefaultContext;
   std::vector<int> contexts;
