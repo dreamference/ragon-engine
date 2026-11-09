@@ -206,4 +206,13 @@ if(RAGON_GRAMMAR)
   # ragon-grammar-bench: mask cost at the model's vocabulary (not a test).
   add_executable(ragon-grammar-bench bench/grammar_bench.cpp)
   target_link_libraries(ragon-grammar-bench PRIVATE ragon_grammar Threads::Threads)
+  # ragon-grammar-fuzz: libFuzzer over the compile front ends, under RAGON_SANITIZE with Clang
+  # (scripts/fuzz_grammar.sh configures and runs it).
+  if(RAGON_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_executable(ragon-grammar-fuzz tests/grammar_fuzz.cpp)
+    target_compile_options(ragon-grammar-fuzz PRIVATE -fsanitize=fuzzer)
+    target_link_options(ragon-grammar-fuzz PRIVATE -fsanitize=fuzzer)
+    target_link_libraries(ragon-grammar-fuzz PRIVATE ragon_grammar)
+    target_compile_options(ragon_grammar PRIVATE -fsanitize=fuzzer-no-link)  # coverage for the fuzzer
+  endif()
 endif()
