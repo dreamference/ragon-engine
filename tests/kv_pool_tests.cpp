@@ -187,7 +187,7 @@ void plan() {
   MemoryPlan p = plan_memory(c, weights, 4, 262144, true, true);
   const long pages = plan_kv_pool(p, c, 262144, avail, reserve, store, -1);
   std::printf("plan on node-b: four sessions at 262,144, pool %s\n", describe_kv_pool(p).c_str());
-  check(pages > 15800 && pages < 16000 && p.kv_pool_pages == pages, "node-b's pool is ~15,900 pages");
+  check(pages > 15600 && pages < 15800 && p.kv_pool_pages == pages, "node-b's pool is ~15,700 pages (P4f: each page's own cost)");
   check(p.kv_pool == size_t(pages + 1) * kv_page_bytes(c) + size_t(pages) * kKvPageOverheadBytes,
         "the pool's bytes count the reserved page and each page's own cost");
   check(refuse_start(p, avail, reserve).empty() && refuse_kv_pool(p, 262144).empty(), "paged: they start");

@@ -59,8 +59,8 @@ inline constexpr size_t kScratchBytes = size_t(4) << 30;
 // - CUDA graphs (--graphs): no term; with them 4 x 65,536 took 189 MiB less than without (the noise is ~200 MiB);
 // - per-session state: no term beyond session_bytes; the remainder was 3,146, 2,858 and 3,052 MiB at 1, 4 and 16
 //   sessions (images on), flat in the session count.
-// Checked against starts at 3 x 262,144 (no flags), 8 and 12 x 65,536 and 23 x 32,768: the measured start was within
-// -1.2 to +0.9 GB of planned_bytes (two identical starts differed by 2.2 GB, the drift of MemAvailable itself).
+// Checked with these values: the start with no flags (3 x 262,144) took 0.4 GiB more than planned_bytes, 12 x 65,536
+// 1.8 GiB less (two identical starts differed by 2.2 GB, the drift of MemAvailable itself).
 inline constexpr size_t kEngineFixedBytes = size_t(1920) << 20;
 inline constexpr size_t kVisionTowerBytes = size_t(896) << 20;
 inline constexpr size_t kKvPageOverheadBytes = size_t(54) << 10;
