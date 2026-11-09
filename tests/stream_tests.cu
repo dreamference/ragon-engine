@@ -417,6 +417,97 @@ bool test_gemm_wide() {
   return ok;
 }
 
+// LOWBIT §8 a1: the all-NVFP4 checkpoint's mixer projections (q|gate, k, v, o; in_qkv, in_z, out) stream as coded
+// NVFP4 blobs at the row buckets (1-16, NT3 17-24, 32, 33-64): every M's rows are bit for bit the 64-row launch's, the
+// coded blob's the raw blob's, and one multi launch over q|gate, k, v (and over in_qkv, in_z) gives each matrix's own.
+bool test_gemm_mixer_nvfp4() {
+  const int MMAX = ragon::kernels::kMaxStreamRows;
+  const std::tuple<const char*, int, int> shapes[] = {{"q|gate", 12288, 5120}, {"k/v", 1024, 5120},
+                                                      {"o/out", 5120, 6144},   {"in_qkv", 10240, 5120},
+                                                      {"in_z", 6144, 5120}};
+  struct Blob {
+    int N = 0, K = 0;
+    uint8_t *raw4 = nullptr, *coded = nullptr, *rawsc = nullptr, *tab = nullptr;
+  };
+  std::vector<Blob> blobs;
+  std::mt19937 rng(41);
+  std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  bool ok = true;
+  std::vector<float> x(size_t(MMAX) * 6144);
+  for (float& v : x) v = normal(rng);
+  float* dx = upload(x);
+  __half* xh;
+  float *xinv, *dy;
+  cudaMalloc(&xh, size_t(MMAX) * 6144 * sizeof(__half));
+  cudaMalloc(&xinv, MMAX * sizeof(float));
+  cudaMalloc(&dy, size_t(MMAX) * 12288 * sizeof(float));
+  for (const auto& [name, N, K] : shapes) {
+    std::vector<uint8_t> w4(size_t(N) * K / 2), s4(size_t(N) * K / 16);
+    for (auto& b : w4) b = byte(rng);
+    for (auto& b : s4) b = scale_byte(rng);
+    uint8_t table[ragon::kernels::kScaleCodes], code_of[256];
+    bool same = ragon::kernels::scale_code_table(s4.data(), s4.size(), table, code_of);
+    uint8_t *rw4 = upload(w4), *ds4 = upload(s4), *map = upload(std::vector<uint8_t>(code_of, code_of + 256));
+    Blob b;
+    b.N = N, b.K = K;
+    b.tab = upload(std::vector<uint8_t>(table, table + ragon::kernels::kScaleCodes));
+    cudaMalloc(&b.raw4, ragon::kernels::tiled_bytes_nvfp4(N, K));
+    cudaMalloc(&b.coded, ragon::kernels::tiled_bytes_nvfp4_coded(N, K));
+    cudaMalloc(&b.rawsc, s4.size());
+    ragon::kernels::retile_nvfp4(rw4, ds4, b.raw4, N, K, nullptr);
+    ragon::kernels::retile_nvfp4_coded(rw4, ds4, map, b.coded, b.rawsc, N, K, nullptr);
+    cudaFree(rw4), cudaFree(ds4), cudaFree(map);
+    const float gs = 1.f / 2048.f;
+    ragon::kernels::to_half_rows(dx, MMAX, K, xh, xinv, nullptr);
+    ragon::kernels::stream_gemm_nvfp4(xh, xinv, MMAX, b.coded, b.tab, gs, dy, N, K, nullptr);
+    const std::vector<float> full = download(dy, size_t(MMAX) * N);
+    for (int M : {1, 2, 8, 9, 12, 16, 17, 20, 24, 25, 32, 33, 40, 48, 63, 64}) {
+      ragon::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+      ragon::kernels::stream_gemm_nvfp4(xh, xinv, M, b.coded, b.tab, gs, dy, N, K, nullptr);
+      const std::vector<float> got = download(dy, size_t(M) * N);
+      same &= std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+      ragon::kernels::stream_gemm_nvfp4(xh, xinv, M, b.raw4, nullptr, gs, dy, N, K, nullptr);
+      same &= download(dy, size_t(M) * N) == got;
+    }
+    ok &= same;
+    std::printf("stream_gemm nvfp4 mixer %-6s (N=%d, K=%d) coded rows identical to M=64 and to the raw blob's, M = 1 .. "
+                "64: %s\n", name, N, K, same ? "yes ok" : "NO FAIL");
+    blobs.push_back(b);
+  }
+  // The row path's multi launches: q|gate, k, v (blobs 0, 1, 1) and in_qkv, in_z (3, 4), each target its single launch.
+  for (const std::vector<int>& group : {std::vector<int>{0, 1, 1}, std::vector<int>{3, 4}}) {
+    const int K = blobs[group[0]].K;
+    bool same = true;
+    for (int M : {1, 16, 24, 32, 48, 64}) {
+      ragon::kernels::to_half_rows(dx, M, K, xh, xinv, nullptr);
+      std::vector<float*> ys;
+      std::vector<ragon::kernels::StreamTarget> t;
+      for (size_t j = 0; j < group.size(); ++j) {
+        const Blob& b = blobs[group[j]];
+        float* y;
+        cudaMalloc(&y, size_t(M) * b.N * sizeof(float));
+        ys.push_back(y);
+        t.push_back({b.coded, b.tab, 0.25f + 0.125f * j, y, b.N});
+      }
+      ragon::kernels::stream_gemm_multi(true, xh, xinv, M, t.data(), static_cast<int>(t.size()), K, nullptr);
+      for (size_t j = 0; j < group.size(); ++j) {
+        const Blob& b = blobs[group[j]];
+        const auto got = download(ys[j], size_t(M) * b.N);
+        ragon::kernels::stream_gemm_nvfp4(xh, xinv, M, b.coded, b.tab, t[j].scale, dy, b.N, K, nullptr);
+        same &= download(dy, size_t(M) * b.N) == got;
+        cudaFree(ys[j]);
+      }
+    }
+    ok &= same;
+    std::printf("stream_gemm_multi nvfp4 mixer %s each target identical to its own launch (M = 1 .. 64): %s\n",
+                group.size() == 3 ? "q|gate, k, v" : "in_qkv, in_z", same ? "yes ok" : "NO FAIL");
+  }
+  for (Blob& b : blobs) cudaFree(b.raw4), cudaFree(b.coded), cudaFree(b.rawsc), cudaFree(b.tab);
+  cudaFree(dx), cudaFree(xh), cudaFree(xinv), cudaFree(dy);
+  return ok;
+}
+
 // BACKLOG 19's selection: every row a mask marks (two sessions' masks joined), then the `dynamic` best other rows by
 // the rank-256 scores (checked against the scores the kernel computed: no unselected row scores above a selected one),
 // in id order; and the mark kernel sets exactly the rows it is given.
@@ -1568,6 +1659,7 @@ int main(int argc, char** argv) {
   bool ok = test_to_half_rows();
   ok &= test_gemm();
   ok &= test_gemm_wide();
+  ok &= test_gemm_mixer_nvfp4();
   ok &= test_bf16_rows();
   ok &= test_sparse_select();
   ok &= test_draft_head_batch();

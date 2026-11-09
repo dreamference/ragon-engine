@@ -1373,7 +1373,7 @@ struct MaybePdl {  // pdl_begin() once per block, at the first read of the prede
 // after it in the same launch): the tiles' reduction buffer in dynamic shared memory, the tail's norm counted (word
 // kMkGdnNormDone, which the FFN's first tiles wait for), and the counters left for the spanning kernel to reset.
 constexpr int kMkGdnNormDone = 11;  // the other spare word of kMkGdnWords
-template <int NT, bool TAIL, int PF, bool SPAN>
+template <int NT, bool TAIL, int PF, bool SPAN, int W4 = 0>
 __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   const int G = gridDim.x, bid = blockIdx.x;
   unsigned* c = a.c;
@@ -1407,7 +1407,7 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   for (;;) {
     const int i = mk_take(&c[kQkvQueue]);
     if (i >= a.n_qkv) break;
-    stream_gemm_body<NT, 2, false, PF, false, false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0,
+    stream_gemm_body<NT, 2, (W4 != 0), PF, (W4 == 1), false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, i, 0,
                                                           MaybePdl{&waited});
     if (a.lt) mk_lora_tile(a, 0, i * 32);
     mk_done(&c[kQkvDone]);
@@ -1468,14 +1468,14 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   for (;;) {
     const int j = mk_take(&c[kZQueue]);
     if (j >= a.n_z) break;
-    stream_gemm_body<NT, 2, false, PF, false, false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, a.n_qkv + j, 0,
+    stream_gemm_body<NT, 2, (W4 != 0), PF, (W4 == 1), false, SPAN>(a.xh, a.xinv, a.M, a.inp, a.K, 1, nullptr, a.n_qkv + j, 0,
                                                           MaybePdl{&waited});
     if (a.lt) mk_lora_tile(a, 1, j * 32);
     mk_done(&c[kZDone]);
   }
   MaybePdl{&waited}();
   MK_STAMP(5)
-  mk_prefetch_tiles(a.outp.w[0], false, false, a.outp.N[0], a.Vs, bid, G, a.n_out, a.pref);
+  mk_prefetch_tiles(a.outp.w[0], W4 != 0, W4 == 1, a.outp.N[0], a.Vs, bid, G, a.n_out, a.pref);
   mk_wait(&c[kZDone], a.n_z);
   mk_wait(&c[kRecDone], a.chain);
   MK_STAMP(6)
@@ -1527,7 +1527,7 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   // The out-projection, b, b + G, ... after every block's FP16 rows.
   for (int i = bid; i < a.n_out; i += G) {
     __syncthreads();
-    stream_gemm_body<NT, 2, false, PF, false, TAIL, SPAN>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
+    stream_gemm_body<NT, 2, (W4 != 0), PF, (W4 == 1), TAIL, SPAN>(a.xh2, a.xinv2, a.M, a.outp, a.Vs, 1, nullptr, i, 0,
                                                          CounterWaitMk{&c[kHalfDone], static_cast<unsigned>(G), i == bid});
     if constexpr (TAIL) mk_done(&c[kMkGdnOutDone]);
   }
@@ -1549,32 +1549,32 @@ __device__ __forceinline__ void gdn_mixer_body(const MkGdnArgs& a) {
   }
 }
 
-template <int NT, bool TAIL = false>
+template <int NT, bool TAIL = false, int W4 = 0>
 __global__ void __launch_bounds__(kWarps * 32, 1) gdn_persistent_kernel(MkGdnArgs a) {
-  gdn_mixer_body<NT, TAIL, 2, false>(a);
+  gdn_mixer_body<NT, TAIL, 2, false, W4>(a);
 }
 
-template <int NT, bool TAIL = false>
+template <int NT, bool TAIL = false, int W4 = 0>
 int mk_gdn_resident() {
   static const int r = [] {
     int per_sm = 0, sms = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_persistent_kernel<NT, TAIL>, kWarps * 32, 0);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_persistent_kernel<NT, TAIL, W4>, kWarps * 32, 0);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     return per_sm * sms;
   }();
   return r;
 }
 
-template <int NT, bool TAIL = false>
+template <int NT, bool TAIL = false, int W4 = 0>
 void mk_gdn_launch(MkGdnArgs& a, cudaStream_t s) {
-  const int G = mk_gdn_resident<NT, TAIL>();
+  const int G = mk_gdn_resident<NT, TAIL, W4>();
   if (G < 2 * a.chain || G < 1 || (TAIL && G < a.M)) throw std::runtime_error("gdn_persistent: too few resident blocks");
   static bool told = false;
   if (!told) {
     told = true;
     std::fprintf(stderr, "megakernel stage 2: gdn_persistent<%d> on %d blocks, %d of them the chain's\n", NT, G, a.chain);
   }
-  launch_kernel("gdn_persistent", gdn_persistent_kernel<NT, TAIL>, dim3(G), dim3(kWarps * 32), 0, s, a);
+  launch_kernel("gdn_persistent", gdn_persistent_kernel<NT, TAIL, W4>, dim3(G), dim3(kWarps * 32), 0, s, a);
 }
 
 // ---- The megakernel's stage 3 in the step: a full-attention layer as one persistent kernel (RAGON_MK_ATTN) ----
@@ -1712,13 +1712,13 @@ __device__ __noinline__ void mk_attn_range(const float* q, const __nv_bfloat16* 
   attention_mma_body<kMkAttnRows, kMkAttnTk, kMkAttnNs, false, true>(q, kc, vc, p0, M, Hq, Hkv, S, chunk, scratch, hs, ps,
                                                                     pf, rb, j, s, td, pages);
 }
-template <int NT, int PF>
+template <int NT, int PF, int W4 = 0>
 __device__ __noinline__ void mk_attn_tile(const __half* x, const float* xinv, int M, const StreamProblems& pr, int K,
                                           int bx, const unsigned* c, unsigned target, bool* waited) {
-  stream_gemm_body<NT, 2, false, PF, false>(x, xinv, M, pr, K, 1, nullptr, bx, 0, MkTileWait{c, target, waited});
+  stream_gemm_body<NT, 2, (W4 != 0), PF, (W4 == 1)>(x, xinv, M, pr, K, 1, nullptr, bx, 0, MkTileWait{c, target, waited});
 }
 
-template <int NT, int PF>
+template <int NT, int PF, int W4 = 0>
 __global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnArgs a) {
   unsigned* c = a.c;
   bool waited = false;
@@ -1744,7 +1744,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnA
       const int bx = it.i < nq ? j * nq + it.i
                      : it.i < nq + a.kvtiles ? a.qkv.block0[1] + j * a.kvtiles + (it.i - nq)
                                              : a.qkv.block0[2] + j * a.kvtiles + (it.i - nq - a.kvtiles);
-      mk_attn_tile<NT, PF>(a.xh, a.xinv, a.M, a.qkv, a.K, bx, nullptr, 0u, &waited);
+      mk_attn_tile<NT, PF, W4>(a.xh, a.xinv, a.M, a.qkv, a.K, bx, nullptr, 0u, &waited);
       mk_done_ev(&c[kAtQkv + j], TQ, ev ? ev + 1 + j : nullptr);
     } else if (it.kind == 1) {  // prepare: one slot of group j for four rows
       MaybePdl{&waited}();
@@ -1798,7 +1798,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnA
       if (threadIdx.x == 0) atomicExch(a.xinv2 + m, ldexpf(1.f, e - 15));
       mk_done_ev(&c[kAtHalf], a.M, ev ? ev + 2 + 3 * kMkMaxKv : nullptr);
     } else if (it.kind == 5) {  // an out-projection tile, after every FP16 row
-      mk_attn_tile<NT, PF>(a.xh2, a.xinv2, a.M, a.outp, a.Hq * D, it.i, &c[kAtHalf], static_cast<unsigned>(a.M), &waited);
+      mk_attn_tile<NT, PF, W4>(a.xh2, a.xinv2, a.M, a.outp, a.Hq * D, it.i, &c[kAtHalf], static_cast<unsigned>(a.M), &waited);
       mk_done_ev(&c[kAtOut], a.n_out, ev ? ev + 3 + 3 * kMkMaxKv : nullptr);
     } else {  // the tail's row m, after every out-projection tile: the residual add, then the post-attention norm
       MaybePdl{&waited}();
@@ -1817,23 +1817,23 @@ __global__ void __launch_bounds__(kWarps * 32, 1) attn_persistent_kernel(MkAttnA
 
 constexpr size_t kMkAttnSmem = mma_smem(kMkAttnTk, kMkAttnNs);  // the attention ring; the prepare step's row too
 
-template <int NT, int PF>
+template <int NT, int PF, int W4 = 0>
 int mk_attn_resident() {
   static const int r = [] {
-    cudaFuncSetAttribute(attn_persistent_kernel<NT, PF>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    cudaFuncSetAttribute(attn_persistent_kernel<NT, PF, W4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(kMkAttnSmem));
     int per_sm = 0, sms = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, attn_persistent_kernel<NT, PF>, kWarps * 32, kMkAttnSmem);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, attn_persistent_kernel<NT, PF, W4>, kWarps * 32, kMkAttnSmem);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     return per_sm * sms;
   }();
   return r;
 }
 
-template <int NT, int PF>
+template <int NT, int PF, int W4 = 0>
 void mk_attn_launch(MkAttnArgs& a, cudaStream_t s) {
   static const int blocks_env = sg_env("RAGON_MK_ATTN_BLOCKS", 0);
-  const int resident = mk_attn_resident<NT, PF>();
+  const int resident = mk_attn_resident<NT, PF, W4>();
   const int G = blocks_env > 0 ? std::min(blocks_env, resident) : resident;
   if (G < 1) throw std::runtime_error("attn_persistent: no resident block");
   static bool told = false;
@@ -1842,7 +1842,7 @@ void mk_attn_launch(MkAttnArgs& a, cudaStream_t s) {
     std::fprintf(stderr, "megakernel stage 3: attn_persistent<%d, PF %d> on %d blocks (%d resident)\n", NT, PF, G,
                  resident);
   }
-  launch_kernel("attn_persistent", attn_persistent_kernel<NT, PF>, dim3(G), dim3(kWarps * 32), kMkAttnSmem, s, a);
+  launch_kernel("attn_persistent", attn_persistent_kernel<NT, PF, W4>, dim3(G), dim3(kWarps * 32), kMkAttnSmem, s, a);
 }
 
 
@@ -1860,33 +1860,33 @@ void mk_attn_launch(MkAttnArgs& a, cudaStream_t s) {
 // The two halves as calls (RAGON_MK_SPAN=2, the default of the switch's on values: window 4 measured the inlined form
 // 0.6-1.5 ms slower than the two launches, its FFN tiles spilling around the mixer's live values); each then has the
 // register file to itself, as in its own kernel. NOINL false: both inlined (RAGON_MK_SPAN=1).
-template <int NT, int PFG>
+template <int NT, int PFG, int W4 = 0>
 __device__ __noinline__ void mk_span_mixer(const MkGdnArgs& g) {
-  gdn_mixer_body<NT, true, PFG, true>(g);
+  gdn_mixer_body<NT, true, PFG, true, W4>(g);
 }
 template <int NT, bool CODED, int PFF>
 __device__ __noinline__ void mk_span_ffn(const MkFfnArgs& f) {
   ffn_body<NT, CODED, true, PFF, true>(f);
 }
-template <int NT, bool CODED, int PFG, int PFF, bool NOINL = false>
+template <int NT, bool CODED, int PFG, int PFF, bool NOINL = false, int W4 = 0>
 __global__ void __launch_bounds__(kWarps * 32, 1)
     gdn_ffn_persistent_kernel(const __grid_constant__ MkGdnArgs g, const __grid_constant__ MkFfnArgs f) {
   if constexpr (NOINL) {
-    mk_span_mixer<NT, PFG>(g);
+    mk_span_mixer<NT, PFG, W4>(g);
     mk_span_ffn<NT, CODED, PFF>(f);
   } else {
-    gdn_mixer_body<NT, true, PFG, true>(g);
+    gdn_mixer_body<NT, true, PFG, true, W4>(g);
     ffn_body<NT, CODED, true, PFF, true>(f);
   }
 }
 
 constexpr size_t kMkSpanSmem = sizeof(float) * kWarps * 2 * 16 * (2 * 8 + 1);  // the tiles' reduction buffer at NT 2
 
-template <int NT, bool CODED, int PFG, int PFF, bool NOINL>
+template <int NT, bool CODED, int PFG, int PFF, bool NOINL, int W4 = 0>
 int mk_span_resident() {
   static const int r = [] {
     int per_sm = 0, sms = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF, NOINL>, kWarps * 32,
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF, NOINL, W4>, kWarps * 32,
                                                   kMkSpanSmem);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     return per_sm * sms;
@@ -1894,9 +1894,9 @@ int mk_span_resident() {
   return r;
 }
 
-template <int NT, bool CODED, int PFG, int PFF, bool NOINL>
+template <int NT, bool CODED, int PFG, int PFF, bool NOINL, int W4 = 0>
 void mk_span_launch(MkGdnArgs& g, MkFfnArgs& f, cudaStream_t s) {
-  const int G = mk_span_resident<NT, CODED, PFG, PFF, NOINL>();
+  const int G = mk_span_resident<NT, CODED, PFG, PFF, NOINL, W4>();
   if (G < 2 * g.chain || G < g.M) throw std::runtime_error("gdn_ffn_persistent: too few resident blocks");
   static bool told = false;
   if (!told) {
@@ -1904,7 +1904,7 @@ void mk_span_launch(MkGdnArgs& g, MkFfnArgs& f, cudaStream_t s) {
     std::fprintf(stderr, "megakernel stage 4: gdn_ffn_persistent<%d, PF %d/%d%s> on %d blocks\n", NT, PFG, PFF,
                  NOINL ? ", calls" : "", G);
   }
-  launch_kernel("gdn_ffn_persistent", gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF, NOINL>, dim3(G), dim3(kWarps * 32),
+  launch_kernel("gdn_ffn_persistent", gdn_ffn_persistent_kernel<NT, CODED, PFG, PFF, NOINL, W4>, dim3(G), dim3(kWarps * 32),
                 kMkSpanSmem, s, g, f);
 }
 
@@ -2071,7 +2071,7 @@ static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
     a.inp.gscale[i] = it[i]->scale;
     a.inp.y[i] = it[i]->y;
     a.inp.N[i] = it[i]->N;
-    a.inp.table[i] = nullptr;
+    a.inp.table[i] = p.fp4 ? it[i]->wscale : nullptr;
     a.inp.block0[i] = blocks;
     blocks += it[i]->N / 32;
   }
@@ -2102,7 +2102,9 @@ static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
   a.outp.gscale[0] = p.out.scale;
   a.outp.y[0] = p.out.y;
   a.outp.N[0] = p.out.N;
-  a.outp.table[0] = nullptr;
+  a.outp.table[0] = p.fp4 ? p.out.wscale : nullptr;
+  // LOWBIT §8 a1: the NVFP4 projections run one kind of tiles, coded (W4 1) or raw (W4 2); a mix takes the unfused path.
+  if (p.fp4 && (!a.inp.table[1] != !a.inp.table[0] || !a.outp.table[0] != !a.inp.table[0])) return false;
   a.outp.block0[0] = 0;
   a.outp.count = 1;
   a.n_out = p.out.N / 32;
@@ -2135,10 +2137,23 @@ static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
   return true;
 }
 
+// LOWBIT §8 a1: the NVFP4 mixer's launch at its row bucket, W4 1 (coded tiles) or 2 (raw tiles).
+template <int W4>
+static void mk_gdn_launch_w4(MkGdnArgs& a, const MkGdnParams& p, cudaStream_t s) {
+  if (p.tail) mk_gdn_launch<2, true, W4>(a, s);
+  else if (p.M <= 8) mk_gdn_launch<1, false, W4>(a, s);
+  else if (p.M <= 16) mk_gdn_launch<2, false, W4>(a, s);
+  else if (p.M <= 24 && nt3_on()) mk_gdn_launch<3, false, W4>(a, s);
+  else mk_gdn_launch<4, false, W4>(a, s);
+}
+
 bool gdn_persistent(const MkGdnParams& p, cudaStream_t s) {
   MkGdnArgs a;
   if (!gdn_build(p, a)) return false;
-  if (p.tail) mk_gdn_launch<2, true>(a, s);
+  if (p.fp4) {  // LOWBIT §8 a1
+    if (a.inp.table[0]) mk_gdn_launch_w4<1>(a, p, s);
+    else mk_gdn_launch_w4<2>(a, p, s);
+  } else if (p.tail) mk_gdn_launch<2, true>(a, s);
   else if (p.M <= 8) mk_gdn_launch<1>(a, s);
   else if (p.M <= 16) mk_gdn_launch<2>(a, s);
   else if (p.M <= 24 && nt3_on()) mk_gdn_launch<3>(a, s);
@@ -2229,11 +2244,34 @@ bool ffn_persistent(const __half* xh, const float* xinv, int M, const StreamTarg
 }
 
 
+// The NVFP4 tile kinds: f(std::integral_constant<int, 1>) for coded tiles, then 2 for raw ones.
+template <class F>
+static void for_w4(F f) {
+  f(std::integral_constant<int, 1>{});
+  f(std::integral_constant<int, 2>{});
+}
+
+// LOWBIT §8 a1: the NVFP4 attention stage's launch, W4 1 (coded tiles) or 2 (raw tiles).
+template <int W4>
+static void mk_attn_launch_w4(MkAttnArgs& a, int M, int pf, cudaStream_t s) {
+  if (M <= 8) mk_attn_launch<1, 2, W4>(a, s);
+  else if (pf == 4) mk_attn_launch<2, 4, W4>(a, s);
+  else if (pf == 3) mk_attn_launch<2, 3, W4>(a, s);
+  else mk_attn_launch<2, 2, W4>(a, s);
+}
+
 void attn_persistent_prepare() {  // the dynamic shared memory attribute, once, outside any graph capture
   mk_attn_resident<1, 2>();
   mk_attn_resident<2, 2>();
   mk_attn_resident<2, 3>();
   mk_attn_resident<2, 4>();
+  for_w4([](auto w) {  // LOWBIT §8 a1: the NVFP4 variants, coded and raw tiles
+    constexpr int W = decltype(w)::value;
+    mk_attn_resident<1, 2, W>();
+    mk_attn_resident<2, 2, W>();
+    mk_attn_resident<2, 3, W>();
+    mk_attn_resident<2, 4, W>();
+  });
 }
 
 bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
@@ -2255,7 +2293,7 @@ bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
     a.qkv.gscale[i] = it[i]->scale;
     a.qkv.y[i] = it[i]->y;
     a.qkv.N[i] = it[i]->N;
-    a.qkv.table[i] = nullptr;
+    a.qkv.table[i] = p.fp4 ? it[i]->wscale : nullptr;
     a.qkv.block0[i] = blocks;
     blocks += it[i]->N / 32;
   }
@@ -2294,7 +2332,9 @@ bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
   a.outp.gscale[0] = p.o.scale;
   a.outp.y[0] = p.o.y;
   a.outp.N[0] = p.o.N;
-  a.outp.table[0] = nullptr;
+  a.outp.table[0] = p.fp4 ? p.o.wscale : nullptr;
+  const bool coded4 = a.qkv.table[0] != nullptr;  // one kind of tiles, coded or raw; a mix takes the unfused path
+  if (p.fp4 && (!a.qkv.table[1] != !coded4 || !a.qkv.table[2] != !coded4 || !a.outp.table[0] != !coded4)) return false;
   a.outp.block0[0] = 0;
   a.outp.count = 1;
   a.n_out = p.o.N / 32;
@@ -2309,7 +2349,10 @@ bool attn_persistent(const MkAttnParams& p, cudaStream_t s) {
     a.t_xinv = p.tail->xinv;
     a.t_eps = p.tail->eps;
   }
-  if (p.M <= 8) {
+  if (p.fp4) {  // LOWBIT §8 a1: the NVFP4 projections' tiles
+    if (coded4) mk_attn_launch_w4<1>(a, p.M, pf, s);
+    else mk_attn_launch_w4<2>(a, p.M, pf, s);
+  } else if (p.M <= 8) {
     mk_attn_launch<1, 2>(a, s);
   } else {
     if (pf == 4) mk_attn_launch<2, 4>(a, s);
@@ -2337,8 +2380,15 @@ bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const S
   fa.c2 = gp.counters;
   fa.c2_words = kMkGdnWords;
   const bool coded = gate.wscale != nullptr;
+  if (gp.fp4 && !coded) return false;  // LOWBIT §8 a1: the NVFP4 mixer (coded or raw tiles) beside a coded FFN only
+  const bool coded4 = ga.inp.table[0] != nullptr;
 #define RAGON_SPAN(PG, PFF_)                                                                                    \
   if (pfg == PG && pff == PFF_) {                                                                              \
+    if (gp.fp4) {                                                                                              \
+      if (coded4) noinl ? mk_span_launch<2, true, PG, PFF_, true, 1>(ga, fa, s) : mk_span_launch<2, true, PG, PFF_, false, 1>(ga, fa, s); \
+      else noinl ? mk_span_launch<2, true, PG, PFF_, true, 2>(ga, fa, s) : mk_span_launch<2, true, PG, PFF_, false, 2>(ga, fa, s); \
+      return true;                                                                                             \
+    }                                                                                                          \
     if (noinl) coded ? mk_span_launch<2, true, PG, PFF_, true>(ga, fa, s) : mk_span_launch<2, false, PG, PFF_, true>(ga, fa, s); \
     else coded ? mk_span_launch<2, true, PG, PFF_, false>(ga, fa, s) : mk_span_launch<2, false, PG, PFF_, false>(ga, fa, s); \
     return true;                                                                                               \

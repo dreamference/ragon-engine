@@ -401,7 +401,8 @@ struct MkGdnParams {
   const float* xinv;
   const float* xn;
   int M, K;  // rows; the hidden size (the projections' K and the out-projection's N)
-  StreamTarget in_qkv, in_z, out;  // FP8
+  StreamTarget in_qkv, in_z, out;  // FP8, or NVFP4 with fp4 (their wscale the scale tables)
+  bool fp4 = false;                // LOWBIT §8 a1: the projections in NVFP4
   const __nv_bfloat16 *wa, *wb;    // [HV][K] each
   float *a, *b, *g, *beta;
   const __nv_bfloat16 *A_log, *dt_bias;
@@ -563,7 +564,8 @@ struct MkAttnParams {
   const __half* xh;
   const float* xinv;
   int M, K;                     // rows; the hidden size (q|k|v's K, o's N)
-  StreamTarget q, k, v, o;      // FP8; q is q|gate per head [Hq][2 D]
+  StreamTarget q, k, v, o;      // FP8 (NVFP4 with fp4); q is q|gate per head [Hq][2 D]
+  bool fp4 = false;             // LOWBIT §8 a1: the projections in NVFP4
   int Hq, Hkv, D, rot;
   float theta, eps;
   const __nv_bfloat16 *q_norm, *k_norm;

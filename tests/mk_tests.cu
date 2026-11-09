@@ -93,16 +93,52 @@ uint8_t* fp4_matrix(std::mt19937_64& rng, int N, int K) {
   return tiled;
 }
 
-int attention_layer(std::mt19937_64& rng, int M, int pos0, bool tail) {
+// LOWBIT §8 a1: a random NVFP4 matrix [N][K] as a coded blob (B26's 6-bit scale codes) and its code table, the form the
+// all-NVFP4 checkpoint's mixer projections load in.
+struct Coded {
+  uint8_t* w = nullptr;
+  uint8_t* table = nullptr;
+};
+Coded fp4_coded(std::mt19937_64& rng, int N, int K) {
+  std::vector<uint8_t> v(size_t(N) * K / 2), sc(size_t(N) * K / 16);
+  std::uniform_int_distribution<int> byte(0, 255);
+  std::uniform_real_distribution<float> u(0.002f, 0.05f);
+  for (uint8_t& b : v) b = uint8_t(byte(rng));
+  for (uint8_t& b : sc) b = __nv_fp8_e4m3(u(rng)).__x;
+  uint8_t table[k::kScaleCodes], code_of[256];
+  if (!k::scale_code_table(sc.data(), sc.size(), table, code_of)) return {};
+  uint8_t *dv = upload(v), *ds = upload(sc), *map = upload(std::vector<uint8_t>(code_of, code_of + 256)), *raw = nullptr;
+  Coded c;
+  c.table = upload(std::vector<uint8_t>(table, table + k::kScaleCodes));
+  cudaMalloc(&c.w, k::tiled_bytes_nvfp4_coded(N, K));
+  cudaMalloc(&raw, sc.size());
+  k::retile_nvfp4_coded(dv, ds, map, c.w, raw, N, K, nullptr);
+  cudaDeviceSynchronize();
+  cudaFree(dv), cudaFree(ds), cudaFree(map), cudaFree(raw);
+  return c;
+}
+
+// A mixer projection in NVFP4: fp4 1 a coded blob, 2 a raw one (no table; a tensor with more distinct scales than the
+// code table holds, which the loader uploads raw with the rest of its megakernel group).
+Coded fp4_mixer(std::mt19937_64& rng, int N, int K, int fp4) {
+  if (fp4 == 1) return fp4_coded(rng, N, K);
+  Coded c;
+  c.w = fp4_matrix(rng, N, K);
+  return c;
+}
+
+int attention_layer(std::mt19937_64& rng, int M, int pos0, bool tail, int fp4 = 0) {
   const int H = 5120, Hq = 24, Hkv = 4, D = 256, rot = 64, qsize = Hq * D, kvsize = Hkv * D, ctx = 65536;
   const float theta = 1e7f, eps = 1e-6f;
   k::set_kv_layout(size_t(ctx) * D, D);  // head-major, as the engine sets it
   // Weights (per-tensor scales as a checkpoint's), norms, and the input norm's output.
-  uint8_t* wq = fp8_matrix(rng, 2 * qsize, H, 0.4f);
-  uint8_t* wk = fp8_matrix(rng, kvsize, H, 0.4f);
-  uint8_t* wv = fp8_matrix(rng, kvsize, H, 0.4f);
-  uint8_t* wo = fp8_matrix(rng, H, qsize, 0.4f);
-  const float sq = 0.003f, sk = 0.0031f, sv = 0.0029f, so = 0.0027f;
+  Coded cq, ck, cv, co;  // fp4: the projections as NVFP4 blobs, 1 coded, 2 raw (their tables; nullptr for FP8 and raw)
+  uint8_t* wq = fp4 ? (cq = fp4_mixer(rng, 2 * qsize, H, fp4)).w : fp8_matrix(rng, 2 * qsize, H, 0.4f);
+  uint8_t* wk = fp4 ? (ck = fp4_mixer(rng, kvsize, H, fp4)).w : fp8_matrix(rng, kvsize, H, 0.4f);
+  uint8_t* wv = fp4 ? (cv = fp4_mixer(rng, kvsize, H, fp4)).w : fp8_matrix(rng, kvsize, H, 0.4f);
+  uint8_t* wo = fp4 ? (co = fp4_mixer(rng, H, qsize, fp4)).w : fp8_matrix(rng, H, qsize, 0.4f);
+  const float sq = fp4 ? 0.3f : 0.003f, sk = fp4 ? 0.31f : 0.0031f, sv = fp4 ? 0.29f : 0.0029f,
+              so = fp4 ? 0.27f : 0.0027f;
   __nv_bfloat16* q_norm = upload(bf16_random(rng, D, -0.3f, 0.3f));
   __nv_bfloat16* k_norm = upload(bf16_random(rng, D, -0.3f, 0.3f));
   __nv_bfloat16* in_norm = upload(bf16_random(rng, H, -0.3f, 0.3f));
@@ -141,16 +177,17 @@ int attention_layer(std::mt19937_64& rng, int M, int pos0, bool tail) {
   int* pos_dev = upload(std::vector<int>{pos0});
   const k::DevPos dpos(pos0, pos_dev, 0);  // as a captured graph passes it
   // The graph path (engine.cpp's attention branch, rows path).
-  const k::StreamTarget tq{wq, nullptr, sq, qg[0], 2 * qsize}, tk{wk, nullptr, sk, kk[0], kvsize},
-      tv{wv, nullptr, sv, vv[0], kvsize};
+  const k::StreamTarget tq{wq, cq.table, sq, qg[0], 2 * qsize}, tk{wk, ck.table, sk, kk[0], kvsize},
+      tv{wv, cv.table, sv, vv[0], kvsize};
   const k::StreamTarget t3[3] = {tq, tk, tv};
-  k::stream_gemm_multi(false, xh, xinv, M, t3, 3, H, nullptr);
+  k::stream_gemm_multi(fp4, xh, xinv, M, t3, 3, H, nullptr);
   k::attn_prepare(qg[0], kk[0], vv[0], q_norm, k_norm, dpos, M, Hq, Hkv, D, rot, theta, eps, q[0], gate[0], kc[0], vc[0],
                   nullptr);
   k::attention_rows(q[0], kc[0], vc[0], dpos, M, Hq, Hkv, D, scratch[0], attn[0], nullptr, ctx);
   k::sigmoid_mul(attn[0], gate[0], M * qsize, nullptr);
   k::to_half_rows(attn[0], M, qsize, xho[0], xinvo[0], nullptr);
-  k::stream_gemm_fp8(xho[0], xinvo[0], M, wo, so, y[0], H, qsize, nullptr);
+  if (fp4) k::stream_gemm_nvfp4(xho[0], xinvo[0], M, wo, co.table, so, y[0], H, qsize, nullptr);
+  else k::stream_gemm_fp8(xho[0], xinvo[0], M, wo, so, y[0], H, qsize, nullptr);
   // Stage 4's reference: the residual add and the post-attention norm as their own kernels.
   __nv_bfloat16* post_norm = upload(bf16_random(rng, H, -0.3f, 0.3f));
   float *hres[2], *pn[2], *pinv[2];
@@ -181,10 +218,11 @@ int attention_layer(std::mt19937_64& rng, int M, int pos0, bool tail) {
     p.xinv = xinv;
     p.M = M;
     p.K = H;
-    p.q = {wq, nullptr, sq, qg[1], 2 * qsize};
-    p.k = {wk, nullptr, sk, kk[1], kvsize};
-    p.v = {wv, nullptr, sv, vv[1], kvsize};
-    p.o = {wo, nullptr, so, y[1], H};
+    p.q = {wq, cq.table, sq, qg[1], 2 * qsize};
+    p.k = {wk, ck.table, sk, kk[1], kvsize};
+    p.v = {wv, cv.table, sv, vv[1], kvsize};
+    p.o = {wo, co.table, so, y[1], H};
+    p.fp4 = fp4;
     p.Hq = Hq;
     p.Hkv = Hkv;
     p.D = D;
@@ -310,15 +348,19 @@ int ffn_tail(std::mt19937_64& rng, int M, bool norm) {
 // Stage 4 (RAGON_MK_SPAN): a DeltaNet layer's mixer and FFN in one launch against gdn_persistent and ffn_persistent with
 // their tails (each checked against the graph path's kernels), bit for bit: the residual stream, the next norm and the
 // mixer's intermediates.
-int span_layer(std::mt19937_64& rng, int M) {
+int span_layer(std::mt19937_64& rng, int M, int fp4 = 0) {
   const int H = 5120, I = 17408, Hk = 16, HV = 48, Dk = 128, C = 2 * Hk * Dk + HV * Dk, Vs = HV * Dk;
   const float eps = 1e-6f;
-  uint8_t* wqkv = fp8_matrix(rng, C, H, 0.4f);
-  uint8_t* wz = fp8_matrix(rng, Vs, H, 0.4f);
-  uint8_t* wout = fp8_matrix(rng, H, Vs, 0.4f);
-  uint8_t* wg = fp4_matrix(rng, I, H);
-  uint8_t* wu = fp4_matrix(rng, I, H);
-  uint8_t* wd = fp4_matrix(rng, H, I);
+  // fp4 (LOWBIT §8 a1): the mixer's projections as NVFP4 blobs (1 coded, 2 raw) and the FFN coded (the span takes a
+  // coded FFN then).
+  Coded cqkv, cz, cout, cg, cu, cd;
+  uint8_t* wqkv = fp4 ? (cqkv = fp4_mixer(rng, C, H, fp4)).w : fp8_matrix(rng, C, H, 0.4f);
+  uint8_t* wz = fp4 ? (cz = fp4_mixer(rng, Vs, H, fp4)).w : fp8_matrix(rng, Vs, H, 0.4f);
+  uint8_t* wout = fp4 ? (cout = fp4_mixer(rng, H, Vs, fp4)).w : fp8_matrix(rng, H, Vs, 0.4f);
+  uint8_t* wg = fp4 ? (cg = fp4_coded(rng, I, H)).w : fp4_matrix(rng, I, H);
+  uint8_t* wu = fp4 ? (cu = fp4_coded(rng, I, H)).w : fp4_matrix(rng, I, H);
+  uint8_t* wd = fp4 ? (cd = fp4_coded(rng, H, I)).w : fp4_matrix(rng, H, I);
+  const float s_qkv = fp4 ? 0.3f : 0.003f, s_z = fp4 ? 0.31f : 0.0031f, s_out = fp4 ? 0.29f : 0.0029f;
   __nv_bfloat16* wa = upload(bf16_random(rng, size_t(HV) * H, -0.02f, 0.02f));
   __nv_bfloat16* wb = upload(bf16_random(rng, size_t(HV) * H, -0.02f, 0.02f));
   __nv_bfloat16* A_log = upload(bf16_random(rng, HV, -1.f, 1.f));
@@ -370,9 +412,10 @@ int span_layer(std::mt19937_64& rng, int M) {
     p.xn = b.xn;
     p.M = M;
     p.K = H;
-    p.in_qkv = {wqkv, nullptr, 0.003f, b.vpre, C};
-    p.in_z = {wz, nullptr, 0.0031f, b.z, Vs};
-    p.out = {wout, nullptr, 0.0029f, nullptr, H};
+    p.in_qkv = {wqkv, cqkv.table, s_qkv, b.vpre, C};
+    p.in_z = {wz, cz.table, s_z, b.z, Vs};
+    p.out = {wout, cout.table, s_out, nullptr, H};
+    p.fp4 = fp4;
     p.wa = wa;
     p.wb = wb;
     p.a = b.a;
@@ -401,9 +444,9 @@ int span_layer(std::mt19937_64& rng, int M) {
     p.tail = tail;
     return p;
   };
-  const k::StreamTarget tg[2] = {{wg, nullptr, 0.9f, B[0].t1, I}, {wg, nullptr, 0.9f, B[1].t1, I}};
-  const k::StreamTarget tu[2] = {{wu, nullptr, 1.1f, B[0].t2, I}, {wu, nullptr, 1.1f, B[1].t2, I}};
-  const k::StreamTarget td[2] = {{wd, nullptr, 0.7f, B[0].t2, H}, {wd, nullptr, 0.7f, B[1].t2, H}};
+  const k::StreamTarget tg[2] = {{wg, cg.table, 0.9f, B[0].t1, I}, {wg, cg.table, 0.9f, B[1].t1, I}};
+  const k::StreamTarget tu[2] = {{wu, cu.table, 1.1f, B[0].t2, I}, {wu, cu.table, 1.1f, B[1].t2, I}};
+  const k::StreamTarget td[2] = {{wd, cd.table, 0.7f, B[0].t2, H}, {wd, cd.table, 0.7f, B[1].t2, H}};
   // The two launches.
   const k::MkTail post0{B[0].h, post_norm, B[0].xn, B[0].xh3, B[0].xinv3, eps};
   const k::MkTail next0{B[0].h, next_norm, B[0].xn, B[0].xh, B[0].xinv, eps};
@@ -463,6 +506,38 @@ int main() {
     }
     bad = span_layer(rng, M);
     std::printf("DeltaNet layer in one launch, %d rows: %s\n", M, bad ? "DIFFERS" : "bit for bit");
+    failed += bad != 0;
+  }
+  // LOWBIT §8 a1: the same layers with the projections in NVFP4 (coded blobs), M = 8 too (the NT = 1 launches).
+  for (int M : {16, 12, 8})
+    for (int pos : {100, 4090, 24000}) {
+      const int bad = attention_layer(rng, M, pos, false, true);
+      std::printf("attention layer, NVFP4 projections, %d rows at %d: %s\n", M, pos, bad ? "DIFFERS" : "bit for bit");
+      failed += bad != 0;
+    }
+  for (int M : {16, 12}) {
+    int bad = attention_layer(rng, M, 24000, true, true);
+    std::printf("attention layer with its tail, NVFP4 projections, %d rows at 24000: %s\n", M,
+                bad ? "DIFFERS" : "bit for bit");
+    failed += bad != 0;
+    bad = span_layer(rng, M, true);
+    std::printf("DeltaNet layer in one launch, NVFP4 projections, %d rows: %s\n", M, bad ? "DIFFERS" : "bit for bit");
+    failed += bad != 0;
+  }
+  // The raw blobs (no scale codes) at the row buckets the decode takes, with and without the tail.
+  for (int M : {16, 8})
+    for (int pos : {100, 24000}) {
+      const int bad = attention_layer(rng, M, pos, false, 2);
+      std::printf("attention layer, raw NVFP4 projections, %d rows at %d: %s\n", M, pos, bad ? "DIFFERS" : "bit for bit");
+      failed += bad != 0;
+    }
+  for (int M : {16, 12}) {
+    int bad = attention_layer(rng, M, 24000, true, 2);
+    std::printf("attention layer with its tail, raw NVFP4 projections, %d rows at 24000: %s\n", M,
+                bad ? "DIFFERS" : "bit for bit");
+    failed += bad != 0;
+    bad = span_layer(rng, M, 2);
+    std::printf("DeltaNet layer in one launch, raw NVFP4 projections, %d rows: %s\n", M, bad ? "DIFFERS" : "bit for bit");
     failed += bad != 0;
   }
   std::printf("%s\n", failed ? "FAILED" : "all passed");
