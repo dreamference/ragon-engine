@@ -1688,10 +1688,12 @@ int main(int argc, char** argv) {
         std::vector<int> answer(plain.begin() + from, plain.end() - (ended ? 1 : 0));
         failures += !same + !state + !rows_plain + !rows_spec;
         std::printf("prompt %zu tokens, constrained: plain %zu tokens %.2f tok/s | spec %zu tokens %.2f tok/s, %ld steps, "
-                    "%.2f tokens/step, %.1f ms/step | tokens %s, state %s, rows plain %s, rows spec %s, %s\n",
+                    "%.2f tokens/step, %.1f ms/step, %ld trees (%ld left the chain), %ld lookup | tokens %s, state %s, rows plain %s, "
+                    "rows spec %s, %s\n",
                     prompt.size(), plain.size(), plain.size() / t_plain, fast.size(), fast.size() / t_spec, st.steps,
                     st.steps ? double(st.accepted + st.steps) / st.steps : 0.0,
                     st.steps ? 1e3 * (st.draft_seconds + st.verify_seconds + st.commit_seconds) / st.steps : 0.0,
+                    st.tree_steps, st.tree_branch_steps, st.lookup_steps,
                     same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS", rows_plain ? "identical" : "DIFFER",
                     rows_spec ? "identical" : "DIFFER", ended ? "ended" : "cut at --max-tokens");
         if (!same) {
