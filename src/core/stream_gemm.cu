@@ -185,7 +185,7 @@ __device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
 // other through the same buffer. A token's column takes exactly the MMAs, chunks, warps and reduction order it takes
 // in a one-group launch (the MMA's columns are independent), so its result is the same bits whatever its group.
 template <int NT, int TILES, bool FP4, int PF, bool CODED, bool RESID = false, bool DYNRED = false, bool GATHER = false,
-          int GROUPS = 1, typename Wait>
+          int GROUPS = 1, int PROF = 0, typename Wait>
 __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, const float* __restrict__ xinv, int M,
                                                  const StreamProblems& pr, int K, int ksplit, float* __restrict__ part,
                                                  int bx, int by, Wait&& wait, int tok0 = 0) {
@@ -221,6 +221,7 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
       for (int j = 0; j < NT; ++j) acc[gr][i][j][0] = acc[gr][i][j][1] = acc[gr][i][j][2] = acc[gr][i][j][3] = 0.f;
 
   WeightRegs<TILES, FP4, CODED> buf[PF + 1];  // buf[0]: the chunk being computed; buf[1..PF]: in flight
+  uint32_t sink = 0;  // RAGON_SG64_ABL 2 and 4: what the dropped part would have consumed, stored never (below)
   // GATHER: the row list is the previous kernel's output, so nothing is read before the wait; a block wholly past the
   // count writes its -inf columns and leaves; a row past the count reads row 0 and is masked at the end.
   int grow[TILES][2] = {};
@@ -262,7 +263,7 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
   // in flight while this block waits for the kernel that wrote x and xinv. Nothing else happens before this.
   if constexpr (!GATHER) wait();
   for (int c = cbeg + warp; c < chunks; c += kWarps) {
-    if (c + PF * kWarps < chunks) load(buf[PF], c + PF * kWarps);
+    if (PROF != 5 && c + PF * kWarps < chunks) load(buf[PF], c + PF * kWarps);
     const WeightRegs<TILES, FP4, CODED>& cur = buf[0];
     uint32_t sc_h2[TILES][2][2];
 #pragma unroll
@@ -272,7 +273,10 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
       const int n = gr * NT * 8 + g + 8 * j;
-      if (n < M) {
+      if constexpr (PROF == 1) {  // RAGON_SG64_ABL ablation: no activation loads (timing only, wrong output)
+#pragma unroll
+        for (int q = 0; q < 16; ++q) xw[j][q] = (uint32_t(lane) << 16) + uint32_t(j * 16 + q);
+      } else if (n < M) {
         const uint4* p = reinterpret_cast<const uint4*>(x + static_cast<size_t>(n) * K + c * kChunk + t * 32);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
@@ -287,7 +291,7 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
         for (int q = 0; q < 16; ++q) xw[j][q] = 0u;
       }
     }
-    if (FP4 && gr == 0) {
+    if (FP4 && gr == 0 && PROF != 3) {
 #pragma unroll
       for (int i = 0; i < TILES; ++i)
 #pragma unroll
@@ -309,7 +313,9 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
         uint32_t a[2][2];  // [row g / g + 8][k pair 0 / 1]
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          if constexpr (FP4) {
+          if constexpr (PROF == 3) {  // ablation: raw weight words as the MMA operand, no dequant
+            a[h][0] = a[h][1] = word_of(cur.v[i][h][FP4 ? 0 : (s >> 2)], FP4 ? (s >> 1) : (s & 3));
+          } else if constexpr (FP4) {
             const uint32_t word = word_of(cur.v[i][h][0], s >> 1);
             const uint32_t bytes = word >> (16 * (s & 1));
             const uint32_t scale = sc_h2[i][h][s >> 2];
@@ -322,8 +328,12 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
           }
         }
 #pragma unroll
-        for (int j = 0; j < NT; ++j)
-          mma16816(acc[gr][i][j], a[0][0], a[1][0], a[0][1], a[1][1], xw[j][2 * s], xw[j][2 * s + 1]);
+        for (int j = 0; j < NT; ++j) {
+          if constexpr (PROF == 2)  // ablation: operands folded into a never-stored word, no MMA
+            sink ^= (j == 0 ? a[0][0] ^ a[1][0] ^ a[0][1] ^ a[1][1] : 0u) ^ (i == 0 ? xw[j][2 * s] ^ xw[j][2 * s + 1] : 0u);
+          else
+            mma16816(acc[gr][i][j], a[0][0], a[1][0], a[0][1], a[1][1], xw[j][2 * s], xw[j][2 * s + 1]);
+        }
       }
     }
     }  // groups
@@ -331,6 +341,20 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     for (int p = 0; p < PF; ++p) buf[p] = buf[p + 1];
   }
 
+  if constexpr (PROF == 4) {  // ablation: the sums materialized, no reduction or store
+#pragma unroll
+    for (int gr = 0; gr < GROUPS; ++gr)
+#pragma unroll
+      for (int i = 0; i < TILES; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+          sink ^= __float_as_uint(acc[gr][i][j][0]) ^ __float_as_uint(acc[gr][i][j][1]) ^
+                  __float_as_uint(acc[gr][i][j][2]) ^ __float_as_uint(acc[gr][i][j][3]);
+  }
+  if constexpr (PROF == 2 || PROF == 4) {
+    if (M < 0 && sink == 0x9e3779b9u) y[0] = __uint_as_float(sink);  // never: M >= 1; keeps the folded work live
+  }
+  if constexpr (PROF == 4) return;
   // Fixed-order reduction over the warps, group by group through one buffer.
 #pragma unroll
   for (int gr = 0; gr < GROUPS; ++gr) {
@@ -346,7 +370,10 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     }
   __syncthreads();
   for (int e = threadIdx.x; e < TILES * 16 * NT * 8; e += blockDim.x) {
-    const int r = e / (NT * 8), nl = e % (NT * 8), n = gr * NT * 8 + nl;
+    // PROF 6 (RAGON_SG64_PROF=1 prototype): row-fastest, so a warp's stores are 32 consecutive floats of one token's
+    // output (one 128-byte line) instead of 32 tokens' (32 lines); each element's sum is the same.
+    const int r = PROF == 6 ? e % (TILES * 16) : e / (NT * 8), nl = PROF == 6 ? e / (TILES * 16) : e % (NT * 8),
+              n = gr * NT * 8 + nl;
     if (n >= M || row0 + r >= N) continue;
     float sum = 0.f;
 #pragma unroll
@@ -372,11 +399,11 @@ struct PdlBegin {
   __device__ __forceinline__ void operator()() const { pdl_begin(); }
 };
 
-template <int NT, int TILES, bool FP4, int PF, bool CODED = false, int GROUPS = 1>
+template <int NT, int TILES, bool FP4, int PF, bool CODED = false, int GROUPS = 1, int PROF = 0>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr, int K,
                        int ksplit, float* __restrict__ part) {
-  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, false, false, GROUPS>(x, xinv, M, pr, K, ksplit, part, blockIdx.x,
+  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, false, false, GROUPS, PROF>(x, xinv, M, pr, K, ksplit, part, blockIdx.x,
                                                                            blockIdx.y, PdlBegin{});
 }
 
@@ -392,13 +419,13 @@ constexpr size_t pair_red_bytes() {
   return size_t(kWarps) * TILES * 16 * (NT * 8 + 1) * sizeof(float);
 }
 
-template <int NT, int TILES, bool FP4, int PF, bool CODED = false>
+template <int NT, int TILES, bool FP4, int PF, bool CODED = false, int PROF = 0>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_pair_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
                             int K) {
   constexpr bool dyn = pair_red_bytes<NT, TILES>() > 48 * 1024;
   const int b = blockIdx.x;
-  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, dyn, false, 1>(x, xinv, M, pr, K, 1, nullptr, b >> 1, 0,
+  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, dyn, false, 1, PROF>(x, xinv, M, pr, K, 1, nullptr, b >> 1, 0,
                                                                      PdlBegin{}, (b & 1) * NT * 8);
 }
 
@@ -633,6 +660,54 @@ float* split_buffer(size_t floats) {
   return buf;
 }
 
+// RAGON_SG64_ABL=1..5 (a timing ablation, never for serving: the output is wrong): the M = 32 launch (NT 4, two
+// tiles, PF 2) and the pair launches (PF 1) of raw NVFP4 / FP8 drop one part of the body: 1 the activation loads,
+// 2 the MMAs, 3 the dequant, 4 the reduction and store, 5 the weight loads past the prologue.
+// RAGON_SG64_PROF=1 (prototype, same bits): the pair launches store the sums row-fastest (body PROF 6); =2 also the
+// M = 32 launch. The ablation then reads RAGON_SG64_ABL.
+int sg_prof() {
+  static const int m = [] {
+    const char* a = std::getenv("RAGON_SG64_ABL");
+    if (a && std::atoi(a) >= 1 && std::atoi(a) <= 5) return std::atoi(a);
+    const char* e = std::getenv("RAGON_SG64_PROF");
+    const int v = e ? std::atoi(e) : 0;
+    return v == 1 ? 6 : v == 2 ? 7 : 0;
+  }();
+  return m;
+}
+
+template <int NT, int TILES, bool FP4, int PF, bool CODED, int GROUPS, bool PAIR>
+auto prof_kernel(int mode) {
+  if constexpr (PAIR) {
+    if constexpr (!CODED && PF == 1) {
+      switch (mode) {
+        case 1: return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, false, 1>;
+        case 2: return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, false, 2>;
+        case 3: return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, false, 3>;
+        case 4: return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, false, 4>;
+        case 5: return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, false, 5>;
+        case 6:
+        case 7: return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, false, 6>;
+        default: break;
+      }
+    }
+    return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED>;
+  } else {
+    if constexpr (!CODED && PF == 2 && NT == 4 && TILES == 2 && GROUPS == 1) {
+      switch (mode) {
+        case 1: return &stream_gemm_kernel<NT, TILES, FP4, PF, false, 1, 1>;
+        case 2: return &stream_gemm_kernel<NT, TILES, FP4, PF, false, 1, 2>;
+        case 3: return &stream_gemm_kernel<NT, TILES, FP4, PF, false, 1, 3>;
+        case 4: return &stream_gemm_kernel<NT, TILES, FP4, PF, false, 1, 4>;
+        case 5: return &stream_gemm_kernel<NT, TILES, FP4, PF, false, 1, 5>;
+        case 7: return &stream_gemm_kernel<NT, TILES, FP4, PF, false, 1, 6>;
+        default: break;
+      }
+    }
+    return &stream_gemm_kernel<NT, TILES, FP4, PF, CODED, GROUPS>;
+  }
+}
+
 template <int NT, int TILES, bool FP4, int PF, bool CODED, int GROUPS = 1, bool PAIR = false>
 void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   StreamProblems pr{};
@@ -650,20 +725,27 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
   if constexpr (PAIR) {
     constexpr size_t red = pair_red_bytes<NT, TILES>();
     constexpr size_t smem = red > 48 * 1024 ? red : 0;
+    const auto kern = prof_kernel<NT, TILES, FP4, PF, CODED, 1, true>(sg_prof());
     if constexpr (smem > 0) {
-      static const cudaError_t set = cudaFuncSetAttribute(stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED>,
-                                                          cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+      static const cudaError_t set =
+          cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
       if (set != cudaSuccess) throw std::runtime_error(std::string("stream_gemm pair: ") + cudaGetErrorString(set));
     }
-    launch_kernel("stream_gemm pair", stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED>, dim3(2 * blocks),
-                  dim3(kWarps * 32), smem, s, x, xinv, M, pr, K);
+    launch_kernel("stream_gemm pair", kern, dim3(2 * blocks), dim3(kWarps * 32), smem, s, x, xinv, M, pr, K);
     return;
   }
   const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;
   float* part = ksplit > 1 ? split_buffer(size_t(ksplit) * M * t[0].N) : nullptr;
   const dim3 grid(blocks, ksplit);
-  launch_kernel("stream_gemm", stream_gemm_kernel<NT, TILES, FP4, PF, CODED, GROUPS>, grid, dim3(kWarps * 32), 0, s, x, xinv,
-                M, pr, K, ksplit, part);
+  const auto kern = prof_kernel<NT, TILES, FP4, PF, CODED, GROUPS, false>(sg_prof());
+  // Under the ablation, 40 KB of unused dynamic shared memory keeps every mode at the base's one block per SM (a mode
+  // with fewer registers would otherwise fit two).
+  const int pad = sg_prof() >= 1 && sg_prof() <= 5 ? 40 * 1024 : 0;
+  if (pad) {
+    static const cudaError_t set = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, pad);
+    if (set != cudaSuccess) throw std::runtime_error(std::string("stream_gemm prof: ") + cudaGetErrorString(set));
+  }
+  launch_kernel("stream_gemm", kern, grid, dim3(kWarps * 32), pad, s, x, xinv, M, pr, K, ksplit, part);
   if (ksplit > 1)
     launch_kernel("stream_gemm split", split_reduce_kernel, dim3((M * t[0].N + 255) / 256), dim3(256), 0, s, part, ksplit,
                   M, t[0].N, t[0].scale, xinv, t[0].y);
