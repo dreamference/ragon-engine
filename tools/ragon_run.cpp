@@ -601,12 +601,13 @@ int main(int argc, char** argv) {
       ragon::serve::Request r;
       r.chat = true;
       if (!grammar_tools.empty()) {
-        r.tools = nlohmann::json::parse(read_file(grammar_tools));
+        // ordered_json, as ragon-serve parses a body: the schema's property order is the order the grammar emits.
+        r.tools = nlohmann::ordered_json::parse(read_file(grammar_tools));
         r.tool_choice_required = true;
       } else {
-        r.response_format = nlohmann::json{
+        r.response_format = nlohmann::ordered_json{
             {"type", "json_schema"},
-            {"json_schema", {{"name", "check"}, {"schema", nlohmann::json::parse(read_file(grammar_schema))}}}};
+            {"json_schema", {{"name", "check"}, {"schema", nlohmann::ordered_json::parse(read_file(grammar_schema))}}}};
       }
       const ragon::grammar::Grammar g = *ragon::serve::request_grammar(gcomp, r);
       const int words = gvocab.words();
