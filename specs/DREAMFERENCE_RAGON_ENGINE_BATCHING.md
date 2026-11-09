@@ -207,6 +207,21 @@ Batched share 0.97-1.00; a batched sequence accepts what it accepts alone (3.35)
 
 The batch path today (M4 stage 4) runs the drafter over every block at once and the state kernels in one launch each (`kernels::SeqBatch`), and captures its graphs per *ordered tuple of sessions* (`batch_graphs_`): eight sessions are 56 ordered pairs, each with draft, verify and per-count commit graphs, captured lazily on first use. That becomes graphs per *batch size*, reading each slot's session (its KV and state pointers, positions, row offsets) from a device descriptor table written before the replay, so the set of graphs is bounded (sizes 1-4) and **captured at start, inside the memory plan**: no allocation after the start depends on which sessions meet. The DeltaNet path of a batch moves into the persistent gdn kernel generalised to N sequences (each sequence's rows its own recurrence), recovering most of §2.4's +8.6 ms per sequence.
 
+**The persistent kernel at 32 forks, probed and not built (2026-11-09).** The lane's go/no-go asked for the recurrence of the plain 32-fork pass at or below 30 ms and the pass at or below 151.6 ms. Measured first, with no kernel code: RAGON_PROFILE at 32 forks of 32,000 tokens, 100 tokens each, three runs per arm interleaved, medians; and a standalone bench over the same state (32 sequences x 48 DeltaNet layers x 48 heads x 128 x 128 FP32: 3.15 MB a layer, 151 MB a sequence, 4.83 GB in all) through the library's own launchers.
+
+| | ms a pass | bytes | GB/s |
+|---|---|---|---|
+| plain pass, whole (`verify/`, 99 passes a run) | 157.7 (157.2-157.7) | | |
+| plain pass, recurrence (`gdn_recurrent_commit_seqs`, state read and written) | 46.9 (46.7-47.2) | 9.66 GB | 206 |
+| drafter (S64 arm) wide pass, whole (`verify_wide/`, 53 passes a run) | 154.4 (154.1-154.8) | | |
+| drafter wide pass, recurrence (`gdn_recurrent_seqs`, 64 rows, state read only) | 24.5 (24.5-24.6) | 4.83 GB | 197 |
+| bench: `gdn_recurrent_commit_seqs`, 32 x 1 row / 32 x 2 rows | 46.8 / 46.3 | 9.66 GB | 207 / 209 |
+| bench: `gdn_recurrent_seqs`, 32 x 1 row / 32 x 2 rows | 21.2 / 21.8 | 4.83 GB | 228 / 222 |
+| bench: float4 read and write in place, no arithmetic (best of six shapes) | 44.5 | 9.66 GB | 217 |
+| bench: float4 read only | 20.7 | 4.83 GB | 234 |
+
+The plain pass's recurrence already runs within 5 % of what reading and writing its state costs on this memory (44.5 ms against 46.9); the drafter arm's commit (the same read and write on the commit stream, outside the profile) costs about the same 46 ms by the bench, beside the next draft. The recurrence is already one launch for all sequences a layer; the persistent kernel (stage 2's mixer, from the projections through the out-projection, overlapped) would only overlap its other stages with it, and it still reads and writes every byte of the state. 30 ms needs 322 GB/s over the 9.66 GB; even read-only, the fastest rate measured here (234 GB/s) moves them in 41 ms. Gate 1 is a no-go by measurement; `RAGON_MK_GDN_N` was not written. Below 44 ms the recurrence needs fewer state bytes a pass (a narrower state type, which is not exact against today's output), not fewer launches.
+
 ### 5.3 Paged KV (P4)
 
 The owner's decision of 2026-11-04 (§3.5): four or more conversations keep the model's full 262,144-token context, paid for by paged KV, not by a shorter context. Ragon's recipe stays as it is (no `--sessions`, no `--batch`) until P4 is on by default; then it passes `--sessions 4 --batch 4` or more.
