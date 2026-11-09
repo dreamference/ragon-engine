@@ -396,8 +396,9 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
     }
   __syncthreads();
   for (int e = threadIdx.x; e < TILES * 16 * NT * 8; e += blockDim.x) {
-    // PROF 6 (RAGON_SG64_PROF=1 prototype): row-fastest, so a warp's stores are 32 consecutive floats of one token's
-    // output (one 128-byte line) instead of 32 tokens' (32 lines); each element's sum is the same.
+    // Row-fastest (ROWF, the pair launches' default; PROF 6 for the M = 32 launch under RAGON_SG64_PROF=2): a warp's
+    // stores are 32 consecutive floats of one token's output (one 128-byte line) instead of 32 tokens' (32 lines);
+    // each element's sum is the same.
     constexpr bool rows_fastest = PROF == 6 || ROWF;
     const int r = rows_fastest ? e % (TILES * 16) : e / (NT * 8), nl = rows_fastest ? e / (TILES * 16) : e % (NT * 8),
               n = gr * NT * 8 + nl;
@@ -690,8 +691,8 @@ float* split_buffer(size_t floats) {
 // RAGON_SG64_ABL=1..5 (a timing ablation, never for serving: the output is wrong): the M = 32 launch (NT 4, two
 // tiles, PF 2) and the pair launches (PF 1) of raw NVFP4 / FP8 drop one part of the body: 1 the activation loads,
 // 2 the MMAs, 3 the dequant, 4 the reduction and store, 5 the weight loads past the prologue.
-// RAGON_SG64_PROF=1 (prototype, same bits): the pair launches store the sums row-fastest (body PROF 6); =2 also the
-// M = 32 launch. The ablation then reads RAGON_SG64_ABL.
+// RAGON_SG64_PROF=2 (prototype, same bits) also stores the M = 32 launch's sums row-fastest (body PROF 6); the pair
+// launches do so by default (sg64_rowf), RAGON_SG64_PROF=0 turns that off. The ablation then reads RAGON_SG64_ABL.
 int sg_prof() {
   static const int m = [] {
     const char* a = std::getenv("RAGON_SG64_ABL");
@@ -703,10 +704,12 @@ int sg_prof() {
   return m;
 }
 
-// Pair launch knobs (33 to 64 rows), same bits either way: RAGON_SG64_XQ=1 loads x by quarter chunk (32 registers
-// instead of 64, no spills at either PF for NVFP4), RAGON_SG64_ROWF=1 stores the sums row-fastest. Off by default
-// (GB10, 2026-11-08, --bench-groups at M = 64): ROWF alone lifts the step's GEMMs 193 -> 199 GB/s with no group
-// slower; XQ adds 5-15 GB/s on the FP8 groups but costs NVFP4 10-20; no setting brings every group to 210.
+// Pair launch knobs (33 to 64 rows), same bits either way. The row-fastest epilogue (ROWF) is the default: on GB10
+// (2026-11-08, --bench-groups) it lifts the step's GEMMs 193 -> 199 GB/s at M = 64 and 210 -> 214 at M = 48 with no
+// group slower; RAGON_SG64_PROF=0 (or RAGON_SG64_ROWF=0) turns it off. Negative results, off by default:
+// RAGON_SG64_XQ=1 loads x by quarter chunk (32 registers instead of 64, no spills at either PF for NVFP4) and adds
+// 5-15 GB/s on the FP8 groups at M = 64 but costs NVFP4 10-20; RAGON_SG64_PF=2 (below) costs NVFP4 further (ffn
+// down 189 -> 166). No setting brings every group to 210 GB/s at M = 64.
 int sg64_flag(const char* n, int d) {
   const char* e = std::getenv(n);
   return e ? std::atoi(e) : d;
@@ -716,7 +719,7 @@ bool sg64_xq() {
   return on;
 }
 bool sg64_rowf() {
-  static const bool on = sg64_flag("RAGON_SG64_ROWF", 0) != 0;
+  static const bool on = sg64_flag("RAGON_SG64_ROWF", 1) != 0 && sg64_flag("RAGON_SG64_PROF", 1) != 0;
   return on;
 }
 
@@ -733,7 +736,7 @@ auto prof_kernel(int mode) {
         default: break;
       }
     }
-    // RAGON_SG64_XQ (x by quarter chunk) and the row-fastest epilogue (RAGON_SG64_ROWF, or RAGON_SG64_PROF=1/2).
+    // RAGON_SG64_XQ (x by quarter chunk) and the row-fastest epilogue (default; off with RAGON_SG64_PROF=0).
     const bool xq = sg64_xq(), rowf = sg64_rowf() || mode == 6 || mode == 7;
     if (xq && rowf) return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED, 0, true, true>;
     if (xq) return &stream_gemm_pair_kernel<NT, TILES, FP4, PF, CODED, 0, true, false>;
