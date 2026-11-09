@@ -8,7 +8,7 @@
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
 //              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
-//              [--kv-pages [--kv-pool-mb N] | --no-kv-pages]
+//              [--kv-pool-mb N | --kv-flat]
 //              [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N]
 //
 // --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
@@ -61,9 +61,10 @@
 // how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
 // by default: MILESTONES §14).
-// With --kv-pages the full-attention KV is kept in 64-position pages behind a page table per session (BATCHING
-// §5.3, P4; off by default, the flat slots, --no-kv-pages says so explicitly; exact: only addresses change;
-// RAGON_KV_PAGES=0/1 overrides). The pages come from one pool allocated
+// The full-attention KV is kept in 64-position pages behind a page table per session (BATCHING §5.3, P4; the
+// default since P4e, 2026-11-08; exact: only addresses change). --kv-flat (or --no-kv-pages) keeps the flat slots
+// instead, one max-context slot a session; --kv-pages is still accepted and changes nothing; RAGON_KV_PAGES=0/1
+// overrides both. The start log names the mode. The pages come from one pool allocated
 // at start: what MemAvailable leaves after the memory plan, the prefix KV store's budget and --host-reserve-mb, at most
 // --sessions x --max-context positions; or --kv-pool-mb N, refused at start when the plan with it does not fit. A
 // session then costs its fixed part (~0.5 GB) and 64 KB for each position it holds, so --sessions 4 --max-context
@@ -284,7 +285,7 @@ struct Metrics {
           "Tokens the resident sessions can hold (sessions times the context size).");
     gauge("ragon:sessions", sessions, "Resident session slots.");
     if (kv_pages_total > 0) {
-      gauge("ragon:kv_pages_total", kv_pages_total, "Pages of the KV page pool (64 positions each, --kv-pages).");
+      gauge("ragon:kv_pages_total", kv_pages_total, "Pages of the KV page pool (64 positions each; none with --kv-flat).");
       gauge("ragon:kv_pages_free", kv_pages_free, "Free pages of the KV page pool.");
     }
     gauge("ragon:sessions_resident", sessions_resident, "Slots holding a session.");
@@ -2354,7 +2355,8 @@ int main(int argc, char** argv) try {
   std::vector<std::string> drafter_args;  // --drafter ID=DIR, repeatable (MULTI_DRAFTER §5.3)
   std::string drafter_routes_file;
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
-  bool kv_pages = false;  // the flat slots by default (P4d kept them: paged passes are slower, BATCHING §5.3)
+  static_assert(ragon::serve::kAutoSessionsCap <= ragon::kernels::kMaxSeqs, "auto-size never picks more than a batch");
+  bool kv_pages = true;  // the page pool by default (P4e, BATCHING §5.3); --kv-flat the flat slots
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
   bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
@@ -2409,8 +2411,8 @@ int main(int argc, char** argv) try {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
-    else if (a == "--kv-pages") kv_pages = true;
-    else if (a == "--no-kv-pages") kv_pages = false;
+    else if (a == "--kv-pages") kv_pages = true;  // the default since P4e; kept so older command lines still start
+    else if (a == "--kv-flat" || a == "--no-kv-pages") kv_pages = false;
     else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
     else if (a == "--draft-bf16") draft_bf16 = true;
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
@@ -2452,7 +2454,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pages [--kv-pool-mb N] | --no-kv-pages] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2606,7 +2608,7 @@ int main(int argc, char** argv) try {
   // P4b: the engine reads RAGON_KV_PAGES itself; the plan must agree with it.
   if (const char* e = std::getenv("RAGON_KV_PAGES")) kv_pages = std::atoi(e) != 0;
   if (kv_pool_mb >= 0 && !kv_pages) {
-    std::cerr << "--kv-pool-mb needs --kv-pages (or RAGON_KV_PAGES=1)\n";
+    std::cerr << "--kv-pool-mb needs the page pool, not --kv-flat or RAGON_KV_PAGES=0\n";
     return 2;
   }
   ragon::serve::MemoryPlan plan;  // the start's plan, which --plan-only reports
@@ -2653,8 +2655,11 @@ int main(int argc, char** argv) try {
     }
     if (kv_pages) {
       opts.kv_pool_pages = static_cast<int>(mp.kv_pool_pages);
-      std::cerr << "KV page pool: " << as::describe_kv_pool(mp)
+      std::cerr << "KV: paged (the default), page pool " << as::describe_kv_pool(mp)
                 << (kv_pool_mb >= 0 ? " (--kv-pool-mb)" : " (from the memory plan)") << "\n";
+    } else {
+      std::cerr << "KV: flat slots (" << (std::getenv("RAGON_KV_PAGES") ? "RAGON_KV_PAGES=0" : "--kv-flat") << "), "
+                << sessions << " x " << max_context << " positions\n";
     }
     // One line: what runs, whether each was chosen here (auto), given, or a default (and why no sizing), and the
     // plan's numbers it was chosen by.

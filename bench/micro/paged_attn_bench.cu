@@ -5,7 +5,7 @@
 // same constant, the identity of the layouts is ragon-paged-tests' job.
 //
 // Layouts (-l):
-//   flat    one allocation per sequence and layer, [Hkv][max_ctx][D] (the engine without --kv-pages)
+//   flat    one allocation per sequence and layer, [Hkv][max_ctx][D] (the engine with --kv-flat)
 //   page    the P4 pool: page = [layer][K, V][head][64][D], the table holds page id * page elements
 //   head    a pool per (layer, K/V, head): base(l, kv, h) + page id * 64 * D; kv_off's formula unchanged, hs is the
 //           sub-pool's size and the table holds page id * 64 * D

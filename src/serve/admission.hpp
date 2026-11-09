@@ -224,7 +224,7 @@ inline std::string plan_json(int sessions, int batch, int max_context, const Mem
   return o.str();
 }
 
-// P4d, auto-size with --kv-pages (the coordinator's decision of 2026-11-04): n sessions at max_context fit when the pool
+// P4d, auto-size with the page pool (the coordinator's decision of 2026-11-04): n sessions at max_context fit when the pool
 // holds one conversation at max_context (as the start check asks) and n x max_context / kPagedFitShare positions, so
 // that n conversations at half the context can be resident at once. More than that is not asked: when n sessions
 // would need more pages than the pool has, the scheduler requeues (P4c), it does not refuse the start.
@@ -234,9 +234,10 @@ inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_contex
   return p.kv_pool_pages >= std::max(kv_pages_one_conversation(p, max_context), half);
 }
 
-// Auto-size (BATCHING §5.6): the most sessions chosen without --sessions (the owner's cap on node-b until a larger
-// number is approved; also the engine's kMaxSeqs), and the shortest context chosen without --max-context.
-inline constexpr int kAutoSessionsCap = 4;
+// Auto-size (BATCHING §5.6): the most sessions chosen without --sessions, and the shortest context chosen without
+// --max-context. The cap is the engine's kMaxSeqs (P4e, 2026-11-08; 4 before): a fan-out's forks are sessions, so a
+// default start must allow 32 of them; memory, not the cap, decides how many fit (7 at 262,144 on node-b paged, 3 flat).
+inline constexpr int kAutoSessionsCap = 32;
 inline constexpr int kAutoContextFloor = 32768;
 // What ragon-serve runs when it does not size itself (--auto-size 0, or MemAvailable unreadable): today's defaults.
 inline constexpr int kDefaultSessions = 2;
