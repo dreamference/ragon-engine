@@ -4,9 +4,9 @@
 //   <parameter=KEY>\nVALUE\n</parameter>\n          (per argument, declared keys only)
 //   </function>\n</tool_call>
 //
-// Calls are separated by one "\n". Under required and named the payload is at most two newlines (after
-// </think>) and then one or more calls; under auto, free text with calls triggered by "<tool_call>". With a
-// response_format the payload is `json | calls` (vllm#39929).
+// Calls are separated by one "\n"; with spec.parallel false there is one call and then the stop. Under required
+// and named the payload is at most two newlines (after </think>) and then one or more calls; under auto, free text
+// with calls triggered by "<tool_call>". With a response_format the payload is `json | calls` (vllm#39929).
 #include "grammar/grammar.hpp"
 
 namespace ragon::grammar {
@@ -53,7 +53,7 @@ ojson function_tag(const Tool& t) {
 }
 
 ojson custom_tag(const Tool& t, std::size_t index) {
-  const std::string param = "tools[" + std::to_string(index) + "].format";
+  const std::string param = "tools[" + std::to_string(t.index >= 0 ? static_cast<std::size_t>(t.index) : index) + "].format";
   ojson content;
   switch (t.format) {
     case Tool::Format::kText:
@@ -94,7 +94,7 @@ std::string tool_calls_tag(const ToolCallSpec& spec) {
                    {"triggers", ojson::array({"<tool_call>"})},
                    {"tags", tags},
                    {"at_least_one", false},
-                   {"stop_after_first", false}};
+                   {"stop_after_first", !spec.parallel}};
     if (spec.json_schema || spec.json_object) {
       // json | calls: a JSON answer, or tool calls (one or more, after at most two newlines).
       const std::string json = spec.json_schema ? schema_ebnf(canonical_schema(*spec.json_schema, spec.json_param), true)
@@ -103,7 +103,7 @@ std::string tool_calls_tag(const ToolCallSpec& spec) {
                           {"tags", tags},
                           {"separator", "\n"},
                           {"at_least_one", true},
-                          {"stop_after_first", false}};
+                          {"stop_after_first", !spec.parallel}};
       format = {{"type", "sequence"},
                 {"elements",
                  ojson::array({ojson{{"type", "grammar"}, {"grammar", kLead}},
@@ -122,7 +122,7 @@ std::string tool_calls_tag(const ToolCallSpec& spec) {
                                    {"tags", tags},
                                    {"separator", "\n"},
                                    {"at_least_one", true},
-                                   {"stop_after_first", false}}})}};
+                                   {"stop_after_first", !spec.parallel}}})}};
   }
   return ojson{{"type", "structural_tag"}, {"format", format}}.dump();
 }

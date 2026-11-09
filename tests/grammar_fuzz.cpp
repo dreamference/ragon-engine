@@ -1,8 +1,11 @@
 // libFuzzer target for the grammar library: schema JSON, Lark text, regex patterns and custom-tool grammars
-// through compile, then a short walk of a matcher. Built and run by scripts/fuzz_grammar.sh.
+// through compile, then a short walk of a matcher; and the routes' request bodies (structured output stage 4):
+// a chat, completions or Responses JSON body through parse_request / parse_responses_request and
+// request_grammar. Built and run by scripts/fuzz_grammar.sh.
 //
 // The first input byte picks the front end; the rest is the text. A grammar::Error (a 400) is an expected
-// outcome; any other exception, a crash or a sanitizer report is a finding.
+// outcome, and for a request body so are std::invalid_argument and a JSON type error (the server's 400s); any
+// other exception, a crash or a sanitizer report is a finding.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +13,8 @@
 #include <vector>
 
 #include "grammar/grammar.hpp"
+#include "serve/api.hpp"
+#include "serve/structured.hpp"
 
 using namespace ragon::grammar;
 
@@ -55,7 +60,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   static Compiler comp(vocab(), std::size_t{8} << 20);
   const std::string text(reinterpret_cast<const char*>(data) + 1, size - 1);
   try {
-    switch (data[0] % 5) {
+    switch (data[0] % 7) {
       case 0: walk(comp.json_schema_text(text, "response_format.json_schema.schema"), text); break;
       case 1: walk(comp.lark(text, "tools[0].format"), text); break;
       case 2: walk(comp.regex(text, "tools[0].format"), text); break;
@@ -75,6 +80,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         spec.json_schema = nlohmann::ordered_json::parse(text, nullptr, false);
         if (spec.json_schema->is_discarded()) return 0;
         walk(comp.tool_calls(spec), text);
+        break;
+      }
+      case 5:
+      case 6: {
+        const nlohmann::json body = nlohmann::json::parse(text, nullptr, false);
+        if (body.is_discarded()) return 0;
+        try {
+          const ragon::serve::Request r = data[0] % 7 == 6 ? ragon::serve::parse_responses_request(body)
+                                                            : ragon::serve::parse_request(body, (data[0] & 8) != 0);
+          if (auto g = ragon::serve::request_grammar(comp, r)) walk(*g, r.prompt_text.substr(0, 64));
+        } catch (const std::invalid_argument&) {
+          // a 400 of the route parser: expected
+        } catch (const nlohmann::json::exception&) {
+          // a field of the wrong JSON type: the server answers it 400
+        } catch (const ragon::serve::ModelNotFound&) {
+          // a model this server does not serve: the server answers it 404
+        }
         break;
       }
     }

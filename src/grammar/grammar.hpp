@@ -111,6 +111,7 @@ struct Tool {
   std::vector<std::string> params;        // kFunction: the declared property names, in schema order
   enum class Format { kText, kLark, kRegex } format = Format::kText;  // kCustom only
   std::string definition;                 // kLark: the grammar; kRegex: the pattern
+  int index = -1;                         // the tool's index in the request body (a 400's `tools[i]`); -1: its own
 };
 
 struct ToolCallSpec {
@@ -121,6 +122,7 @@ struct ToolCallSpec {
   std::optional<nlohmann::ordered_json> json_schema;
   bool json_object = false;
   std::string json_param = "response_format.json_schema.schema";  // names the schema in a 400
+  bool parallel = true;                   // false (parallel_tool_calls: false): at most one call, then the stop
 };
 
 // The exact prefix the output parser reads before a custom tool's input; the structural tag triggers on it.

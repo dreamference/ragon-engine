@@ -1,11 +1,13 @@
-// ragon-structured-tests [TOKENIZER_JSON]: structured output stage 2's server side (serve/structured.hpp) against the
-// model's vocabulary: a chat request's response_format and tool_choice "required" as parse_request reads them, the
+// ragon-structured-tests [TOKENIZER_JSON]: structured output's server side (serve/structured.hpp, stages 2 and 4)
+// against the model's vocabulary: every route's response_format, text.format, tool_choice, parallel_tool_calls and
+// custom-tool grammars as parse_request and parse_responses_request read them, the
 // grammar request_grammar builds from them (and its 400s), and GrammarConstraint driving the masked host sampler to
 // an answer that parses and validates. The tokenizer comes as in ragon-grammar-tests; without one, exit 77.
 #include <glob.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -92,11 +94,153 @@ void test_parse() {
   EXPECT(!request_grammar(*g_comp, parse_request(b, true)));  // required without tools: nothing to call
   b["tool_choice"] = "auto";
   EXPECT(!parse_request(b, true).tool_choice_required);
-  // Completions never: the fields are chat only.
-  Request c;
-  c.chat = false;
-  c.response_format = json{{"type", "json_object"}};
-  EXPECT(!request_grammar(*g_comp, c));
+  // Completions take response_format (stage 4), never tools.
+  json cb = {{"model", "m"}, {"prompt", "Answer in JSON:"}};
+  EXPECT(!request_grammar(*g_comp, parse_request(cb, false)));
+  cb["response_format"] = {{"type", "text"}};
+  EXPECT(!request_grammar(*g_comp, parse_request(cb, false)));
+  cb["response_format"] = {{"type", "json_object"}};
+  EXPECT(request_grammar(*g_comp, parse_request(cb, false)));
+  cb["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "x"}, {"schema", json::parse(kSchema)}}}};
+  EXPECT(request_grammar(*g_comp, parse_request(cb, false)));
+  cb["response_format"]["json_schema"]["schema"] = {{"type", "text"}};
+  EXPECT(refusal(parse_request(cb, false)) ==
+         "invalid_json_schema|response_format.json_schema.schema: 'type' must be one of object, array, string, number, "
+         "integer, boolean, null at \"\"");
+  cb["response_format"] = {{"type", "json_schema"}};
+  EXPECT(refusal(parse_request(cb, false)) == "invalid_request_error|response_format.json_schema.schema must be an object");
+  cb["response_format"] = {{"type", "json_schema"}, {"json_schema", {{"name", "x"}, {"schema",
+      {{"type", "object"}, {"properties", {{"a", {{"type", "string"}, {"pattern", "x"}}}}}}}}}};
+  EXPECT(refusal(parse_request(cb, false)) ==
+         "unsupported_json_schema|response_format.json_schema.schema: the keyword 'pattern' at /properties/a is not "
+         "supported (supported: type, properties, required, additionalProperties, items, enum, const, anyOf, $ref, $defs)");
+  cb["response_format"]["json_schema"]["schema"] = {{"type", "string"}, {"pattern", "a+"}};
+  EXPECT(refusal(parse_request(cb, false)).rfind(
+             "unsupported_json_schema|response_format.json_schema.schema: the keyword 'pattern' at \"\"", 0) == 0);
+}
+
+const char* kApplyPatchLark =
+    "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\n"
+    "hunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\n"
+    "delete_hunk: \"*** Delete File: \" filename LF\n"
+    "update_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\n"
+    "add_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\n"
+    "change: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\n"
+    "change_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF\n";
+const char* kCallEnd = "\n</parameter>\n</function>\n</tool_call>";
+
+// A Responses body as Codex sends one: a function tool, then the apply_patch custom tool (index 1).
+json responses_body() {
+  return json{{"model", "m"},
+              {"input", "fix it"},
+              {"tool_choice", "auto"},
+              {"tools", json::array({json{{"type", "function"}, {"name", "shell"}, {"description", "Run a command"},
+                                          {"parameters", {{"type", "object"},
+                                                          {"properties", {{"command", {{"type", "string"}}}}}}}},
+                                     json{{"type", "custom"}, {"name", "apply_patch"}, {"description", "Edit files"},
+                                          {"format", {{"type", "grammar"}, {"syntax", "lark"},
+                                                      {"definition", kApplyPatchLark}}}}})}};
+}
+
+// Whether the grammar accepts `text` and may stop after it.
+bool complete(const grammar::Grammar& g, const std::string& text) {
+  grammar::Matcher m(g);
+  return m.accept_string(text) && m.can_stop();
+}
+
+// Stage 4: tool_choice named, parallel_tool_calls, the Responses route's text.format and custom-tool grammars.
+void test_routes() {
+  const std::string weather = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n"
+                              "</tool_call>";
+  // Chat, named: calls only, the name fixed; a name that is not offered is the stage 1 400.
+  json b = chat_body();
+  b["tools"] = json::parse(kTools);
+  b["tools"].push_back({{"type", "function"}, {"function", {{"name", "get_time"}, {"parameters", {{"type", "object"}}}}}});
+  EXPECT(!request_grammar(*g_comp, parse_request(b, true)));  // auto, function tools only: unconstrained
+  b["tool_choice"] = {{"type", "function"}, {"function", {{"name", "get_weather"}}}};
+  Request r = parse_request(b, true);
+  EXPECT(r.tool_choice_named == "get_weather" && r.tools.size() == 1);
+  std::optional<grammar::Grammar> g = request_grammar(*g_comp, r);
+  EXPECT(g && complete(*g, weather) && !complete(*g, "Sure.\n" + weather));
+  b["tool_choice"] = {{"type", "function"}, {"function", {{"name", "get_stock"}}}};
+  EXPECT(refusal(parse_request(b, true)) == "invalid_tools|tool_choice: the function 'get_stock' is not in tools");
+  // parallel_tool_calls false: one call. Under required no second call; under auto free text and at most one call.
+  b["tool_choice"] = "required";
+  g = request_grammar(*g_comp, parse_request(b, true));
+  EXPECT(g && complete(*g, weather + "\n" + weather));
+  b["parallel_tool_calls"] = false;
+  g = request_grammar(*g_comp, parse_request(b, true));
+  EXPECT(g && complete(*g, weather) && !complete(*g, weather + "\n" + weather));
+  b["tool_choice"] = "auto";
+  g = request_grammar(*g_comp, parse_request(b, true));
+  EXPECT(g && complete(*g, "Let me look.\n\n" + weather) && complete(*g, "No call needed.") &&
+         !complete(*g, weather + "\n" + weather));
+
+  // Responses: a custom tool with a Lark format is enforced under auto; free text and function calls stay allowed.
+  json rb = responses_body();
+  r = parse_responses_request(rb);
+  EXPECT(r.custom_formats.size() == 1 && r.custom_formats[0].index == 1 && r.custom_formats[0].syntax == "lark");
+  g = request_grammar(*g_comp, r);
+  const std::string patch = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch";
+  const std::string patch_call = grammar::custom_tool_prefix("apply_patch") + patch + kCallEnd;
+  const std::string shell_call = "<tool_call>\n<function=shell>\n<parameter=command>\nls -la\n</parameter>\n</function>\n"
+                                 "</tool_call>";
+  EXPECT(g && complete(*g, "I will add the file.\n\n" + patch_call) && complete(*g, shell_call) &&
+         complete(*g, "Done.") && complete(*g, shell_call + "\n" + patch_call));
+  EXPECT(g && !complete(*g, grammar::custom_tool_prefix("apply_patch") + "--- a/a.txt\n+++ b/a.txt\n" + kCallEnd));
+  EXPECT(g && !complete(*g, grammar::custom_tool_prefix("apply_patch") + "*** Begin Patch\n" + kCallEnd));
+  // Named custom tool, in the Responses shape.
+  rb["tool_choice"] = {{"type", "custom"}, {"name", "apply_patch"}};
+  g = request_grammar(*g_comp, parse_responses_request(rb));
+  EXPECT(g && complete(*g, patch_call) && !complete(*g, shell_call));
+  rb["tool_choice"] = {{"type", "function"}, {"name", "shell"}};
+  g = request_grammar(*g_comp, parse_responses_request(rb));
+  EXPECT(g && complete(*g, shell_call) && !complete(*g, patch_call));
+  rb["tool_choice"] = "required";
+  rb["parallel_tool_calls"] = false;
+  g = request_grammar(*g_comp, parse_responses_request(rb));
+  EXPECT(g && complete(*g, patch_call) && !complete(*g, shell_call + "\n" + patch_call) && !complete(*g, "Done."));
+  rb["tool_choice"] = "none";
+  EXPECT(!request_grammar(*g_comp, parse_responses_request(rb)));
+  // The 400s name the tool by its index in the body.
+  rb = responses_body();
+  rb["tools"][1]["format"]["definition"] = "start: \"a\"i\n";
+  EXPECT(refusal(parse_responses_request(rb)).rfind("unsupported_grammar|tools[1].format: ", 0) == 0);
+  rb["tools"][1]["format"]["syntax"] = "ebnf";
+  EXPECT(refusal(parse_responses_request(rb)) ==
+         "unsupported_grammar|tools[1].format: the syntax 'ebnf' is not supported (supported: lark, regex)");
+  rb["tools"][1]["format"] = {{"type", "grammar"}, {"syntax", "regex"}, {"definition", "[a-z]+(?=x)"}};
+  EXPECT(refusal(parse_responses_request(rb)).rfind("unsupported_grammar|tools[1].format: ", 0) == 0);
+  rb["tools"][1]["format"] = {{"type", "grammar"}, {"syntax", "regex"}, {"definition", "[0-9]{3}"}};
+  g = request_grammar(*g_comp, parse_responses_request(rb));
+  EXPECT(g && complete(*g, grammar::custom_tool_prefix("apply_patch") + "123" + kCallEnd) &&
+         !complete(*g, grammar::custom_tool_prefix("apply_patch") + "12a" + kCallEnd));
+  rb["tools"][1]["format"] = {{"type", "grammar"}, {"syntax", "lark"}, {"definition", ""}};
+  EXPECT(refusal(parse_responses_request(rb)) == "invalid_grammar|tools[1].format: the definition is missing or empty");
+  rb["tools"][1]["format"]["definition"] = "start: missing_rule\n";
+  EXPECT(refusal(parse_responses_request(rb)).rfind("invalid_grammar|", 0) == 0);
+  // A custom tool in the text format asks for nothing: the request stays unconstrained.
+  rb["tools"][1]["format"] = {{"type", "text"}};
+  EXPECT(!request_grammar(*g_comp, parse_responses_request(rb)));
+  rb["tools"][1].erase("format");
+  EXPECT(!request_grammar(*g_comp, parse_responses_request(rb)));
+
+  // text.format: json_schema (flat), json_object, text; its 400s name text.format.
+  json tb = {{"model", "m"}, {"input", "hi"}};
+  EXPECT(!request_grammar(*g_comp, parse_responses_request(tb)));
+  tb["text"] = {{"format", {{"type", "text"}}}};
+  EXPECT(!request_grammar(*g_comp, parse_responses_request(tb)));
+  tb["text"]["format"] = {{"type", "json_schema"}, {"name", "x"}, {"strict", true}, {"schema", json::parse(kSchema)}};
+  g = request_grammar(*g_comp, parse_responses_request(tb));
+  EXPECT(g && complete(*g, R"({"name": "a", "n": 1, "tags": [], "ok": true})") && !complete(*g, "{}"));
+  tb["text"]["format"] = {{"type", "json_object"}};
+  g = request_grammar(*g_comp, parse_responses_request(tb));
+  EXPECT(g && complete(*g, "{}") && !complete(*g, "hello"));
+  tb["text"]["format"] = {{"type", "json_schema"}, {"name", "x"}, {"schema", {{"type", "string"}, {"pattern", "a+"}}}};
+  EXPECT(refusal(parse_responses_request(tb)).rfind(
+             "unsupported_json_schema|text.format.schema: the keyword 'pattern' at \"\" is not supported (supported: ", 0) == 0);
+  tb["text"]["format"] = {{"type", "json_schema"}, {"name", "x"}};
+  EXPECT(refusal(parse_responses_request(tb)) == "invalid_request_error|text.format.schema must be an object");
 }
 
 void test_refusals() {
@@ -224,6 +368,7 @@ int main(int argc, char** argv) {
   const std::pair<const char*, void (*)()> tests[] = {
       {"parse", test_parse},
       {"refusals", test_refusals},
+      {"routes", test_routes},
       {"drive_schema", test_drive_schema},
       {"drive_required", test_drive_required},
   };

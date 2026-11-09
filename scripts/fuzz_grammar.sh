@@ -18,7 +18,7 @@ nice -n 19 cmake -S . -B "$OUT" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_CO
   -DRAGON_GRAMMAR=ON -DRAGON_SANITIZE=ON ${FUZZ_CMAKE_ARGS:-} > "$OUT/configure.log"
 nice -n 19 cmake --build "$OUT" -j8 --target ragon-grammar-fuzz > "$OUT/build.log"
 
-# Seeds: one per front end (the first byte picks it).
+# Seeds: one per front end (the first byte picks it; 5 and 6 are the route bodies, chat with bit 3 set).
 seed() { printf '%b' "$2" > "$OUT/corpus/$1"; }
 seed schema '\x00{"type": "object", "properties": {"a": {"type": "array", "items": {"$ref": "#/$defs/x"}}}, "$defs": {"x": {"anyOf": [{"type": "string"}, {"enum": [1, null]}]}}, "required": ["a"]}'
 seed lark '\x01start: begin_patch hunk+ end_patch\nbegin_patch: "*** Begin Patch" LF\nend_patch: "*** End Patch" LF?\nhunk: "+" /(.*)/ LF -> line\n%%import common.LF\n'
@@ -26,6 +26,9 @@ seed exec '\x01start: pragma_source | plain_source\npragma_source: PRAGMA_LINE N
 seed regex '\x02[a-z]{2,3}\\d(-[A-F0-9]+)*|(?:\\w+\\s?)+\\.'
 seed tools '\x03?start: "x" NAME\nNAME: /[A-Z][a-z]{1,8}/\n'
 seed json_calls '\x04{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}'
+seed chat '\x0c{"messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"a": {"type": "string"}}}}}], "tool_choice": {"type": "function", "function": {"name": "f"}}, "parallel_tool_calls": false, "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}}'
+seed completions '\x05{"prompt": "Q:", "response_format": {"type": "json_object"}}'
+seed responses '\x06{"input": "hi", "tools": [{"type": "function", "name": "f", "parameters": {"type": "object"}}, {"type": "custom", "name": "apply_patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: \\"*** Begin Patch\\" LF /(.+)/ LF\\n%%import common.LF\\n"}}], "tool_choice": "required", "text": {"format": {"type": "json_schema", "name": "x", "schema": {"type": "object"}}}}'
 
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 \
   nice -n 19 "$OUT/ragon-grammar-fuzz" "$OUT/corpus" -max_total_time="$SECONDS_TO_RUN" -max_len=4096 \

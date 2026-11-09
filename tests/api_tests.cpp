@@ -325,9 +325,57 @@ static void test_response_items() {
   }
 }
 
+// Structured output stage 4: the request fields each route reads (enforcement is structured_tests').
+static void test_structured_fields() {
+  namespace rs = ragon::serve;
+  const std::string msgs = R"("messages":[{"role":"user","content":"hi"}],)";
+  const std::string tools = R"("tools":[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}},
+    {"type":"function","function":{"name":"b","parameters":{"type":"object"}}}])";
+  auto chat = [&](const std::string& extra) { return rs::parse_request(json::parse("{" + msgs + extra + "}"), true); };
+  rs::Request r = chat(tools);
+  EXPECT(!r.tool_choice_required && r.tool_choice_named.empty() && r.parallel_tool_calls && r.response_format.is_null());
+  r = chat(tools + R"(,"tool_choice":"required","parallel_tool_calls":false)");
+  EXPECT(r.tool_choice_required && !r.parallel_tool_calls && r.tools.size() == 2);
+  r = chat(tools + R"(,"tool_choice":{"type":"function","function":{"name":"b"}})");
+  EXPECT(r.tool_choice_named == "b" && r.tools.size() == 1 && r.tools[0]["function"]["name"] == "b");
+  r = chat(tools + R"(,"parallel_tool_calls":"no")");  // not a boolean: the default
+  EXPECT(r.parallel_tool_calls);
+  r = chat(R"("response_format":{"type":"json_object"},"stream":false)");
+  EXPECT(r.response_format["type"] == "json_object" && r.response_format_param == "response_format.json_schema.schema");
+  // Completions read response_format too.
+  r = rs::parse_request(json::parse(R"({"prompt":"hi","response_format":{"type":"json_schema",
+    "json_schema":{"name":"x","schema":{"type":"object"}}}})"), false);
+  EXPECT(r.response_format["type"] == "json_schema" && r.response_format["json_schema"]["schema"]["type"] == "object");
+  r = rs::parse_request(json::parse(R"({"prompt":"hi","response_format":{"type":"text"}})"), false);
+  EXPECT(r.response_format.is_null());
+  // Responses: text.format is flat; tool_choice in both shapes; a custom tool's grammar format keeps its body index.
+  r = rs::parse_responses_request(json::parse(R"({"input":"hi","text":{"format":{"type":"json_schema","name":"x",
+    "strict":true,"schema":{"type":"object"}}}})"));
+  EXPECT(r.response_format["type"] == "json_schema" && r.response_format["json_schema"]["schema"]["type"] == "object" &&
+         r.response_format_param == "text.format.schema");
+  r = rs::parse_responses_request(json::parse(R"({"input":"hi","text":{"format":{"type":"json_object"}}})"));
+  EXPECT(r.response_format["type"] == "json_object" && r.response_format_param == "text.format.schema");
+  r = rs::parse_responses_request(json::parse(R"({"input":"hi","text":{"format":{"type":"text"}}})"));
+  EXPECT(r.response_format.is_null());
+  const std::string rtools = R"("tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},
+    {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: \"x\""}},
+    {"type":"custom","name":"note"}])";
+  r = rs::parse_responses_request(json::parse("{\"input\":\"hi\"," + rtools + ",\"parallel_tool_calls\":false}"));
+  EXPECT(r.tools.size() == 3 && !r.parallel_tool_calls && r.custom_formats.size() == 1);
+  EXPECT(r.custom_formats[0].name == "apply_patch" && r.custom_formats[0].syntax == "lark" &&
+         r.custom_formats[0].definition == "start: \"x\"" && r.custom_formats[0].index == 1);
+  r = rs::parse_responses_request(json::parse("{\"input\":\"hi\"," + rtools + R"(,"tool_choice":{"type":"custom","name":"apply_patch"}})"));
+  EXPECT(r.tool_choice_named == "apply_patch" && r.tools.size() == 1);
+  r = rs::parse_responses_request(json::parse("{\"input\":\"hi\"," + rtools + R"(,"tool_choice":{"type":"function","name":"shell"}})"));
+  EXPECT(r.tool_choice_named == "shell" && r.tools.size() == 1);
+  r = rs::parse_responses_request(json::parse("{\"input\":\"hi\"," + rtools + R"(,"tool_choice":"none"})"));
+  EXPECT(r.tools.empty() && r.custom_formats.empty());
+}
+
 int main() {
   test_repetition();
   test_response_items();
+  test_structured_fields();
 
   {
     // P4c: X-Ragon-Share-Scope is opaque; absent or empty is the unscoped scope 0, any value a scope that is never 0.

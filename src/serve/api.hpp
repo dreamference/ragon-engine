@@ -78,11 +78,23 @@ struct Request {
   // `logprobs: k`. k is 0 .. kMaxTopLogprobs.
   bool logprobs = false;
   int top_logprobs = 0;
-  // Structured output (chat only): `response_format` when it asks for JSON (type json_object or json_schema; null
-  // otherwise) and whether `tool_choice` is "required". Ignored (API §3) unless ragon-serve runs with
-  // RAGON_STRUCTURED=1 (SPECULATION "Structured output, stage 2", serve/structured.hpp).
+  // Structured output (API §3, §4; SPECULATION "Structured output, stage 4", serve/structured.hpp), enforced unless
+  // ragon-serve runs with RAGON_STRUCTURED=0 or without RAGON_GRAMMAR. `response_format` when it asks for JSON (type
+  // json_object or json_schema; null otherwise; the Responses route's `text.format` in the same shape), and the name
+  // a 400 gives its schema; whether `tool_choice` is "required"; the function a named `tool_choice` fixes;
+  // `parallel_tool_calls` (false: at most one call); the grammars of the custom tools that declare one.
   json response_format;
+  std::string response_format_param = "response_format.json_schema.schema";
   bool tool_choice_required = false;
+  std::string tool_choice_named;
+  bool parallel_tool_calls = true;
+  struct CustomFormat {
+    std::string name;
+    std::string syntax;      // "lark" or "regex"
+    std::string definition;
+    int index = 0;           // the tool's index in the request body's `tools`
+  };
+  std::vector<CustomFormat> custom_formats;
   // `prompt_cache_key` (Codex sends its thread id, API §4): where the engine looks for the request's
   // resident session first, and which sessions are protected from eviction (M4 §1). A hint only: the
   // token prefix decides what is reused. Empty when the request carries none.
