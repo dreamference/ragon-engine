@@ -770,6 +770,8 @@ class Engine {
   // BACKLOG 26: the chain and its tree (scores: this sequence's), when the step takes one and it is full and worth its
   // rows; desc gets its description.
   void plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc);
+  void plan_fixed(StepPlan& sp);
+  void plan_mask_rows(StepPlan& sp, int row0, int rows);  // a batch's constrained sequence: its mask rows  // structured output: a lookup chain's masks and cut (after its padding)
   void plan_accept(StepPlan& sp, const float* vals, const int* ids);  // rows' top K -> accepted, next
   void plan_gather(StepPlan& sp);                                     // a tree's accepted path to the first rows
   void plan_count(StepPlan& sp);                               // the session's counters and shadow records
@@ -1094,7 +1096,8 @@ class Engine {
     double sh_acc_ema = -1;
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
     std::map<int, cudaGraphExec_t> tree_verify_graphs;  // a tree verify's, by top-K
-    std::map<int, cudaGraphExec_t> masked_verify_graphs;  // structured output: a verify under token masks, by top-K
+    // Structured output: a verify under token masks, by 2 x top-K + 1 for a tree.
+    std::map<int, cudaGraphExec_t> masked_verify_graphs;
     // Structured output (set_constraint): the request's constraint, the token that arms it (-1: armed from the
     // start) and whether it is armed.
     std::shared_ptr<TokenConstraint> constraint;

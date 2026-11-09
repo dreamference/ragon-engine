@@ -2733,10 +2733,11 @@ void Engine::set_constraint(int i, std::shared_ptr<TokenConstraint> c, int arm_t
     if (size_t(words) * 32 < size_t(model_->config().vocab))
       throw std::runtime_error("set_constraint: the constraint's mask is shorter than the vocabulary");
     if (!mask_pin_) {  // once, between steps (never inside a capture); kept for the engine's lifetime
-      check(cudaHostAlloc(reinterpret_cast<void**>(&mask_pin_), size_t(kernels::kMaxStreamRows) * words * sizeof(int32_t),
-                          cudaHostAllocDefault),
+      // A batch's walks may write a block past kMaxStreamRows before its row count is checked (plan_mask_rows).
+      const size_t rows = size_t(kernels::kMaxStreamRows) + kernels::kMaxSeqRows;
+      check(cudaHostAlloc(reinterpret_cast<void**>(&mask_pin_), rows * words * sizeof(int32_t), cudaHostAllocDefault),
             "mask rows");
-      mask_dev_ = reinterpret_cast<int32_t*>(alloc<int>(size_t(kernels::kMaxStreamRows) * words));
+      mask_dev_ = reinterpret_cast<int32_t*>(alloc<int>(rows * words));
       mask_words_ = words;
     } else if (words != mask_words_) {
       throw std::runtime_error("set_constraint: a mask of another width");

@@ -594,6 +594,218 @@ bool check_walk_refusal() {
   return threw;
 }
 
+// Stage 3: the tree's masks by a depth-first walk (walk_tree). Random trees over the toy grammar: each reachable row's
+// mask is the state after its path, a child its parent's state refuses (or one after the grammar's end) is dead, the
+// rows under a dead node and the unarmed ones are all-ones, and the constraint is rolled back. A second walk that
+// reuses the first's chain rows (chain_filled) gives the same masks.
+bool check_walk_tree() {
+  std::mt19937_64 rng(31);
+  bool ok = true;
+  int dead_seen = 0, ended_seen = 0, unarmed_seen = 0;
+  for (int trial = 0; trial < 400; ++trial) {
+    const int E = 1 + int(rng() % 11), n = E + 1 + int(rng() % 8);
+    ragon::DraftTree t;
+    t.E = E;
+    t.parent.assign(n, -1);
+    t.token.assign(n, 0);
+    t.children.assign(n, {});
+    for (int r = 1; r < n; ++r) {
+      t.parent[r] = r <= E ? r - 1 : int(rng() % r);
+      t.children[t.parent[r]].push_back(r);
+    }
+    ToyConstraint con;
+    const int start = int(rng() % 5);
+    for (int i = 0; i < start; ++i) con.accept(i % 3);
+    const std::vector<int> before = con.acc;
+    const int arm = trial % 5 == 0 ? 9 : -1;
+    // Tokens mostly allowed on their path (so trees grow deep), some refused, some the stop, some the arm token.
+    {
+      std::vector<int> depth_n(n, int(before.size()));
+      for (int r = 1; r < n; ++r) {
+        const int d = depth_n[t.parent[r]];
+        const int roll = int(rng() % 10);
+        int tok = roll < 6 ? (d % 3) + 3 * int(rng() % 20) : roll < 8 ? int(rng() % 63) : roll < 9 ? kToyStop : 9;
+        if (tok >= kToyV) tok = d % 3;
+        t.token[r] = tok;
+        depth_n[r] = d + 1;
+      }
+    }
+    // The reference: each row's state by replaying its path.
+    std::vector<char> exp_dead(n, 0), reach(n, 0), own(n, 0);
+    std::vector<std::vector<int32_t>> exp_mask(n, std::vector<int32_t>(kToyWords, -1));
+    bool any_masked = false;
+    for (int u = 0; u < n; ++u) {
+      std::vector<int> path;
+      for (int r = u; r > 0; r = t.parent[r]) path.push_back(r);
+      std::reverse(path.begin(), path.end());
+      ToyConstraint st;
+      st.acc = before;
+      bool armed = arm < 0, live = true;
+      for (int c : path) {
+        const int tok = t.token[c];
+        if (!armed) {
+          armed = tok == arm;
+          continue;
+        }
+        if (st.done || !st.allows(tok)) {
+          if (c == u) exp_dead[u] = 1;
+          live = false;
+          break;
+        }
+        st.accept(tok);
+      }
+      reach[u] = live;
+      if (live && armed && !st.done) {
+        own[u] = 1;
+        any_masked = true;
+        st.fill(exp_mask[u].data());
+      }
+      if (live && !armed) ++unarmed_seen;
+      if (live && st.done) ++ended_seen;
+    }
+    std::vector<int32_t> masks(size_t(n) * kToyWords, 0x5a5a5a5a);
+    ragon::TreeMaskWalk w;
+    w.token = &t.token;
+    w.children = &t.children;
+    w.E = E;
+    w.con = &con;
+    w.armed = arm < 0;
+    w.arm_token = arm;
+    w.masks = masks.data();
+    w.words = kToyWords;
+    ragon::walk_tree(w);
+    ok &= con.acc == before && !con.done;
+    ok &= w.masked == any_masked;
+    for (int u = 0; u < n; ++u) {
+      ok &= bool(w.dead[u]) == bool(exp_dead[u]);
+      dead_seen += exp_dead[u];
+      if (any_masked) ok &= std::equal(exp_mask[u].begin(), exp_mask[u].end(), masks.begin() + size_t(u) * kToyWords);
+    }
+    if (any_masked) {  // the chain rows reused: the same masks and dead nodes
+      std::vector<char> chain(E + 1, 0);
+      for (int e = 0; e <= E; ++e) chain[e] = own[e];
+      std::vector<int32_t> again(masks.size(), 0x5a5a5a5a);
+      for (int e = 0; e <= E; ++e)
+        if (chain[e]) std::copy_n(masks.begin() + size_t(e) * kToyWords, kToyWords, again.begin() + size_t(e) * kToyWords);
+      ragon::TreeMaskWalk w2 = w;
+      w2.chain_filled = &chain;
+      w2.masks = again.data();
+      ragon::walk_tree(w2);
+      ok &= again == masks && w2.dead == w.dead && con.acc == before;
+    }
+  }
+  ok &= dead_seen > 200 && ended_seen > 20 && unarmed_seen > 20;
+  std::printf("tree walk, constrained: masks per path, dead nodes, rollback (%d dead, %d ended, %d unarmed) %s\n",
+              dead_seen, ended_seen, unarmed_seen, ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// Stage 3: a lookup proposal (q = 1) under the grammar (walk_fixed): cut at its first refused token, or after the
+// token that ends it; the masks of rows 0 .. cut are the states on the way; the constraint is rolled back.
+bool check_walk_fixed() {
+  std::mt19937_64 rng(37);
+  bool ok = true;
+  int cut_mid = 0, cut_end = 0, whole = 0;
+  for (int trial = 0; trial < 400; ++trial) {
+    const int E = 1 + int(rng() % 11);
+    ToyConstraint con;
+    const int start = int(rng() % 5);
+    for (int i = 0; i < start; ++i) con.accept(i % 3);
+    const std::vector<int> before = con.acc;
+    const int arm = trial % 6 == 0 ? 9 : -1;
+    std::vector<int> tok(E);
+    for (int e = 0; e < E; ++e) {
+      const int d = start + e, roll = int(rng() % 12);
+      tok[e] = roll < 9 ? (d % 3) + 3 * int(rng() % 20) : roll < 10 ? int(rng() % 63) : roll < 11 ? kToyStop : 9;
+      if (tok[e] >= kToyV) tok[e] = d % 3;
+    }
+    std::vector<int32_t> masks(size_t(E + 1) * kToyWords, 0x5a5a5a5a);
+    ragon::FixedWalk w;
+    w.tokens = tok.data();
+    w.E = E;
+    w.con = &con;
+    w.armed = arm < 0;
+    w.arm_token = arm;
+    w.masks = masks.data();
+    w.words = kToyWords;
+    ragon::walk_fixed(w);
+    ok &= con.acc == before && !con.done;
+    ToyConstraint st;
+    st.acc = before;
+    bool armed = arm < 0, any = false;
+    int cut = E;
+    std::vector<std::vector<int32_t>> exp(E + 1, std::vector<int32_t>(kToyWords, -1));
+    for (int e = 0; e <= E; ++e) {
+      if (armed && !st.done) {
+        st.fill(exp[e].data());
+        any = true;
+      }
+      if (e == E) break;
+      if (!armed) {
+        armed = tok[e] == arm;
+        continue;
+      }
+      if (st.done) continue;
+      if (!st.allows(tok[e])) {
+        cut = e;
+        break;
+      }
+      st.accept(tok[e]);
+      if (st.done) {
+        cut = e + 1;
+        break;
+      }
+    }
+    ok &= w.cut == cut && w.masked == any;
+    if (any)
+      for (int e = 0; e <= E; ++e) ok &= std::equal(exp[e].begin(), exp[e].end(), masks.begin() + size_t(e) * kToyWords);
+    cut_end += st.done;
+    cut_mid += cut < E && !st.done;
+    whole += cut == E;
+  }
+  ok &= cut_mid > 50 && cut_end > 20 && whole > 20;
+  std::printf("lookup walk, constrained: cut, masks, rollback (%d cut, %d ended, %d whole) %s\n", cut_mid, cut_end, whole,
+              ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// Stage 3: the accept rules never enter a dead node, greedy or sampled, even when the target puts all its mass on it.
+bool check_dead_accept() {
+  ragon::DraftTree t;  // 0 -> 1 (chain, token 5) -> 2 (chain, token 6); 0 -> 3 (extra, token 7)
+  t.E = 2;
+  t.parent = {-1, 0, 1, 0};
+  t.depth = {0, 1, 2, 1};
+  t.token = {0, 5, 6, 7};
+  t.pick = {0, 0, 0, 1};
+  t.children = {{1, 3}, {2}, {}, {}};
+  bool ok = true;
+  int next = -1;
+  const int argmax_live[4] = {5, 6, 9, 9};
+  ok &= ragon::accept_tree_greedy(t, argmax_live, next) == std::vector<int>({0, 1, 2}) && next == 9;
+  t.dead = {0, 1, 0, 0};  // the chain's first node refused
+  ok &= ragon::accept_tree_greedy(t, argmax_live, next) == std::vector<int>({0}) && next == 5;
+  const int argmax_extra[4] = {7, 9, 9, 8};
+  ok &= ragon::accept_tree_greedy(t, argmax_extra, next) == std::vector<int>({0, 3}) && next == 8;
+  t.dead = {0, 0, 0, 1};
+  ok &= ragon::accept_tree_greedy(t, argmax_extra, next) == std::vector<int>({0}) && next == 7;
+  // Sampled: the target sure of the dead node's token, the draft sure of the chain's.
+  std::mt19937_64 rng(41);
+  auto q = [](int e, int tok) { return (e == 0 && tok == 5) || (e == 1 && tok == 6) ? 1.0 : 0.0; };
+  std::vector<ragon::Dist> P = {{{5, 1.0}}, {{6, 1.0}}, {{9, 1.0}}, {{9, 1.0}}};
+  for (int i = 0; i < 50; ++i) {
+    t.dead = {0, 1, 0, 0};
+    const std::vector<int> path = ragon::accept_tree_sampled(t, P, q, rng, next);
+    ok &= path == std::vector<int>({0}) && next == 5;
+    P[0] = {{7, 1.0}};
+    t.dead = {0, 0, 0, 1};
+    const std::vector<int> path2 = ragon::accept_tree_sampled(t, P, q, rng, next);
+    ok &= path2 == std::vector<int>({0}) && next == 7;
+    P[0] = {{5, 1.0}};
+  }
+  std::printf("tree accept never enters a dead node %s\n", ok ? "ok" : "FAIL");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -610,6 +822,9 @@ int main() {
   ok &= check_walk_plain();
   ok &= check_walk_constrained();
   ok &= check_walk_refusal();
+  ok &= check_walk_tree();
+  ok &= check_walk_fixed();
+  ok &= check_dead_accept();
   std::printf(ok ? "all spec tests passed\n" : "SPEC TESTS FAILED\n");
   return ok ? 0 : 1;
 }
