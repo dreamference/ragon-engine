@@ -1,5 +1,6 @@
 // JSON schema, the stage 1 subset (§2.1): checks the keywords, strips annotations, and turns the schema into a
 // JSON grammar whose whitespace slots are bounded.
+#include <cstdint>
 #include <regex>
 #include <set>
 
@@ -14,6 +15,7 @@ namespace {
 using ojson = nlohmann::ordered_json;
 
 constexpr int kMaxDepth = 64;  // schema nesting; deeper schemas are refused (and keep the walk off the stack)
+constexpr std::uint64_t kMaxItemsBound = 2147483647;  // minItems, maxItems: XGrammar's repetition bound (int32)
 
 const std::set<std::string> kAnnotations = {"title",   "description", "default",  "examples",
                                             "$schema", "$id",         "$comment", "format"};
@@ -121,6 +123,10 @@ struct Walker {
       } else if (kw == "items") {
         if (!v.is_object() && !v.is_boolean()) invalid("'items' is not one schema", ptr);
         out[kw] = schema(v, here, depth + 1);
+      } else if (kw == "minItems" || kw == "maxItems") {  // an array's bounds, compiled by XGrammar as a repetition
+        if (!v.is_number_integer() || v.get<std::int64_t>() < 0 || v.get<std::uint64_t>() > kMaxItemsBound)
+          invalid("'" + kw + "' is not an integer from 0 to " + std::to_string(kMaxItemsBound), ptr);
+        out[kw] = v;
       } else if (kw == "enum") {
         if (!v.is_array() || v.empty()) invalid("'enum' is not a non-empty list", ptr);
         out[kw] = v;
@@ -150,6 +156,9 @@ struct Walker {
         unsupported(kw, ptr);
       }
     }
+    if (out.contains("minItems") && out.contains("maxItems") &&
+        out["minItems"].get<std::uint64_t>() > out["maxItems"].get<std::uint64_t>())
+      invalid("'minItems' is greater than 'maxItems'", ptr);
     return out;
   }
 };

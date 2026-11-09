@@ -197,7 +197,7 @@ void test_schema_whitelist() {
 void test_schema_refusals() {
   const char* refused[] = {"minLength",        "maxLength",        "pattern",           "minimum",
                            "maximum",          "exclusiveMinimum", "exclusiveMaximum",  "multipleOf",
-                           "minItems",         "maxItems",         "uniqueItems",       "prefixItems",
+                           "uniqueItems",      "prefixItems",
                            "contains",         "minContains",      "maxContains",       "oneOf",
                            "allOf",            "not",              "if",                "then",
                            "else",             "patternProperties", "propertyNames",    "minProperties",
@@ -556,6 +556,44 @@ void test_response_format() {
   EXPECT(m.can_stop() && m.allowed(g_im_end) && m.accept(g_im_end) && m.terminated());
 }
 
+// Stage 3: minItems and maxItems bound an array (XGrammar's repetition); a bounded array stops at its bound: after
+// the last item the grammar refuses a comma, takes the bracket, and then the stop token. Bad bounds are invalid.
+void test_array_bounds() {
+  Grammar g = schema(R"({"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 3})");
+  ACCEPTS(g, "[1]");
+  ACCEPTS(g, "[1, 2, 3]");
+  REJECTS(g, "[]");
+  REJECTS(g, "[1, 2, 3, 4]");
+  Grammar none = schema(R"({"type": "array", "items": {"type": "string"}, "maxItems": 0})");
+  ACCEPTS(none, "[]");
+  REJECTS(none, R"(["a"])");
+  Grammar obj = schema(R"({"type": "object", "properties": {"xs": {"type": "array", "items": {"type": "boolean"},
+                           "maxItems": 2}}, "required": ["xs"]})");
+  ACCEPTS(obj, R"({"xs": [true, false]})");
+  REJECTS(obj, R"({"xs": [true, false, true]})");
+  // The bounded array stops: token by token, the comma is refused after the third item.
+  Grammar rf = g_comp->response_format(ojson::parse(R"({"type": "array", "items": {"type": "integer"}, "maxItems": 3})"),
+                                       kSchemaParam);
+  Matcher m(rf);
+  for (int id : g_tok->encode("[1, 2, 3")) EXPECT(m.accept(id));
+  for (const char* more : {",", ", "}) {
+    const std::vector<int> ids = g_tok->encode(more);
+    EXPECT(ids.size() == 1 && !m.allowed(ids[0]));
+  }
+  EXPECT(!m.can_stop() && !m.allowed(g_im_end));
+  for (int id : g_tok->encode("]")) EXPECT(m.accept(id));
+  EXPECT(m.can_stop() && m.allowed(g_im_end) && m.accept(g_im_end) && m.terminated());
+  // Bad bounds.
+  EXPECT_EQ(refusal([&] { (void)schema(R"({"type": "array", "minItems": -1})"); }),
+            "invalid_json_schema|" + kSchemaParam + ": 'minItems' is not an integer from 0 to 2147483647 at \"\"");
+  EXPECT_EQ(refusal([&] { (void)schema(R"({"type": "array", "maxItems": 1.5})"); }),
+            "invalid_json_schema|" + kSchemaParam + ": 'maxItems' is not an integer from 0 to 2147483647 at \"\"");
+  EXPECT_EQ(refusal([&] { (void)schema(R"({"type": "array", "maxItems": 4294967296})"); }),
+            "invalid_json_schema|" + kSchemaParam + ": 'maxItems' is not an integer from 0 to 2147483647 at \"\"");
+  EXPECT_EQ(refusal([&] { (void)schema(R"({"type": "object", "properties": {"a": {"minItems": 3, "maxItems": 2}}})"); }),
+            "invalid_json_schema|" + kSchemaParam + ": 'minItems' is greater than 'maxItems' at /properties/a");
+}
+
 // The stop token is allowed exactly where the grammar is complete; padding and control tokens never are.
 void test_stop_and_padding() {
   Grammar g = schema(kDocSchema);
@@ -748,6 +786,7 @@ int main(int argc, char** argv) {
       {"lark", test_lark},
       {"tool_calls", test_tool_calls},
       {"response_format", test_response_format},
+      {"array_bounds", test_array_bounds},
       {"stop_and_padding", test_stop_and_padding},
       {"matcher_ops", test_matcher_ops},
       {"cache", test_cache},
