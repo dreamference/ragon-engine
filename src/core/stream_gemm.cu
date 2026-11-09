@@ -31,8 +31,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ragon::kernels {
 namespace {
@@ -195,8 +198,11 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
   const uint8_t* __restrict__ w = pr.w[pi];
   const float gscale = pr.gscale[pi];
   const int N = pr.N[pi];
-  // tok0 (stream_gemm_pair_kernel): this block's tokens start at row tok0 of x, xinv and y.
+  // tok0 (stream_gemm_pair_kernel): this block's tokens start at row tok0 of x, xinv, y and each split's slice of
+  // part (slices of the launch's full M rows: [split][row][column]).
   float* __restrict__ y = pr.y[pi] + static_cast<size_t>(tok0) * N;
+  const int part_rows = M;
+  if (part) part += static_cast<size_t>(tok0) * N;
   x += static_cast<size_t>(tok0) * K;
   xinv += tok0;
   M -= tok0;
@@ -418,7 +424,7 @@ __device__ __forceinline__ void stream_gemm_body(const __half* __restrict__ x, c
         y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
       }
     } else
-      part[(static_cast<size_t>(by) * M + n) * N + row0 + r] = sum;
+      part[(static_cast<size_t>(by) * part_rows + n) * N + row0 + r] = sum;
   }
   }  // groups
 }
@@ -441,7 +447,8 @@ __global__ void __launch_bounds__(kWarps * 32)
 // and past 32 rows that traffic, not DRAM or the MMAs, capped the two-group launch (8 bytes per weight byte at 64
 // rows; four tiles over 32 tokens are 2). Four tiles' warp-reduction buffer passes the 48 KB of static shared
 // memory, so it is the launch's dynamic one (DYNRED). Each element's arithmetic is the one-group body's, so the bits
-// are the same.
+// are the same. Split K (sg64_ksplit, blockIdx.y): each split's pair writes its partial sums to part, which
+// split_reduce_kernel adds in split order.
 template <int NT, int TILES>
 constexpr size_t pair_red_bytes() {
   return size_t(kWarps) * TILES * 16 * (NT * 8 + 1) * sizeof(float);
@@ -450,11 +457,11 @@ constexpr size_t pair_red_bytes() {
 template <int NT, int TILES, bool FP4, int PF, bool CODED = false, int PROF = 0, bool XQ = false, bool ROWF = false>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_pair_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
-                            int K) {
+                            int K, int ksplit, float* __restrict__ part) {
   constexpr bool dyn = pair_red_bytes<NT, TILES>() > 48 * 1024;
   const int b = blockIdx.x;
-  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, dyn, false, 1, PROF, XQ, ROWF>(x, xinv, M, pr, K, 1, nullptr, b >> 1,
-                                                                               0, PdlBegin{}, (b & 1) * NT * 8);
+  stream_gemm_body<NT, TILES, FP4, PF, CODED, false, dyn, false, 1, PROF, XQ, ROWF>(
+      x, xinv, M, pr, K, ksplit, part, b >> 1, blockIdx.y, PdlBegin{}, (b & 1) * NT * 8);
 }
 
 template <int NT, int GROUPS = 1>
@@ -723,6 +730,59 @@ bool sg64_rowf() {
   return on;
 }
 
+// Split K for the pair launches whose last wave is mostly idle. A launch of one matrix with 3 to 4 waves of its
+// one-block-per-SM blocks and a last wave at most half full (on GB10's 48 SMs: the N = 5,120 matrices, attn o, gdn
+// out and ffn down, 160 blocks = 3.33 waves) can split K in RAGON_SG64_KSPLIT parts (off by default; 3: 480 blocks,
+// 10 full waves; at most 8), each part at least one chunk per warp. Each split writes its partial sums to an FP32
+// workspace and split_reduce_kernel adds them in split order, so a result does not depend on block scheduling and is
+// the same in every run; the choice depends only on the matrix shape and the GPU, never on M, so every row count
+// from 33 to 64 gives a row the same bits. Against the unsplit launch (and so against M <= 32, which does not split)
+// the FP32 summation order differs: those three matrices' outputs move in their last bits. Measured slower
+// (2026-11-09): with a third of K a block's one-chunk-in-flight pipeline does not fill, the 160 x 3 launch takes
+// 170.5 us against 154.7 unsplit (the reduce 5.3 us), so it stays off.
+int sg64_ksplit(int n, int pair_blocks, int K) {
+  static const int want = std::min(8, sg64_flag("RAGON_SG64_KSPLIT", 1));
+  static const int sms = [] {
+    int dev = 0, v = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
+    return std::max(1, v);
+  }();
+  if (want <= 1 || n != 1) return 1;
+  const int waves = pair_blocks / sms, last = pair_blocks % sms;
+  if (waves != 3 || last == 0 || 2 * last > sms) return 1;
+  if ((K / kChunk) / want < kWarps) return 1;
+  return want;
+}
+
+// The pair split's workspace: one per stream (launches on two streams may overlap), sized once for the largest
+// launch sg64_ksplit picks (8 splits x kMaxStreamRows rows x N, N below 2 x SMs x 64 columns), never reallocated,
+// so a captured graph's pointer stays valid; allocated under relaxed capture mode, since the first use may be
+// inside a capture.
+float* pair_split_buffer(cudaStream_t s, size_t floats) {
+  static std::mutex mu;
+  static std::vector<std::pair<cudaStream_t, std::pair<float*, size_t>>> bufs;
+  std::lock_guard<std::mutex> lock(mu);
+  for (auto& b : bufs)
+    if (b.first == s) {
+      if (floats > b.second.second) throw std::runtime_error("stream_gemm pair split: workspace too small");
+      return b.second.first;
+    }
+  int sms = 0, dev = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  // sg64_ksplit takes fewer than 4 x SMs pair blocks: N < 2 x SMs x 64.
+  const size_t cap = std::max(floats, size_t(8) * kMaxStreamRows * 2 * std::max(sms, 1) * 64);
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  float* p = nullptr;
+  const cudaError_t e = cudaMalloc(&p, cap * sizeof(float));
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  if (e != cudaSuccess) throw std::runtime_error("stream_gemm pair split: workspace");
+  bufs.push_back({s, {p, cap}});
+  return p;
+}
+
 template <int NT, int TILES, bool FP4, int PF, bool CODED, int GROUPS, bool PAIR>
 auto prof_kernel(int mode) {
   if constexpr (PAIR) {
@@ -781,7 +841,13 @@ void launch(const __half* x, const float* xinv, int M, const StreamTarget* t, in
           cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
       if (set != cudaSuccess) throw std::runtime_error(std::string("stream_gemm pair: ") + cudaGetErrorString(set));
     }
-    launch_kernel("stream_gemm pair", kern, dim3(2 * blocks), dim3(kWarps * 32), smem, s, x, xinv, M, pr, K);
+    const int ksplit = sg64_ksplit(n, 2 * blocks, K);
+    float* part = ksplit > 1 ? pair_split_buffer(s, size_t(ksplit) * M * t[0].N) : nullptr;
+    launch_kernel("stream_gemm pair", kern, dim3(2 * blocks, ksplit), dim3(kWarps * 32), smem, s, x, xinv, M, pr, K,
+                  ksplit, part);
+    if (ksplit > 1)
+      launch_kernel("stream_gemm pair split", split_reduce_kernel, dim3((M * t[0].N + 255) / 256), dim3(256), 0, s, part,
+                    ksplit, M, t[0].N, t[0].scale, xinv, t[0].y);
     return;
   }
   const int ksplit = n == 1 ? choose_ksplit(blocks, K) : 1;

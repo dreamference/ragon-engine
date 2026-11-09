@@ -417,6 +417,74 @@ bool test_gemm_wide() {
   return ok;
 }
 
+// Split K in the pair tier (sg64_ksplit): an out-projection-shaped launch (N = 5120: 160 pair blocks, a last wave a
+// third full) splits K by RAGON_SG64_KSPLIT (off by default: run with RAGON_SG64_KSPLIT=3 to test the split) and
+// adds the slices in split order. Two 64-row launches give the same bits, rows of a 33 .. 48-row launch match the
+// 64-row one, and rows 0 .. 31 stay within rounding of the unsplit 32-row launch (with the split the summation order
+// differs there, so the bits may; without it none differ).
+bool test_gemm_split() {
+  std::mt19937 rng(13);
+  std::uniform_int_distribution<int> byte(0, 255), scale_byte(0x28, 0x48);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const int N = 5120, K = 3072, MMAX = ragon::kernels::kMaxStreamRows;
+  std::vector<uint8_t> w4(size_t(N) * K / 2), s4(size_t(N) * K / 16), w8(size_t(N) * K);
+  for (auto& b : w4) b = byte(rng);
+  for (auto& b : s4) b = scale_byte(rng);
+  for (auto& b : w8) {
+    do b = byte(rng);
+    while ((b & 0x7f) == 0x7f);
+  }
+  std::vector<float> x(size_t(MMAX) * K);
+  for (float& v : x) v = normal(rng);
+  uint8_t *rw4 = upload(w4), *ds4 = upload(s4), *rw8 = upload(w8), *dw4, *dw8;
+  cudaMalloc(&dw4, ragon::kernels::tiled_bytes_nvfp4(N, K));
+  cudaMalloc(&dw8, ragon::kernels::tiled_bytes_fp8(N, K));
+  ragon::kernels::retile_nvfp4(rw4, ds4, dw4, N, K, nullptr);
+  ragon::kernels::retile_fp8(rw8, dw8, N, K, nullptr);
+  float* dx = upload(x);
+  __half* xh;
+  float *xinv, *dy;
+  cudaMalloc(&xh, size_t(MMAX) * K * sizeof(__half));
+  cudaMalloc(&xinv, MMAX * sizeof(float));
+  cudaMalloc(&dy, size_t(MMAX) * N * sizeof(float));
+  bool ok = true;
+  for (bool fp4 : {true, false}) {
+    const uint8_t* w = fp4 ? dw4 : dw8;
+    run(fp4, dx, MMAX, K, xh, xinv, w, ds4, 0.5f, dy, N);
+    const std::vector<float> full = download(dy, size_t(MMAX) * N);
+    run(fp4, dx, MMAX, K, xh, xinv, w, ds4, 0.5f, dy, N);
+    const std::vector<float> again = download(dy, size_t(MMAX) * N);
+    bool same = std::memcmp(again.data(), full.data(), full.size() * sizeof(float)) == 0;
+    for (int M : {33, 36, 48}) {
+      run(fp4, dx, M, K, xh, xinv, w, ds4, 0.5f, dy, N);
+      const std::vector<float> got = download(dy, size_t(M) * N);
+      same &= std::memcmp(got.data(), full.data(), got.size() * sizeof(float)) == 0;
+    }
+    run(fp4, dx, 32, K, xh, xinv, w, ds4, 0.5f, dy, N);
+    const std::vector<float> head = download(dy, size_t(32) * N);
+    double ss = 0, worst = 0;
+    size_t differ = 0;
+    for (size_t i = 0; i < head.size(); ++i) {
+      ss += double(head[i]) * head[i];
+      worst = std::max(worst, std::fabs(double(head[i]) - full[i]));
+      differ += head[i] != full[i];
+    }
+    const double rms = std::sqrt(ss / head.size()), rel = worst / std::max(rms, 1e-30);
+    const bool close = std::isfinite(rel) && rel < 1e-4;
+    ok &= same && close;
+    uint64_t h = 1469598103934665603ull;  // FNV-1a of the 64-row output: the same in every run (determinism gate)
+    for (const unsigned char c : std::string(reinterpret_cast<const char*>(full.data()), full.size() * sizeof(float)))
+      h = (h ^ c) * 1099511628211ull;
+    std::printf("stream_gemm %-5s split (N=%d K=%d) 64-row runs and M = 33 .. 48 identical: %s; rows 0 .. 31 vs a "
+                "32-row launch: max |diff| %.2e of rms, %zu of %zu values differ; output hash %016llx: %s\n",
+                fp4 ? "nvfp4" : "fp8", N, K, same ? "yes" : "NO", rel, differ, head.size(),
+                static_cast<unsigned long long>(h), same && close ? "ok" : "FAIL");
+  }
+  cudaFree(dw4), cudaFree(dw8), cudaFree(rw4), cudaFree(ds4), cudaFree(rw8), cudaFree(dx), cudaFree(xh), cudaFree(xinv),
+      cudaFree(dy);
+  return ok;
+}
+
 // BACKLOG 19's selection: every row a mask marks (two sessions' masks joined), then the `dynamic` best other rows by
 // the rank-256 scores (checked against the scores the kernel computed: no unselected row scores above a selected one),
 // in id order; and the mark kernel sets exactly the rows it is given.
@@ -1568,6 +1636,7 @@ int main(int argc, char** argv) {
   bool ok = test_to_half_rows();
   ok &= test_gemm();
   ok &= test_gemm_wide();
+  ok &= test_gemm_split();
   ok &= test_bf16_rows();
   ok &= test_sparse_select();
   ok &= test_draft_head_batch();
