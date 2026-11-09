@@ -100,6 +100,8 @@
 // prompt decoded alone (speculatively, from a cold engine, under the same seed). With --graphs the runs alone and the
 // batch both replay step graphs (the batch path's own since stage 4). Tree verification (BACKLOG 26) stays on: a
 // batched sequence takes the tree it takes alone, step for step, and the check prints how many it took.
+// --batch-mixed (structured output, stage 3; needs --grammar-schema or --grammar-tools) constrains B, alone and in
+// every batch, and leaves A free: one masked and one unmasked sequence share each verify pass.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -358,7 +360,7 @@ int main(int argc, char** argv) {
   int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
   bool fanout_check = false;
   bool fork_check = false, joint_check = false;
-  bool interleave_check = false, batch_check = false, batch_bench = false, draft_bf16 = false, switch_check = false;
+  bool interleave_check = false, batch_check = false, batch_bench = false, batch_mixed = false, draft_bf16 = false, switch_check = false;
   std::vector<std::pair<std::string, std::string>> extra_drafters;  // --drafter ID=DIR, beside --draft (`general`)
   double draft_off_below = -1;  // the drafter-off guard (BACKLOG 10): the engine's default unless given
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
@@ -423,6 +425,7 @@ int main(int argc, char** argv) {
     else if (a == "--fork-check") fork_check = true;
     else if (a == "--joint-check") joint_check = true;
     else if (a == "--batch-bench") batch_check = batch_bench = true;
+    else if (a == "--batch-mixed") batch_mixed = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else if (a == "--vision-prompts") vision_prompts = next();
@@ -951,6 +954,12 @@ int main(int argc, char** argv) {
     if (batch_check) {
       if (!engine.has_drafter() || engine.sessions() < 2 || prompts.size() < 2)
         throw std::runtime_error("--batch-check needs --draft, --sessions 2 and at least two prompts");
+      if (batch_mixed && !make_constraint)
+        throw std::runtime_error("--batch-mixed needs --grammar-schema or --grammar-tools");
+      // With --batch-mixed, B (the second of each pair) is constrained, alone and batched, and A is not.
+      auto constrain = [&](int k, int session, const std::vector<int>& prompt) {
+        if (batch_mixed && k == 1) engine.set_constraint(session, make_constraint(), arm_token(prompt));
+      };
       // Emits q's pending tokens; true when q is done.
       auto emit = [&](Seq& q, int limit) {
         for (int t : q.pending) {
@@ -989,10 +998,11 @@ int main(int argc, char** argv) {
           }
         }
       };
-      auto start = [&](Seq& q, int session, const std::vector<int>& prompt, int drafter) {
+      auto start = [&](Seq& q, int session, const std::vector<int>& prompt, int drafter, int k) {
         q.session = session;
         activate(session, "", true, drafter);
         engine.prefill(prompt, nullptr, false, IMG);
+        constrain(k, session, prompt);
         q.pending = {engine.sample(engine.logits(), q.sp, engine.history())};
       };
       for (size_t pi = 0; pi + 1 < prompts.size(); pi += 2) {
@@ -1002,8 +1012,8 @@ int main(int argc, char** argv) {
           Seq q[2];
           q[0].sp.temperature = q[1].sp.temperature = 0.f;
           q[0].sp.seed = q[1].sp.seed = 1;
-          start(q[0], 0, *P[0], 0);
-          start(q[1], 1, *P[1], other_drafter);
+          start(q[0], 0, *P[0], 0, 0);
+          start(q[1], 1, *P[1], other_drafter, 1);
           run_batch({&q[0], &q[1]});
           const ragon::SpecStats& s = engine.session_spec_stats(q[0].session);
           const ragon::SpecStats& o = engine.session_spec_stats(q[1].session);
@@ -1025,7 +1035,7 @@ int main(int argc, char** argv) {
             engine.reset_all();
             Seq q;
             q.sp = sp;
-            start(q, 0, *P[k], k ? other_drafter : 0);
+            start(q, 0, *P[k], k ? other_drafter : 0, k);
             while (!q.done) advance(q, max_tokens);
             alone[k] = result_of(q);
           }
@@ -1039,19 +1049,21 @@ int main(int argc, char** argv) {
             q[0].sp = q[1].sp = sp;
             int chunks_beside = 0, steps_beside = 0;
             if (run < 2) {
-              start(q[0], 0, *P[0], 0);
-              start(q[1], 1, *P[1], other_drafter);
+              start(q[0], 0, *P[0], 0, 0);
+              start(q[1], 1, *P[1], other_drafter, 1);
               run_batch(run == 0 ? std::vector<Seq*>{&q[0], &q[1]} : std::vector<Seq*>{&q[1], &q[0]});
             } else {
               const int f = run == 2 ? 0 : 1, o = 1 - f;  // first (decoding), other (prefilling)
-              start(q[f], 0, *P[f], f ? other_drafter : 0);
+              start(q[f], 0, *P[f], f ? other_drafter : 0, f);
               for (int k = 0; k < 2 && !q[f].done; ++k) advance(q[f], max_tokens);
               q[o].session = 1;
               activate(1, "", true, o ? other_drafter : 0);
               ragon::Engine::PrefillCursor cur = engine.begin_prefill(*P[o], false, IMG);
               while (!cur.done()) {
-                if (engine.prefill_chunk(cur, q[f].done ? 0 : contended))
+                if (engine.prefill_chunk(cur, q[f].done ? 0 : contended)) {
+                  constrain(o, 1, *P[o]);
                   q[o].pending = {engine.sample(engine.logits(), q[o].sp, engine.history())};
+                }
                 chunks_beside += !q[f].done;
                 if (!q[f].done) {
                   advance(q[f], max_tokens);
