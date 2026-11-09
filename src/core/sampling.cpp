@@ -22,6 +22,17 @@ void require_finite_topk(std::span<const float> vals, std::span<const int> ids, 
     if (!std::isfinite(vals[i]) || vals[i] == -FLT_MAX || ids[i] < 0 || ids[i] >= vocab) throw NonFiniteLogits();
 }
 
+int require_finite_topk_masked(std::span<const float> vals, std::span<const int> ids, int vocab) {
+  const size_t k = std::min(vals.size(), ids.size());
+  size_t n = 0;
+  while (n < k && !(vals[n] == -FLT_MAX && ids[n] == 0x7fffffff)) ++n;
+  if (n == 0) throw NonFiniteLogits();
+  require_finite_topk(vals.subspan(0, n), ids.subspan(0, n), vocab);
+  for (size_t i = n; i < k; ++i)
+    if (!(vals[i] == -FLT_MAX && ids[i] == 0x7fffffff)) throw NonFiniteLogits();
+  return static_cast<int>(n);
+}
+
 int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
                   std::mt19937_64& rng) {
   require_finite(logits);
@@ -39,6 +50,38 @@ int sample_logits(std::span<const float> logits, const SamplingParams& p, std::s
   const int k = (p.top_k > 0 && p.top_k < V) ? p.top_k : V;
   std::vector<int> idx(V);
   std::iota(idx.begin(), idx.end(), 0);
+  std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return l[a] > l[b]; });
+  idx.resize(k);
+  std::vector<float> top(k);
+  for (int i = 0; i < k; ++i) top[i] = l[idx[i]];
+  return sample_topk(top, idx, p, rng);
+}
+
+int sample_logits_masked(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
+                         std::mt19937_64& rng, const int32_t* mask) {
+  require_finite(logits);
+  const int V = static_cast<int>(logits.size());
+  std::vector<float> l(logits.begin(), logits.end());
+  if (p.presence_penalty != 0.f || p.repetition_penalty != 1.f) {
+    std::unordered_set<int> seen(output.begin(), output.end());
+    for (int t : seen) {
+      if (t < 0 || t >= V) continue;
+      if (p.repetition_penalty != 1.f) l[t] = l[t] > 0 ? l[t] / p.repetition_penalty : l[t] * p.repetition_penalty;
+      l[t] -= p.presence_penalty;
+    }
+  }
+  std::vector<int> idx;
+  for (int t = 0; t < V; ++t)
+    if (mask_allows(mask, t)) idx.push_back(t);
+  if (idx.empty()) throw ConstraintError("structured output: the grammar allows no token here");
+  if (p.temperature <= 0.f) {
+    int best = idx[0];
+    for (int t : idx)
+      if (l[t] > l[best]) best = t;  // ties to the lower id, like max_element
+    return best;
+  }
+  const int n = static_cast<int>(idx.size());
+  const int k = (p.top_k > 0 && p.top_k < n) ? p.top_k : n;
   std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return l[a] > l[b]; });
   idx.resize(k);
   std::vector<float> top(k);

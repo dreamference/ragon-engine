@@ -52,6 +52,7 @@
 #include "core/kernels.cuh"
 #include "core/accept.hpp"
 #include "core/lookup.hpp"
+#include "core/walk.hpp"
 #include "core/safetensors.hpp"
 
 namespace ragon {
@@ -162,6 +163,11 @@ struct Engine::StepPlan {
   int accepted = 0, next = 0;
   bool failed = false;
   bool ride = false;  // a drafter-off sequence's one plain row in the batch's verify (speculate_batch)
+  // Structured output (plan_walk): the verify reads mask_pin_'s rows (some row is constrained), and the drafts that
+  // may be accepted, rows[1, cut]: the chain stops at the first row whose mask allows none of its candidates, or after
+  // the token that ends the grammar.
+  bool masked = false;
+  int cut = 0;
 };
 
 void Engine::alloc_drafter() {
@@ -434,7 +440,8 @@ void Engine::draft_head(int n, int E, const uint8_t* const* masks) {
 
 bool Engine::tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const {
   const int rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
-  return opts_.tree_nodes > 0 && !use_lookup && !want_logits && B == opts_.draft_block &&
+  // A constrained session (structured output) verifies its chain only: the tree's rows have no masks.
+  return opts_.tree_nodes > 0 && !use_lookup && !want_logits && !s.constraint && B == opts_.draft_block &&
          rows <= kernels::kMaxSeqRows && s.pos + rows <= opts_.max_context;
 }
 
@@ -472,6 +479,8 @@ void Engine::clear_session_graphs(Session& s) {
   s.verify_graphs.clear();
   for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
   s.tree_verify_graphs.clear();
+  for (auto& [k, g] : s.masked_verify_graphs) cudaGraphExecDestroy(g);
+  s.masked_verify_graphs.clear();
   for (cudaGraphExec_t g : s.commit_graphs)
     if (g) cudaGraphExecDestroy(g);
   s.commit_graphs.clear();
@@ -803,7 +812,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
   }
 }
 
-void Engine::verify_launch(int V, int K, bool tree) {
+void Engine::verify_launch(int V, int K, bool tree, bool masked) {
   const ModelConfig& c = model_->config();
   if (tree) {  // the tree's description (BACKLOG 26), read by the attention and DeltaNet kernels of this pass
     check(cudaMemcpyAsync(tree_dev_, &pin_->tree[0], sizeof(kernels::TreeDesc), cudaMemcpyHostToDevice, stream_), "tree");
@@ -816,7 +825,15 @@ void Engine::verify_launch(int V, int K, bool tree) {
     throw;
   }
   tree_ = nullptr;
-  kernels::topk_rows(logits_dev_, V, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
+  if (masked) {  // structured output: each row's mask (plan_walk wrote mask_pin_'s first V rows)
+    check(cudaMemcpyAsync(mask_dev_, mask_pin_, size_t(V) * mask_words_ * sizeof(int32_t), cudaMemcpyHostToDevice,
+                          stream_),
+          "masks");
+    kernels::topk_rows_masked(logits_dev_, V, c.vocab, K, mask_dev_, mask_words_, topk_scratch_, vals_dev_,
+                              ids_out_dev_, stream_);
+  } else {
+    kernels::topk_rows(logits_dev_, V, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
+  }
   // The values too when greedy (V floats): the host checks them for NaN and inf after the step.
   check(cudaMemcpyAsync(pin_->topk_vals, vals_dev_, size_t(V) * K * sizeof(float), cudaMemcpyDeviceToHost, stream_),
         "topk");
@@ -866,7 +883,9 @@ void Engine::plan_begin(StepPlan& sp, int B) {
     sp.lp.tokens.erase(bad, sp.lp.tokens.end());
     if (sp.lp.tokens.empty()) sp.lp.match = 0;
   }
-  sp.use_lookup = opts_.lookup_mode == 2 && !sp.lp.tokens.empty() && sp.lp.match >= opts_.lookup_min_match;
+  // A constrained session (structured output) never verifies a lookup chain: its rows have no masks.
+  sp.use_lookup = opts_.lookup_mode == 2 && !sp.lp.tokens.empty() && sp.lp.match >= opts_.lookup_min_match &&
+                  !s.constraint;
   sp.rows.assign(1, sp.anchor);
   if (sp.use_lookup) {
     sp.rows.insert(sp.rows.end(), sp.lp.tokens.begin(), sp.lp.tokens.end());
@@ -893,42 +912,28 @@ void Engine::plan_draft(StepPlan& sp, int B, bool graph) {
 void Engine::plan_walk(StepPlan& sp, int B, const int* cand, const float* scores_host) {
   const SamplingParams& p = *sp.p;
   const int K16 = draft_->config().selector_top_k, E = sp.E;
-  std::uniform_real_distribution<double> uni(0.0, 1.0);
   sp.cand.assign(cand, cand + size_t(E) * K16);
   sp.rows.resize(B);
-  sp.q.assign(E, std::vector<double>(K16, 0.0));
-  sp.picks.assign(E, 0);
-  int prev = 0;
-  for (int e = 0; e < E; ++e) {
-    const float* sc = scores_host + (size_t(e) * K16 + (e == 0 ? 0 : prev)) * K16;
-    std::vector<double>& q = sp.q[e];
-    int pick = 0;
-    if (sp.greedy) {
-      for (int k = 1; k < K16; ++k)
-        if (sc[k] > sc[pick]) pick = k;  // ties to the lower index
-      q[pick] = 1.0;
-    } else {
-      const double T = std::max(double(p.temperature), 1e-5);
-      double mx = sc[0];
-      for (int k = 1; k < K16; ++k) mx = std::max(mx, double(sc[k]));
-      double sum = 0;
-      for (int k = 0; k < K16; ++k) sum += q[k] = std::exp((sc[k] - mx) / T);
-      for (double& v : q) v /= sum;
-      const double u = uni(sp.s->rng);
-      double cum = 0;
-      pick = K16 - 1;
-      for (int k = 0; k < K16; ++k) {
-        cum += q[k];
-        if (u < cum) {
-          pick = k;
-          break;
-        }
-      }
-    }
-    sp.rows[e + 1] = sp.cand[size_t(e) * K16 + pick];
-    sp.picks[e] = pick;
-    prev = pick;
+  ChainWalk w;
+  w.E = E;
+  w.K = K16;
+  w.cand = sp.cand.data();
+  w.scores = scores_host;
+  w.greedy = sp.greedy;
+  w.temperature = p.temperature;
+  if (sp.s->constraint) {  // structured output (core/walk.hpp)
+    w.con = sp.s->constraint.get();
+    w.armed = sp.s->armed;
+    w.arm_token = sp.s->arm_token;
+    w.masks = mask_pin_;
+    w.words = mask_words_;
   }
+  walk_chain(w, sp.s->rng);
+  for (int e = 0; e < E; ++e) sp.rows[e + 1] = w.drafts[e];
+  sp.picks = std::move(w.picks);
+  sp.q = std::move(w.q);
+  sp.cut = w.cut;
+  sp.masked = w.masked;
 }
 
 void Engine::plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc) {
@@ -971,6 +976,34 @@ void Engine::plan_gather(StepPlan& sp) {
 void Engine::plan_accept(StepPlan& sp, const float* vals, const int* ids) {
   // On the host, after the step (graph or not): no verified row may be NaN or inf (core/sampling.hpp).
   const int V = sp.V, K = sp.K, E = sp.E;
+  if (sp.masked) {  // structured output: a masked row may hold fewer than K valid entries; drafts past the cut never count
+    std::vector<int> valid(V);
+    for (int i = 0; i < V; ++i)
+      valid[i] = require_finite_topk_masked({vals + size_t(i) * K, size_t(K)}, {ids + size_t(i) * K, size_t(K)},
+                                            model_->config().vocab);
+    if (sp.greedy) {
+      int accepted = 0;
+      while (accepted < sp.cut && sp.rows[accepted + 1] == ids[accepted]) ++accepted;
+      sp.accepted = accepted;
+      sp.next = ids[accepted];
+      return;
+    }
+    const int K16 = draft_->config().selector_top_k;
+    auto q_of = [&](int e, int token) {
+      double qt = 0;
+      const int* cand = sp.cand.data() + size_t(e) * K16;
+      for (int k = 0; k < K16; ++k)
+        if (cand[k] == token) qt += sp.q[e][k];
+      return qt;
+    };
+    std::vector<Dist> P(sp.cut + 1);
+    for (int i = 0; i <= sp.cut; ++i) P[i] = target_dist(vals + size_t(i) * K, ids + size_t(i) * K, valid[i], *sp.p);
+    const auto [acc, tok] =
+        accept_sampled(P, std::vector<int>(sp.rows.begin() + 1, sp.rows.begin() + 1 + sp.cut), q_of, sp.s->rng);
+    sp.accepted = acc;
+    sp.next = tok;
+    return;
+  }
   require_finite_topk({vals, size_t(V) * K}, {ids, size_t(V) * K}, model_->config().vocab);
   if (sp.tree) {  // BACKLOG 26: the accepted path through the tree (core/tree.hpp)
     if (sp.greedy) {
@@ -1117,10 +1150,10 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   join_commit();  // the previous step's DeltaNet replay, beside this step's draft until here
   if (graph) {
-    cudaGraphExec_t& g = (sp.tree ? s_->tree_verify_graphs : s_->verify_graphs)[K];
-    run_graph(g, "verify", [&] { verify_launch(V, K, sp.tree); });
+    cudaGraphExec_t& g = (sp.masked ? s_->masked_verify_graphs : sp.tree ? s_->tree_verify_graphs : s_->verify_graphs)[K];
+    run_graph(g, "verify", [&] { verify_launch(V, K, sp.tree, sp.masked); });
   } else {
-    verify_launch(V, K, sp.tree);
+    verify_launch(V, K, sp.tree, sp.masked);
   }
   check(cudaStreamSynchronize(stream_), "verify");
   plan_accept(sp, pin_->topk_vals, pin_->topk_ids);  // 3. accept
@@ -1172,6 +1205,8 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
 
   std::vector<int> out(sp.rows.begin() + 1, sp.rows.begin() + n);
   out.push_back(sp.next);
+  if (s_->constraint)  // structured output: the real constraint follows the committed tokens and the next one
+    for (int t : out) constraint_advance(*s_, t);
   return out;
 }
 
@@ -1180,7 +1215,9 @@ bool Engine::can_batch(int session, const SamplingParams& p) const {
   // A session whose drafter-off guard has its next step plain is no drafting member of a batch: it takes that step
   // alone (speculate()), in step_batch, or as a rider marked drafter_off in speculate_batch. A probe is a speculative
   // step and may join.
-  return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block && !drafter_off(session, p);
+  // A constrained session (structured output) steps alone: speculate_batch has no masks.
+  return can_speculate(p) && opts_.max_context - s.pos >= opts_.draft_block && !drafter_off(session, p) &&
+         !s.constraint;
 }
 
 bool Engine::drafter_off(int session, const SamplingParams& p) const {
@@ -1227,7 +1264,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   int nd = 0;
   for (const SeqStep& q : seqs) {
     if (q.session < 0 || q.session >= sessions() || !q.params) throw std::runtime_error("speculate_batch: bad entry");
-    if (q.drafter_off ? !(can_step_batch(q.session) && drafter_off(q.session, *q.params))
+    if (q.drafter_off ? !(can_step_batch(q.session) && drafter_off(q.session, *q.params) && !constrained(q.session))
                       : !can_batch(q.session, *q.params))
       throw std::runtime_error("speculate_batch: a sequence cannot join the batch");
     if (!q.drafter_off && &q != &seqs[nd]) throw std::runtime_error("speculate_batch: a drafting sequence after a rider");

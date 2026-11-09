@@ -450,6 +450,11 @@ void l2_prefetch_weights(const uint8_t* w, bool fp4, bool coded, int N, int K, s
 // what std::max_element returns). `scratch` needs topk_scratch_floats(rows, K) floats.
 size_t topk_scratch_floats(int rows, int K);
 void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* vals, int* ids, cudaStream_t s);
+// The same under a token mask per row (structured output): mask [rows][words] int32, bit id%32 of word id/32 set
+// when id is allowed. Disallowed ids count as -inf: they never appear. A row allowing m < K ids ends in K - m empty
+// entries (-FLT_MAX, 0x7fffffff).
+void topk_rows_masked(const float* x, int rows, int V, int K, const int32_t* mask, int words, float* scratch,
+                      float* vals, int* ids, cudaStream_t s);
 
 // Dequantize a whole matrix to BF16 (for the BF16 GEMM path).
 void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,

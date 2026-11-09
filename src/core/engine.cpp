@@ -566,6 +566,7 @@ Engine::~Engine() {
   }
   clear_graphs();
   if (pin_) cudaFreeHost(pin_);
+  if (mask_pin_) cudaFreeHost(mask_pin_);
   if (profile_) {
     for (const auto& [phase, sec] : phase_seconds_) std::fprintf(stderr, "profile %-24s %8.3f s\n", phase.c_str(), sec);
   }
@@ -591,6 +592,8 @@ void Engine::reset_session() {
   check(cudaStreamSynchronize(stream_), "reset");
   s_->history.clear();
   s_->sh_dirty = true;  // the sparse head's context vocabulary goes with the history (BACKLOG 19)
+  s_->constraint.reset();  // structured output: a constraint belongs to one request
+  s_->armed = false;
   s_->prompt_len = 0;
   s_->turn_start = 0;
   s_->snap_pos = -1;
@@ -2716,7 +2719,54 @@ const std::vector<float>& Engine::step(int token) {
 int Engine::sample(const std::vector<float>& logits, const SamplingParams& p, const std::vector<int>& history) {
   if (p.seed != 0 && p.temperature > 0.f) s_->rng.seed(p.seed + history.size());
   const size_t output = std::min(history.size(), s_->prompt_len);  // where the request's output starts
-  return sample_logits(logits, p, std::span<const int>(history).subspan(output), s_->rng);
+  if (!s_->constraint) return sample_logits(logits, p, std::span<const int>(history).subspan(output), s_->rng);
+  const std::span<const int> out = std::span<const int>(history).subspan(output);
+  const int t = constraint_armed(*s_) ? sample_constrained(*s_, logits, p, out) : sample_logits(logits, p, out, s_->rng);
+  constraint_advance(*s_, t);
+  return t;
+}
+
+void Engine::set_constraint(int i, std::shared_ptr<TokenConstraint> c, int arm_token) {
+  Session& s = sessions_.at(i);
+  if (c) {
+    const int words = c->words();
+    if (size_t(words) * 32 < size_t(model_->config().vocab))
+      throw std::runtime_error("set_constraint: the constraint's mask is shorter than the vocabulary");
+    if (!mask_pin_) {  // once, between steps (never inside a capture); kept for the engine's lifetime
+      check(cudaHostAlloc(reinterpret_cast<void**>(&mask_pin_), size_t(kernels::kMaxStreamRows) * words * sizeof(int32_t),
+                          cudaHostAllocDefault),
+            "mask rows");
+      mask_dev_ = reinterpret_cast<int32_t*>(alloc<int>(size_t(kernels::kMaxStreamRows) * words));
+      mask_words_ = words;
+    } else if (words != mask_words_) {
+      throw std::runtime_error("set_constraint: a mask of another width");
+    }
+  }
+  s.constraint = std::move(c);
+  s.arm_token = arm_token;
+  s.armed = s.constraint && arm_token < 0;
+}
+
+bool Engine::constraint_armed(const Session& s) const {
+  return s.constraint && s.armed && !s.constraint->terminated();
+}
+
+int Engine::sample_constrained(Session& s, std::span<const float> logits, const SamplingParams& p,
+                               std::span<const int> output) {
+  mask_host_.resize(mask_words_);
+  s.constraint->fill(mask_host_.data());
+  return sample_logits_masked(logits, p, output, s.rng, mask_host_.data());
+}
+
+void Engine::constraint_advance(Session& s, int token) {
+  if (!s.constraint) return;
+  if (!s.armed) {
+    s.armed = token == s.arm_token;  // the thinking span ends: the grammar starts with the next token
+    return;
+  }
+  if (s.constraint->terminated()) return;
+  if (!s.constraint->accept(token))
+    throw ConstraintError("structured output: the grammar refuses token " + std::to_string(token));
 }
 
 }  // namespace ragon

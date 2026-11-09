@@ -526,6 +526,36 @@ void test_tool_calls() {
   EXPECT_EQ(refusal([&] { (void)g_comp->tool_calls(empty); }), "invalid_tools|tools: the list is empty");
 }
 
+// response_format with no tools (stage 2): at most two newlines, then the JSON answer; refusals keep the s1 texts.
+void test_response_format() {
+  const ojson sch = ojson::parse(R"({"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]})");
+  Grammar rf = g_comp->response_format(sch, kSchemaParam);
+  ACCEPTS(rf, R"({"answer": "42"})");
+  ACCEPTS(rf, "\n" + std::string(R"({"answer": "42"})"));
+  ACCEPTS(rf, "\n\n" + std::string(R"({"answer": "42"})"));
+  REJECTS(rf, "\n\n\n" + std::string(R"({"answer": "42"})"));
+  REJECTS(rf, R"({"other": 1})");
+  REJECTS(rf, "The answer is 42.");
+  REJECTS(rf, "<tool_call>\n<function=exec_command>\n</function>\n</tool_call>");
+  Grammar ro = g_comp->response_format(std::nullopt, "response_format");
+  ACCEPTS(ro, "\n\n{\"x\": [1, {\"y\": null}]}");
+  REJECTS(ro, "[1]");
+  REJECTS(ro, "plain");
+  // Its own cache entry: the s1 json_schema grammar (no lead) is unchanged.
+  Grammar js = g_comp->json_schema(sch, kSchemaParam);
+  EXPECT(&js.impl() != &rf.impl());
+  REJECTS(js, "\n\n" + std::string(R"({"answer": "42"})"));
+  EXPECT(&g_comp->response_format(sch, kSchemaParam).impl() == &rf.impl());
+  EXPECT_EQ(refusal([&] { (void)g_comp->response_format(ojson::parse(R"({"type": "string", "pattern": "a"})"), kSchemaParam); }),
+            "unsupported_json_schema|" + kSchemaParam + ": the keyword 'pattern' at \"\"" + kSupported);
+  // The stop token only once the answer is complete.
+  Matcher m(rf);
+  for (int id : g_tok->encode(R"({"answer": "4)")) EXPECT(m.accept(id));
+  EXPECT(!m.can_stop() && !m.allowed(g_im_end));
+  for (int id : g_tok->encode(R"(2"})")) EXPECT(m.accept(id));
+  EXPECT(m.can_stop() && m.allowed(g_im_end) && m.accept(g_im_end) && m.terminated());
+}
+
 // The stop token is allowed exactly where the grammar is complete; padding and control tokens never are.
 void test_stop_and_padding() {
   Grammar g = schema(kDocSchema);
@@ -717,6 +747,7 @@ int main(int argc, char** argv) {
       {"codex_grammars", test_codex_grammars},
       {"lark", test_lark},
       {"tool_calls", test_tool_calls},
+      {"response_format", test_response_format},
       {"stop_and_padding", test_stop_and_padding},
       {"matcher_ops", test_matcher_ops},
       {"cache", test_cache},

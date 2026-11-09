@@ -140,6 +140,9 @@ class Compiler {
   Grammar lark(std::string_view text, const std::string& param);
   Grammar regex(std::string_view pattern, const std::string& param);
   Grammar tool_calls(const ToolCallSpec& spec);
+  // response_format with no tools offered (structured output stage 2): at most two newlines, then the JSON
+  // answer. `schema` set: response_format json_schema (`param` names it in a 400); unset: json_object.
+  Grammar response_format(const std::optional<nlohmann::ordered_json>& schema, const std::string& param);
 
   struct Stats {
     std::size_t hits = 0, misses = 0, evictions = 0, bytes = 0, entries = 0;
@@ -165,6 +168,8 @@ std::string lark_to_ebnf(std::string_view lark, const std::string& param);
 std::string regex_to_ebnf(std::string_view pattern, const std::string& param);
 // The bounded whitespace rule, named `name`, and its helper rules.
 std::string ws_rules(const std::string& name);
+// The structural tag Compiler::response_format compiles (the newline lead, then the JSON grammar).
+std::string response_format_tag(const std::optional<nlohmann::ordered_json>& schema, const std::string& param);
 // Parses EBNF (syntax only); throws Error invalid_grammar. Used by the fuzz target.
 void check_ebnf(const std::string& ebnf);
 }  // namespace detail
