@@ -295,6 +295,21 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
   - the serving tools have dropped it.
 - **No-go on MXFP4 and on layer skipping.**
 
+**Built 2026-11-09: the FP8 KV cache (c), behind `--kv-fp8` / `RAGON_KV_FP8=1`, off by default; stopped at the step-time gate.**
+
+- **What it does:**
+  - per-layer K and V scales come from a calibration sidecar (`--kv-fp8-scales`, `bench/quant/kv_calib.py`), because the checkpoint names an FP8 static scheme but carries no scale tensors; scale = absmax/448, and the sidecar records its source;
+  - only full accepted pages are sealed into an E4M3 mirror; the tail page, the verify and tree rows, and the first and last full-attention layers stay BF16;
+  - the paged attention kernel reads a sealed page's FP8 codes and dequantizes them on chip, for decode, verify, tree and prefill.
+- **Knob off:** every path is unchanged (the BF16 attention kernels' SASS is identical to the base build's; the two KV-write kernels take the page flags, which are null with the knob off; ctest 21/21; spec, prefix, batch and graph checks; agentlong 16 turns greedy identical).
+- **Knob on:** `--spec-check` (including two 28K prompts) and `--prefix-check` pass bit for bit.
+- **Step time, one stream, 16-row tree, medians of three interleaved runs:**
+  - at 25.7K: 98.6 → 98.0 ms, saving 0.6 ms against a 2.5 ms gate (below half the byte gain);
+  - at 64K: 111.5 → 105.3 ms, saving 6.2 ms against a 6 ms gate.
+  - This used FP8 layers on 2048-key ranges. A kernel round that issued FP8 tiles two ahead was slower and was dropped.
+- **Memory:** the mirror sits beside the BF16 pool, so this build adds about half a page per sealed page instead of halving it. Pages stored only as FP8 are still to build.
+- **Not run:** the quality gate (flips, gaps, tool names, KL by length, the 32K needles) and the replay acceptance check, because the build stopped at step time first.
+
 ## Sources
 
 - Measured here: `bench/lowbit/` (node-c, 2026-11-04).

@@ -14,6 +14,9 @@
 //
 // Usage: paged_attn_bench CTX [LAYERS_IN_PAGE=16] [CYCLE=16] [REPS=64] [layouts=flat,page,head] [orders=seq,rr,shuf]
 // One line per case: layout, order, prefetch, bulk, ms per layer call (median of REPS), effective GB/s of KV read.
+// Environment: BENCH_SEQS / BENCH_ROWS (default 4 and 12) set the batch; BENCH_Q8 (layout page only) reads the KV
+// through --kv-fp8's domain: 1 rounds every BF16 tile on chip (no mirror), 2 reads every full page from an all-sealed
+// E4M3 mirror (LOWBIT §8).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -32,7 +35,8 @@ namespace k = ragon::kernels;
 
 namespace {
 
-constexpr int Hq = 24, Hkv = 4, D = 256, PT = k::kKvPageTokens, NSEQ = 4, ROWS = 12;
+constexpr int Hq = 24, Hkv = 4, D = 256, PT = k::kKvPageTokens;
+int NSEQ = 4, ROWS = 12;
 
 void ck(cudaError_t e, const char* what) {
   if (e != cudaSuccess) {
@@ -89,6 +93,9 @@ int main(int argc, char** argv) {
   const int reps = argc > 4 ? std::atoi(argv[4]) : 64;
   const auto layouts = split(argc > 5 ? argv[5] : "flat,page,head");
   const auto orders = split(argc > 6 ? argv[6] : "seq,rr,shuf");
+  if (const char* e = std::getenv("BENCH_SEQS")) NSEQ = std::max(1, std::min(8, std::atoi(e)));
+  if (const char* e = std::getenv("BENCH_ROWS")) ROWS = std::max(1, std::atoi(e));
+  const int q8mode = std::getenv("BENCH_Q8") ? std::atoi(std::getenv("BENCH_Q8")) : 0;
   k::prepare_kernels();
   const int np = (ctx + PT - 1) / PT;
   const size_t P = size_t(NSEQ) * np + 1;  // pool pages, page 0 included
@@ -125,6 +132,13 @@ int main(int argc, char** argv) {
       page_elems = size_t(NL) * 2 * kvsize * PT;
       sub = P * PT * D;  // "head": one (layer, K/V, head) sub-pool
       pool = dalloc<__nv_bfloat16>(page_elems * P);
+    }
+    uint8_t* mirror = nullptr;
+    uint8_t* sealed = nullptr;
+    if (q8mode == 2 && layout == "page") {
+      mirror = dalloc<uint8_t>(page_elems * P);
+      sealed = dalloc<uint8_t>(P);
+      ck(cudaMemset(sealed, 1, P), "sealed");
     }
     for (const std::string& order : flat ? std::vector<std::string>{"-"} : orders) {
       std::vector<uint64_t*> tables;
@@ -167,7 +181,18 @@ int main(int argc, char** argv) {
               }
             }
             ck(cudaEventRecord(e0), "record");
-            k::attention_rows_seqs(q, kc, vc, sb, Hq, Hkv, D, scratch, out, nullptr, 0, pg);
+            k::KvQ8 q8;
+            if (q8mode && layout == "page") {
+              q8.ks = q8.vs = 1.f / 64;
+              q8.kinv = q8.vinv = 64.f;
+              if (mirror) {
+                q8.k8 = mirror + size_t(l) * 2 * kvsize * PT;
+                q8.v8 = mirror + (size_t(l) * 2 + 1) * kvsize * PT;
+                q8.sealed = sealed;
+                q8.unit = page_elems;
+              }
+            }
+            k::attention_rows_seqs(q, kc, vc, sb, Hq, Hkv, D, scratch, out, nullptr, 0, pg, q8);
             ck(cudaEventRecord(e1), "record");
             ck(cudaEventSynchronize(e1), "sync");
             float t = 0.f;
@@ -186,6 +211,8 @@ int main(int argc, char** argv) {
     for (auto* p : fk) cudaFree(p);
     for (auto* p : fv) cudaFree(p);
     if (pool) cudaFree(pool);
+    if (mirror) cudaFree(mirror);
+    if (sealed) cudaFree(sealed);
   }
   return 0;
 }
