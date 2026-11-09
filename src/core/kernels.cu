@@ -595,6 +595,15 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* _
 
 // attn_prepare_body: core/attention_body.cuh.
 
+// M2 (--kv-fp8): a row written into a sealed page makes its FP8 mirror stale; the first block of the row clears the
+// page's flag before any attention launch after this one reads the page (the host also clears it in kv_ensure; this
+// covers a write at a position the host did not expect, so a set flag always means a current mirror).
+__device__ __forceinline__ void kv_unseal_row(uint8_t* sealed, const uint64_t* pages, unsigned long long unit, int p) {
+  if (sealed == nullptr || pages == nullptr || blockIdx.y != 0 || threadIdx.x != 0) return;
+  const unsigned long long id = pages[p / kKvPageTokens] / unit;
+  if (sealed[id]) sealed[id] = 0;
+}
+
 __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
                                     const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
                                     const __nv_bfloat16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
@@ -602,9 +611,11 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
                                     float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
                                     __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
                                     const TreeDesc* __restrict__ td, const int* __restrict__ mrope,
-                                    const uint64_t* __restrict__ pages) {
+                                    const uint64_t* __restrict__ pages, uint8_t* __restrict__ sealed,
+                                    unsigned long long unit) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, p0 = pos_value(pos0);
+  kv_unseal_row(sealed, pages, unit, p0 + m);
   // In a tree (BACKLOG 26) the row's position is its depth's; its key and value still go to slot p0 + m. After an
   // image the RoPE position is the slot's plus the sequence's rope delta; a prefill chunk with images reads its rows'
   // (temporal, height, width) from mrope (VISION §20.3 (b)).
@@ -627,25 +638,28 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                                          const __nv_bfloat16* __restrict__ k_norm, SeqBatch b, int Hq, int Hkv, int D,
                                          int rot, float theta, float eps, float* __restrict__ q,
                                          float* __restrict__ gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                                         size_t hs, size_t ps, SeqPtrs<const uint64_t> pg) {
+                                         size_t hs, size_t ps, SeqPtrs<const uint64_t> pg,
+                                         uint8_t* __restrict__ sealed, unsigned long long unit) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x, sq = seq_of(b, m);
   const int p = seq_pos(b, sq) + m - b.row0[sq], r = p + seq_rdelta(b, sq);
+  kv_unseal_row(sealed, pg.p[sq], unit, p);
   attn_prepare_body(q_gate, k, v, q_norm, k_norm, m, r, r, r, Hq, Hkv, D, rot, theta, eps, q, gate, kc.p[sq], vc.p[sq], hs,
                     ps, pg.p[sq], p, blockIdx.y);
 }
 
 // The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh.
 
-template <int ROWS, int TK, int NS, bool BULK>
+template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
                          int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
-                         const TreeDesc* __restrict__ td, const uint64_t* __restrict__ pages) {
+                         const TreeDesc* __restrict__ td, const uint64_t* __restrict__ pages, KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
-  attention_mma_body<ROWS, TK, NS, BULK>(q, kcache, vcache, pos_value(pos0_arg), M, Hq, Hkv, splits, chunk, scratch, hs,
-                                         ps, pf, blockIdx.x, blockIdx.y, blockIdx.z, td, pages);
+  attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q, kcache, vcache, pos_value(pos0_arg), M, Hq, Hkv, splits, chunk,
+                                                       scratch, hs, ps, pf, blockIdx.x, blockIdx.y, blockIdx.z, td, pages,
+                                                       0, q8);
 }
 
 // Several sequences in one launch (M4 stage 4): the x blocks of sequence i are [blk0[i], blk0[i + 1]); each block
@@ -654,20 +668,22 @@ __global__ void __launch_bounds__(ROWS * 2)
 struct AttnBlocks {
   int blk0[kMaxSeqs + 1];
 };
-template <int ROWS, int TK, int NS, bool BULK>
+template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
                               SeqPtrs<const __nv_bfloat16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
                               int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
-                              SeqPtrs<const uint64_t> pg) {
+                              SeqPtrs<const uint64_t> pg, KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
   int sq = 0;
   while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
   constexpr int D = kMmaD;
   const size_t r0 = b.row0[sq];
-  attention_mma_body<ROWS, TK, NS, BULK>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq), b.row0[sq + 1] - b.row0[sq],
-                                         Hq, Hkv, splits, chunk, scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
-                                         blockIdx.x - blocks.blk0[sq], blockIdx.y, blockIdx.z, nullptr, pg.p[sq]);
+  attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq),
+                                                       b.row0[sq + 1] - b.row0[sq], Hq, Hkv, splits, chunk,
+                                                       scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
+                                                       blockIdx.x - blocks.blk0[sq], blockIdx.y, blockIdx.z, nullptr, pg.p[sq],
+                                                       0, q8);
 }
 
 // The cascade's two phases (attention_rows_cascade). First the keys a group of sequences shares, once, over all its rows
@@ -676,32 +692,35 @@ struct AttnGroups {
   SeqGroups g;
   int blk0[kMaxSeqGroups + 1];
 };
-template <int ROWS, int TK, int NS, bool BULK>
+template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_shared_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                             SeqBatch b, AttnGroups gr, int Hq, int Hkv, int splits, int chunk,
-                            float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg) {
+                            float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg,
+                            KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
   int g = 0;
   while (g + 1 < gr.g.n && static_cast<int>(blockIdx.x) >= gr.blk0[g + 1]) ++g;
   constexpr int D = kMmaD;
   const int first = gr.g.seq0[g], cut = gr.g.cut[g];
   const size_t r0 = b.row0[first];
-  attention_mma_body<ROWS, TK, NS, BULK, false, 1>(q + r0 * Hq * D, kc.p[first], vc.p[first], cut,
-                                                   b.row0[gr.g.seq1[g]] - b.row0[first], Hq, Hkv, splits, chunk,
-                                                   scratch + r0 * Hq * splits * (D + 2), hs, ps, pf, blockIdx.x - gr.blk0[g],
-                                                   blockIdx.y, blockIdx.z, nullptr, pg.p[first], cut);
+  attention_mma_body<ROWS, TK, NS, BULK, false, 1, Q8>(q + r0 * Hq * D, kc.p[first], vc.p[first], cut,
+                                                       b.row0[gr.g.seq1[g]] - b.row0[first], Hq, Hkv, splits, chunk,
+                                                       scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
+                                                       blockIdx.x - gr.blk0[g], blockIdx.y, blockIdx.z, nullptr, pg.p[first],
+                                                       cut, q8);
 }
 // Then each sequence's own keys, from its cut[i] (0: all of them) on; z counts the ranges from zbase.
 struct AttnCuts {
   int cut[kMaxSeqs];
   int zbase;
 };
-template <int ROWS, int TK, int NS, bool BULK>
+template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_suffix_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                             SeqBatch b, AttnBlocks blocks, AttnCuts cuts, int Hq, int Hkv, int splits, int chunk,
-                            float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg) {
+                            float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg,
+                            KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
   int sq = 0;
   while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
@@ -709,10 +728,11 @@ __global__ void __launch_bounds__(ROWS * 2)
   const size_t r0 = b.row0[sq];
   const int split = blockIdx.z + cuts.zbase;
   if ((split + 1) * chunk <= cuts.cut[sq]) return;  // a range the first phase finished for this sequence
-  attention_mma_body<ROWS, TK, NS, BULK, false, 2>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq),
-                                                   b.row0[sq + 1] - b.row0[sq], Hq, Hkv, splits, chunk,
-                                                   scratch + r0 * Hq * splits * (D + 2), hs, ps, pf, blockIdx.x - blocks.blk0[sq],
-                                                   blockIdx.y, split, nullptr, pg.p[sq], cuts.cut[sq]);
+  attention_mma_body<ROWS, TK, NS, BULK, false, 2, Q8>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq),
+                                                       b.row0[sq + 1] - b.row0[sq], Hq, Hkv, splits, chunk,
+                                                       scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
+                                                       blockIdx.x - blocks.blk0[sq], blockIdx.y, split, nullptr, pg.p[sq],
+                                                       cuts.cut[sq], q8);
 }
 
 __global__ void attention_combine_kernel(const float* __restrict__ scratch, int splits, int D,
@@ -973,19 +993,22 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s, const TreeDesc* td, const int* mrope, const uint64_t* pages) {
+                  cudaStream_t s, const TreeDesc* td, const int* mrope, const uint64_t* pages, uint8_t* sealed,
+                  unsigned long long unit) {
   dim3 grid(M, Hq + 2 * Hkv);
   launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
-                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td, mrope, pages);
+                pos0, Hq, Hkv, D, rot, theta, eps, q, gate, kcache, vcache, kv_hs(D), kv_ps(Hkv, D), td, mrope, pages,
+                sealed, unit);
 }
 
 void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                        const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
                        float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                       cudaStream_t s, SeqPtrs<const uint64_t> pages) {
+                       cudaStream_t s, SeqPtrs<const uint64_t> pages, uint8_t* sealed, unsigned long long unit) {
   dim3 grid(b.row0[b.n], Hq + 2 * Hkv);
   launch_kernel("attn_prepare_seqs", attn_prepare_seqs_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v,
-                q_norm, k_norm, b, Hq, Hkv, D, rot, theta, eps, q, gate, kc, vc, kv_hs(D), kv_ps(Hkv, D), pages);
+                q_norm, k_norm, b, Hq, Hkv, D, rot, theta, eps, q, gate, kc, vc, kv_hs(D), kv_ps(Hkv, D), pages, sealed,
+                unit);
 }
 
 // Fixed key ranges at fixed positions (row invariance); RAGON_ATTN_CHUNK picks the size for experiments.
@@ -1034,13 +1057,129 @@ void prepare_kernels() {
   check(cudaFuncSetAttribute(attention_suffix_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem_q8(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnRows, kAttnTk, kAttnNs, false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem_q8(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_shared_kernel<kAttnRows, kAttnTk, kAttnNs, false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem_q8(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_suffix_kernel<kAttnRows, kAttnTk, kAttnNs, false, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem_q8(kAttnTk, kAttnNs))),
+        "attention_rows smem");
   configured = true;
+}
+
+namespace {
+// RAGON_KV_CALIB: the largest |K| and |V| of positions [p0, p0 + n) of one layer's cache, folded into amax[0..1] (the
+// float bits of non-negative values order as integers).
+__global__ void kv_absmax_kernel(const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
+                                 const uint64_t* __restrict__ pages, int p0, int D, size_t hs, size_t ps,
+                                 float* __restrict__ amax) {
+  const int p = p0 + blockIdx.x, h = blockIdx.y;
+  const size_t off = kv_off(pages, h, p, hs, ps);
+  float mk = 0.f, mv = 0.f;
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    mk = fmaxf(mk, fabsf(__bfloat162float(kc[off + d])));
+    mv = fmaxf(mv, fabsf(__bfloat162float(vc[off + d])));
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    mk = fmaxf(mk, __shfl_xor_sync(0xffffffffu, mk, o));
+    mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, o));
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(reinterpret_cast<int*>(amax), __float_as_int(mk));
+    atomicMax(reinterpret_cast<int*>(amax) + 1, __float_as_int(mv));
+  }
+}
+}  // namespace
+
+void kv_absmax(const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, const uint64_t* pages, int p0, int n,
+               int Hkv, int D, float* amax, cudaStream_t s) {
+  if (n <= 0) return;
+  kv_absmax_kernel<<<dim3(n, Hkv), 128, 0, s>>>(kcache, vcache, pages, p0, D, kv_hs(D), kv_ps(Hkv, D), amax);
+  check(cudaGetLastError(), "kv_absmax");
+}
+
+namespace {
+// M2 (--kv-fp8): the FP8 mirror of whole pages. Block (i, l * 2 + kv, h) encodes page ids[i]'s run of slot l0 + l, K or V,
+// KV head h (kKvPageTokens * D contiguous elements in either layout), 16 bytes of codes a thread a step: the codes
+// kv_q8_encode2 gives, so the decoded tile equals attn_round_stage's of the BF16 one.
+struct KvSealArgs {
+  int ids[kKvSealMax];
+  float kinv[kMaxKvQ8Slots];
+  float vinv[kMaxKvQ8Slots];
+};
+__global__ void kv_seal_kernel(const __nv_bfloat16* __restrict__ pool, uint8_t* __restrict__ mirror, KvSealArgs a,
+                               int l0, int Hkv, int D, size_t hs, size_t unit) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int lkv = blockIdx.y, l = l0 + lkv / 2, kv = lkv % 2, h = blockIdx.z;
+  const float inv = kv ? a.vinv[l] : a.kinv[l];
+  const size_t off = size_t(a.ids[blockIdx.x]) * unit + (size_t(l) * 2 + kv) * Hkv * hs + size_t(h) * hs;
+  const int n16 = kKvPageTokens * D / 16;
+  for (int i = threadIdx.x; i < n16; i += blockDim.x) {
+    const uint4* src = reinterpret_cast<const uint4*>(pool + off) + 2 * i;
+    uint4 w[2] = {src[0], src[1]};
+    const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(w);
+    uint4 out;
+    uint16_t* o = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) o[j] = kv_q8_encode2(__bfloat1622float2(hv[j]), inv);
+    reinterpret_cast<uint4*>(mirror + off)[i] = out;
+  }
+}
+struct KvIds {
+  int ids[kKvSealMax];
+};
+__global__ void kv_flag_kernel(uint8_t* __restrict__ sealed, KvIds a, int n, uint8_t v) {
+  pdl_begin();  // first statement: see launch.cuh
+  if (static_cast<int>(threadIdx.x) < n) sealed[a.ids[threadIdx.x]] = v;
+}
+}  // namespace
+
+void kv_seal(const __nv_bfloat16* pool, uint8_t* mirror, uint8_t* sealed, const int* ids, int n, int l0, int l1,
+             int Hkv, int D, size_t page_unit, const float* kinv, const float* vinv, cudaStream_t s) {
+  if (l1 > kMaxKvQ8Slots) throw std::runtime_error("kv_seal: too many full-attention layers");
+  if (D % 16) throw std::runtime_error("kv_seal: head_dim a multiple of 16");
+  for (int at = 0; at < n; at += kKvSealMax) {
+    const int m = std::min(kKvSealMax, n - at);
+    KvSealArgs a{};
+    KvIds f{};
+    for (int i = 0; i < m; ++i) a.ids[i] = f.ids[i] = ids[at + i];
+    for (int l = 0; l < l1; ++l) {
+      a.kinv[l] = kinv[l];
+      a.vinv[l] = vinv[l];
+    }
+    if (l1 > l0)
+      launch_kernel("kv_seal", kv_seal_kernel, dim3(m, (l1 - l0) * 2, Hkv), dim3(256), 0, s, pool, mirror, a, l0, Hkv, D,
+                    kv_hs(D), page_unit);
+    launch_kernel("kv_seal_flags", kv_flag_kernel, dim3(1), dim3(kKvSealMax), 0, s, sealed, f, m, uint8_t(1));
+  }
+}
+
+void kv_unseal(uint8_t* sealed, const int* ids, int n, cudaStream_t s) {
+  for (int at = 0; at < n; at += kKvSealMax) {
+    const int m = std::min(kKvSealMax, n - at);
+    KvIds f{};
+    for (int i = 0; i < m; ++i) f.ids[i] = ids[at + i];
+    launch_kernel("kv_unseal", kv_flag_kernel, dim3(1), dim3(kKvSealMax), 0, s, sealed, f, m, uint8_t(0));
+  }
+}
+
+// --kv-fp8: the FP8 read domain needs the cp.async tiles on the 32-key grid.
+void check_q8(const KvQ8& q8, int chunk) {
+  if (!q8.on()) return;
+  if (g_attn_bulk) throw std::runtime_error("attention_rows: --kv-fp8 needs the cp.async tiles (no --attn-bulk)");
+  if (chunk % kAttnTk) throw std::runtime_error("attention_rows: --kv-fp8 needs RAGON_ATTN_CHUNK on the 32-key grid");
 }
 
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx,
-                    const TreeDesc* td, const uint64_t* pages) {
+                    const TreeDesc* td, const uint64_t* pages, KvQ8 q8) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  check_q8(q8, attention_chunk());
   if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (td && g_attn_bulk) throw std::runtime_error("attention_rows: a tree verify needs the cp.async tiles (no --attn-bulk)");
   // The grid: the ranges covering the rows' keys, or (in a graph) every range up to fixed_ctx.
@@ -1049,17 +1188,21 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   prepare_kernels();
   const int R = M * 6;
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
-                    g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true> : attention_mma_kernel<rows, tk, ns, false>,
-                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kcache, vcache,
-                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td, pages);
+                    q8.on()       ? attention_mma_kernel<rows, tk, ns, false, true>
+                    : g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true>
+                                  : attention_mma_kernel<rows, tk, ns, false>,
+                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kcache, vcache,
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td, pages,
+                    q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
 }
 
 void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                          const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
-                         int fixed_ctx, SeqPtrs<const uint64_t> pages) {
+                         int fixed_ctx, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  check_q8(q8, attention_chunk());
   if (b.pos_dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
@@ -1074,17 +1217,20 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   for (int i = 0; i < b.n; ++i) blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
   prepare_kernels();
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
-                    g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true> : attention_mma_seqs_kernel<rows, tk, ns, false>,
-                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
-                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
+                    q8.on()       ? attention_mma_seqs_kernel<rows, tk, ns, false, true>
+                    : g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true>
+                                  : attention_mma_seqs_kernel<rows, tk, ns, false>,
+                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
+                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
 
 void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                             const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out,
-                            cudaStream_t s, SeqPtrs<const uint64_t> pages) {
+                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
+  check_q8(q8, attention_chunk());
   if (b.pos_dev) throw std::runtime_error("attention_rows_cascade: positions on the host only (no captured graph)");
   if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
   if (groups.n < 1 || groups.n > kMaxSeqGroups) throw std::runtime_error("attention_rows_cascade: no groups");
@@ -1120,13 +1266,17 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
   }
   prepare_kernels();
   launch_kernel_pdl(pdl_attention_enabled(), "attention_shared",
-                    g_attn_bulk ? attention_shared_kernel<rows, tk, ns, true> : attention_shared_kernel<rows, tk, ns, false>,
-                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
-                    splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
+                    q8.on()       ? attention_shared_kernel<rows, tk, ns, false, true>
+                    : g_attn_bulk ? attention_shared_kernel<rows, tk, ns, true>
+                                  : attention_shared_kernel<rows, tk, ns, false>,
+                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
+                    splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_suffix",
-                    g_attn_bulk ? attention_suffix_kernel<rows, tk, ns, true> : attention_suffix_kernel<rows, tk, ns, false>,
-                    dim3(blocks.blk0[b.n], Hkv, splits - cuts.zbase), dim3(rows * 2), mma_smem(tk, ns), s, q, kc, vc, b, blocks,
-                    cuts, Hq, Hkv, splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages);
+                    q8.on()       ? attention_suffix_kernel<rows, tk, ns, false, true>
+                    : g_attn_bulk ? attention_suffix_kernel<rows, tk, ns, true>
+                                  : attention_suffix_kernel<rows, tk, ns, false>,
+                    dim3(blocks.blk0[b.n], Hkv, splits - cuts.zbase), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks,
+                    cuts, Hq, Hkv, splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }

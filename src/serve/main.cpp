@@ -4,7 +4,7 @@
 //
 //   ragon-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
 //              [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
-//              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16]
+//              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16] [--kv-fp8 --kv-fp8-scales F]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
 //              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
@@ -60,7 +60,8 @@
 // (default 2, 0 off; M3). --keepalive-seconds N (default 15, 0 off; RAGON_KEEPALIVE_SECONDS overrides it) is
 // how often a streamed request that has produced no token yet is sent a keep-alive (API §3, §4).
 // --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does (B34; not exact, off
-// by default: MILESTONES §14).
+// by default: MILESTONES §14). --kv-fp8 reads the full-attention KV below a row's 32-position unit as FP8 E4M3 with
+// the per-layer scales of --kv-fp8-scales F (LOWBIT §8, B41; not exact, off by default).
 // The full-attention KV is kept in 64-position pages behind a page table per session (BATCHING §5.3, P4; the
 // default since P4e, 2026-11-08; exact: only addresses change). --kv-flat (or --no-kv-pages) keeps the flat slots
 // instead, one max-context slot a session; --kv-pages is still accepted and changes nothing; RAGON_KV_PAGES=0/1
@@ -2355,6 +2356,8 @@ int main(int argc, char** argv) try {
   std::vector<std::string> drafter_args;  // --drafter ID=DIR, repeatable (MULTI_DRAFTER §5.3)
   std::string drafter_routes_file;
   bool graphs = false, pdl = false, attn_bulk = false, prefill_bf16 = false;
+  bool kv_fp8 = false;
+  std::string kv_fp8_scales;
   static_assert(ragon::serve::kAutoSessionsCap <= ragon::kernels::kMaxSeqs, "auto-size never picks more than a batch");
   bool kv_pages = true;  // the page pool by default (P4e, BATCHING §5.3); --kv-flat the flat slots
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
@@ -2411,6 +2414,8 @@ int main(int argc, char** argv) try {
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--keepalive-seconds") keepalive_seconds = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--kv-fp8") kv_fp8 = true;
+    else if (a == "--kv-fp8-scales") kv_fp8_scales = next();
     else if (a == "--kv-pages") kv_pages = true;  // the default since P4e; kept so older command lines still start
     else if (a == "--kv-flat" || a == "--no-kv-pages") kv_pages = false;
     else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
@@ -2554,6 +2559,8 @@ int main(int argc, char** argv) try {
   opts.attention_bulk = attn_bulk;
   opts.attention_prefetch = attn_prefetch;
   opts.prefill_bf16 = prefill_bf16;
+  opts.kv_fp8 = kv_fp8;
+  opts.kv_fp8_scales = kv_fp8_scales;
   opts.kv_pages = kv_pages;
   opts.draft_nvfp4 = !draft_bf16;
   opts.draft_head = draft_head;
