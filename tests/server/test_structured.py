@@ -196,7 +196,7 @@ APPLY_PATCH = {"type": "custom", "name": "apply_patch",
 def refused(server, path, body):
     status, out = server.request(path, body)
     assert status == 400, (status, out)
-    return out["error"]["code"] + "|" + out["error"]["message"]
+    return (out["error"].get("code") or out["error"]["type"]) + "|" + out["error"]["message"]
 
 
 def output_text(resp):
