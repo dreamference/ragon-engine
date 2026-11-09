@@ -3,7 +3,10 @@
 //     model whose next-token distribution depends only on the position is decoded speculatively many
 //     times, with random draft distributions and with deterministic (lookup) proposals, and the joint
 //     distribution of the first tokens is compared with the target's by a chi-square test;
-//   - the context lookup's proposals.
+//   - the context lookup's proposals;
+//   - structured output's chain walk (core/walk.hpp): unconstrained it is the plain walk; constrained, every pick
+//     the walk can accept is one its row's mask allows, the chain is cut at the first row that allows none and after
+//     the grammar's end, the constraint is rolled back, and each row's mask is the state after the drafts before it.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +17,7 @@
 #include "core/accept.hpp"
 #include "core/lookup.hpp"
 #include "core/tree.hpp"
+#include "core/walk.hpp"
 
 namespace {
 
@@ -354,6 +358,242 @@ bool check_lookup() {
   return ok;
 }
 
+// A toy grammar over 64 ids: the n-th token (n from 0) must be n mod 3 (mod 3); id 63 (the stop) is allowed once
+// at least kStopAfter tokens were accepted, and ends it.
+constexpr int kToyV = 64, kToyWords = 2, kToyStop = 63, kStopAfter = 4;
+struct ToyConstraint final : ragon::TokenConstraint {
+  std::vector<int> acc;
+  bool done = false;
+  int words() const override { return kToyWords; }
+  bool allows(int id) const {
+    if (done) return false;
+    if (id == kToyStop) return int(acc.size()) >= kStopAfter;
+    return id % 3 == int(acc.size()) % 3;
+  }
+  void fill(int32_t* m) override {
+    std::fill_n(m, kToyWords, 0);
+    for (int id = 0; id < kToyV; ++id)
+      if (allows(id)) m[id >> 5] |= int32_t(1u << (id & 31));
+  }
+  bool accept(int id) override {
+    if (!allows(id)) return false;
+    acc.push_back(id);
+    done = id == kToyStop;
+    return true;
+  }
+  void rollback(int n) override {
+    for (int i = 0; i < n; ++i) {
+      if (acc.back() == kToyStop) done = false;
+      acc.pop_back();
+    }
+  }
+  bool terminated() const override { return done; }
+};
+
+// The walk before stage 2 (no constraint), kept here as the reference.
+void reference_walk(int E, int K, const int* cand, const float* scores, bool greedy, double T, std::mt19937_64& rng,
+                    std::vector<int>& drafts, std::vector<std::vector<double>>& q) {
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  drafts.assign(E, 0);
+  q.assign(E, std::vector<double>(K, 0.0));
+  int prev = 0;
+  for (int e = 0; e < E; ++e) {
+    const float* sc = scores + (size_t(e) * K + (e == 0 ? 0 : prev)) * K;
+    int pick = 0;
+    if (greedy) {
+      for (int k = 1; k < K; ++k)
+        if (sc[k] > sc[pick]) pick = k;
+      q[e][pick] = 1.0;
+    } else {
+      T = std::max(T, 1e-5);
+      double mx = sc[0];
+      for (int k = 1; k < K; ++k) mx = std::max(mx, double(sc[k]));
+      double sum = 0;
+      for (int k = 0; k < K; ++k) sum += q[e][k] = std::exp((sc[k] - mx) / T);
+      for (double& v : q[e]) v /= sum;
+      const double u = uni(rng);
+      double cum = 0;
+      pick = K - 1;
+      for (int k = 0; k < K; ++k) {
+        cum += q[e][k];
+        if (u < cum) {
+          pick = k;
+          break;
+        }
+      }
+    }
+    drafts[e] = cand[size_t(e) * K + pick];
+    prev = pick;
+  }
+}
+
+struct Lattice {
+  int E, K;
+  std::vector<int> cand;
+  std::vector<float> scores;
+};
+Lattice random_lattice(std::mt19937_64& rng, int E, int K, int max_id = kToyV - 1) {
+  Lattice l{E, K, std::vector<int>(size_t(E) * K), std::vector<float>(size_t(E) * K * K)};
+  std::uniform_int_distribution<int> id(0, max_id);
+  std::normal_distribution<float> n(0.f, 2.f);
+  for (int& c : l.cand) c = id(rng);
+  for (float& x : l.scores) x = n(rng);
+  return l;
+}
+
+bool check_walk_plain() {
+  bool ok = true;
+  std::mt19937_64 rng(31);
+  for (int trial = 0; trial < 400; ++trial) {
+    const bool greedy = trial % 2 == 0;
+    Lattice l = random_lattice(rng, 1 + trial % 11, 16, 1000);
+    std::mt19937_64 r1(trial), r2(trial);
+    ragon::ChainWalk w;
+    w.E = l.E;
+    w.K = l.K;
+    w.cand = l.cand.data();
+    w.scores = l.scores.data();
+    w.greedy = greedy;
+    w.temperature = 0.7;
+    ragon::walk_chain(w, r1);
+    std::vector<int> drafts;
+    std::vector<std::vector<double>> q;
+    reference_walk(l.E, l.K, l.cand.data(), l.scores.data(), greedy, 0.7, r2, drafts, q);
+    ok &= w.drafts == drafts && w.q == q && w.cut == l.E && !w.masked && r1() == r2();
+  }
+  std::printf("chain walk, unconstrained = the plain walk %s\n", ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// The walk under the toy constraint: what each row allows given the drafts the walk itself accepted before it.
+bool check_walk_constrained() {
+  bool ok = true;
+  std::mt19937_64 rng(37);
+  int cuts_mid = 0, cuts_end = 0, full = 0;
+  for (int trial = 0; trial < 3000; ++trial) {
+    const bool greedy = trial % 3 != 0;
+    const int E = 1 + trial % 11;
+    // Ids 0..11 and the stop: about a third of each row's candidates is allowed, sometimes none.
+    Lattice l = random_lattice(rng, E, 4, 12);
+    for (int& c : l.cand)
+      if (c == 12) c = kToyStop;
+    ToyConstraint con;
+    const int start = trial % 5;  // tokens accepted before the walk (the anchor's state)
+    for (int i = 0; i < start; ++i) con.accept(i % 3);
+    const std::vector<int> before = con.acc;
+    const int arm = trial % 7 == 0 ? 9 : -1;  // sometimes not armed until a draft is 9 (</think> in the server)
+    std::vector<int32_t> masks(size_t(E + 1) * kToyWords, 0x5a5a5a5a);
+    ragon::ChainWalk w;
+    w.E = E;
+    w.K = l.K;
+    w.cand = l.cand.data();
+    w.scores = l.scores.data();
+    w.greedy = greedy;
+    w.temperature = 1.3;
+    w.con = &con;
+    w.armed = arm < 0;
+    w.arm_token = arm;
+    w.masks = masks.data();
+    w.words = kToyWords;
+    ragon::walk_chain(w, rng);
+    ok &= con.acc == before && !con.done;  // rolled back
+    // Replay: the expected cut, and each row's mask.
+    ToyConstraint replay;
+    replay.acc = before;
+    bool armed = arm < 0, live = true;
+    int cut = E, first_armed = armed ? 0 : -1;
+    for (int e = 0; e < E && live; ++e) {
+      if (armed) {
+        bool any = false;
+        for (int k = 0; k < l.K; ++k) any |= replay.allows(l.cand[size_t(e) * l.K + k]);
+        if (!any) {
+          cut = e;
+          break;
+        }
+        ok &= replay.allows(w.drafts[e]);
+        std::vector<int32_t> m(kToyWords);
+        replay.fill(m.data());
+        ok &= std::equal(m.begin(), m.end(), masks.begin() + size_t(e) * kToyWords);
+        if (!greedy) {  // q is renormalised over the allowed candidates
+          double sum = 0;
+          for (int k = 0; k < l.K; ++k) {
+            const bool a = replay.allows(l.cand[size_t(e) * l.K + k]);
+            ok &= a || w.q[e][k] == 0.0;
+            sum += w.q[e][k];
+          }
+          ok &= std::fabs(sum - 1.0) < 1e-9;
+        } else {  // the best allowed candidate, ties to the lower index
+          const float* sc = l.scores.data() + (size_t(e) * l.K + (e == 0 ? 0 : w.picks[e - 1])) * l.K;
+          int best = -1;
+          for (int k = 0; k < l.K; ++k)
+            if (replay.allows(l.cand[size_t(e) * l.K + k]) && (best < 0 || sc[k] > sc[best])) best = k;
+          ok &= w.picks[e] == best;
+        }
+        replay.accept(w.drafts[e]);
+        if (replay.done) {
+          cut = e + 1;
+          live = false;
+        }
+      } else if (w.drafts[e] == arm) {
+        armed = true;
+        first_armed = e + 1;
+      }
+    }
+    if (live && cut == E && armed) {  // the row after the last draft
+      std::vector<int32_t> m(kToyWords);
+      replay.fill(m.data());
+      ok &= std::equal(m.begin(), m.end(), masks.begin() + size_t(E) * kToyWords);
+    }
+    ok &= w.cut == cut;
+    ok &= w.masked == (first_armed >= 0 && first_armed <= std::min(cut, E));
+    if (w.masked) {  // rows without a state of their own are all ones
+      for (int e = 0; e <= E; ++e) {
+        const bool own = e >= first_armed && (e < cut || (e == cut && cut < E && !replay.done) || (e == E && cut == E && !replay.done));
+        if (!own)
+          for (int i = 0; i < kToyWords; ++i) ok &= masks[size_t(e) * kToyWords + i] == -1;
+      }
+    }
+    cuts_mid += cut < E && !replay.done;
+    cuts_end += replay.done;
+    full += cut == E;
+  }
+  ok &= cuts_mid > 100 && cuts_end > 50 && full > 100;  // every case was reached
+  std::printf("chain walk, constrained: filter, cut, rollback, masks (%d cut, %d ended, %d whole) %s\n", cuts_mid,
+              cuts_end, full, ok ? "ok" : "FAIL");
+  return ok;
+}
+
+// A refused draft (a constraint whose accept disagrees with its mask) is an error, not a silent pick.
+bool check_walk_refusal() {
+  struct Liar final : ragon::TokenConstraint {
+    int words() const override { return kToyWords; }
+    void fill(int32_t* m) override { std::fill_n(m, kToyWords, int32_t(-1)); }
+    bool accept(int) override { return false; }
+    void rollback(int) override {}
+    bool terminated() const override { return false; }
+  } liar;
+  std::mt19937_64 rng(5);
+  Lattice l = random_lattice(rng, 3, 4);
+  std::vector<int32_t> masks(4 * kToyWords);
+  ragon::ChainWalk w;
+  w.E = 3;
+  w.K = 4;
+  w.cand = l.cand.data();
+  w.scores = l.scores.data();
+  w.con = &liar;
+  w.armed = true;
+  w.masks = masks.data();
+  w.words = kToyWords;
+  bool threw = false;
+  try {
+    ragon::walk_chain(w, rng);
+  } catch (const ragon::ConstraintError&) {
+    threw = true;
+  }
+  std::printf("chain walk, a refused draft throws %s\n", threw ? "ok" : "FAIL");
+  return threw;
+}
+
 }  // namespace
 
 int main() {
@@ -367,6 +607,9 @@ int main() {
   ok &= check_tree(1, 3, 5);
   ok &= check_tree(3, 6, 6);
   ok &= check_tree(4, 12, 7);
+  ok &= check_walk_plain();
+  ok &= check_walk_constrained();
+  ok &= check_walk_refusal();
   std::printf(ok ? "all spec tests passed\n" : "SPEC TESTS FAILED\n");
   return ok ? 0 : 1;
 }

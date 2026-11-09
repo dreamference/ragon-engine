@@ -286,6 +286,12 @@ Request parse_request(const json& body, bool chat, bool vision) {
     }
     if (body.contains("tools") && body["tools"].is_array() && body.value("tool_choice", json("auto")) != "none")
       r.tools = canonical_tools(body["tools"], body.contains("tool_choice") ? body["tool_choice"] : json("auto"));
+    if (body.contains("response_format") && body["response_format"].is_object()) {
+      const json& rf = body["response_format"];
+      const json type = rf.contains("type") ? rf["type"] : json();
+      if (type == "json_object" || type == "json_schema") r.response_format = rf;
+    }
+    r.tool_choice_required = body.contains("tool_choice") && body["tool_choice"] == "required";
     if (vision) opts.images = &r.image_urls;
     r.prompt_text = render_chat(production_messages(body["messages"]), r.tools, opts);
     r.reasoning = !opts.enable_thinking.has_value() || *opts.enable_thinking;

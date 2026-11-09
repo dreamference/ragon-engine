@@ -337,6 +337,17 @@ namespace detail {
 std::string tool_calls_tag(const ToolCallSpec& spec);  // tool_calls.cpp
 }
 
+Grammar Compiler::response_format(const std::optional<nlohmann::ordered_json>& schema, const std::string& param) {
+  const std::string tag = detail::response_format_tag(schema, param);  // the schema checks throw a 400 first
+  return impl_->get('r', tag, [&] {
+    try {
+      return std::make_pair(impl_->compiler.CompileStructuralTag(tag), tag);
+    } catch (const std::exception& e) {
+      throw Error("invalid_json_schema", param + ": " + first_line(e.what()) + " at \"\"");
+    }
+  });
+}
+
 Grammar Compiler::tool_calls(const ToolCallSpec& spec) {
   const std::string tag = detail::tool_calls_tag(spec);
   return impl_->get('t', tag, [&] {

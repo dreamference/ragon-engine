@@ -14,6 +14,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -800,6 +801,73 @@ bool test_topk() {
   return ok;
 }
 
+// Structured output's device path: topk_rows_masked against a brute-force reference on the host, with masks from
+// none to all of the vocabulary allowed (fewer than K allowed ends the row in empty entries).
+bool test_topk_masked() {
+  std::mt19937 rng(11);
+  std::normal_distribution<float> normal(0.f, 3.f);
+  const int rows = 8, V = 248320, W = (V + 31) / 32;
+  std::vector<float> x(size_t(rows) * V);
+  for (auto& v : x) v = std::round(normal(rng) * 64.f) / 64.f;  // ties
+  std::vector<int32_t> mask(size_t(rows) * W, 0);
+  const int density[rows] = {0, 1, 3, 17, 70, 1000, 30000, -1};  // allowed ids per row; -1 = all
+  for (int r = 0; r < rows; ++r) {
+    int32_t* m = mask.data() + size_t(r) * W;
+    if (density[r] < 0) {
+      for (int w = 0; w < W; ++w) m[w] = -1;
+      continue;
+    }
+    for (int i = 0; i < density[r]; ++i) {
+      const int id = r == 2 && i == 0 ? V - 1 : int(rng() % V);  // the last id too
+      m[id >> 5] |= int32_t(1u << (id & 31));
+    }
+  }
+  float* dx = upload(x);
+  int32_t* dm;
+  cudaMalloc(&dm, mask.size() * sizeof(int32_t));
+  cudaMemcpy(dm, mask.data(), mask.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+  bool ok = true;
+  for (int K : {1, 16, 20, 64}) {
+    float *scratch, *vals;
+    int* ids;
+    cudaMalloc(&scratch, ragon::kernels::topk_scratch_floats(rows, K) * sizeof(float));
+    cudaMalloc(&vals, size_t(rows) * K * sizeof(float));
+    cudaMalloc(&ids, size_t(rows) * K * sizeof(int));
+    ragon::kernels::topk_rows_masked(dx, rows, V, K, dm, W, scratch, vals, ids, nullptr);
+    const auto gv = download(vals, size_t(rows) * K);
+    const auto gi = download(ids, size_t(rows) * K);
+    bool good = true;
+    for (int r = 0; r < rows; ++r) {
+      const float* row = x.data() + size_t(r) * V;
+      const int32_t* m = mask.data() + size_t(r) * W;
+      std::vector<int> idx;
+      for (int id = 0; id < V; ++id)
+        if ((uint32_t(m[id >> 5]) >> (id & 31)) & 1u) idx.push_back(id);
+      const int n = std::min<int>(K, idx.size());
+      std::partial_sort(idx.begin(), idx.begin() + n, idx.end(),
+                        [&](int a, int b) { return row[a] > row[b] || (row[a] == row[b] && a < b); });
+      for (int k = 0; k < K; ++k) {
+        const size_t o = size_t(r) * K + k;
+        if (k < n)
+          good &= gi[o] == idx[k] && gv[o] == row[idx[k]];
+        else
+          good &= gi[o] == 0x7fffffff && gv[o] == -FLT_MAX;
+      }
+    }
+    // An all-ones row is topk_rows' row.
+    ragon::kernels::topk_rows(dx + size_t(rows - 1) * V, 1, V, K, scratch, vals, ids, nullptr);
+    const auto pv = download(vals, K);
+    const auto pi = download(ids, K);
+    for (int k = 0; k < K; ++k)
+      good &= pi[k] == gi[size_t(rows - 1) * K + k] && pv[k] == gv[size_t(rows - 1) * K + k];
+    ok &= good;
+    std::printf("topk_rows_masked K=%-2d %s\n", K, good ? "ok" : "FAIL");
+    cudaFree(scratch), cudaFree(vals), cudaFree(ids);
+  }
+  cudaFree(dx), cudaFree(dm);
+  return ok;
+}
+
 void bench() {
   struct Shape {
     const char* name;
@@ -1573,6 +1641,7 @@ int main(int argc, char** argv) {
   ok &= test_draft_head_batch();
   ok &= test_attention_rows();
   ok &= test_topk();
+  ok &= test_topk_masked();
   ok &= test_batched_state_kernels();
   ok &= test_nvfp4_copy();
   if (argc > 1 && std::string(argv[1]) == "--bench") bench();

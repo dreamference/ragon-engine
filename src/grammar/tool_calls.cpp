@@ -127,5 +127,14 @@ std::string tool_calls_tag(const ToolCallSpec& spec) {
   return ojson{{"type", "structural_tag"}, {"format", format}}.dump();
 }
 
+std::string response_format_tag(const std::optional<ojson>& schema, const std::string& param) {
+  const std::string json = schema ? schema_ebnf(canonical_schema(*schema, param), true)
+                                  : schema_ebnf(ojson{{"type", "object"}}, false);
+  const ojson format = {{"type", "sequence"},
+                        {"elements", ojson::array({ojson{{"type", "grammar"}, {"grammar", kLead}},
+                                                   ojson{{"type", "grammar"}, {"grammar", json}}})}};
+  return ojson{{"type", "structural_tag"}, {"format", format}}.dump();
+}
+
 }  // namespace detail
 }  // namespace ragon::grammar

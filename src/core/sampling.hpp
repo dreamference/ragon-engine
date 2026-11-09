@@ -34,6 +34,14 @@ void require_finite(std::span<const float> logits);
 // so a row with no finite logit comes back as -FLT_MAX with an id past the vocabulary; an inf is kept.
 // Both are caught here. A row with only some NaN logits is not: that needs a scan on the device.
 void require_finite_topk(std::span<const float> vals, std::span<const int> ids, int vocab);
+// The same for one row of kernels::topk_rows_masked: its valid entries come first, then empty ones
+// (-FLT_MAX, 0x7fffffff) where the mask allowed fewer than K ids. Returns how many are valid (at least one).
+int require_finite_topk_masked(std::span<const float> vals, std::span<const int> ids, int vocab);
+// A token the grammar refuses, or a mask that allows none: the request ends with an error.
+class ConstraintError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 // Picks the next token from one row of logits. Presence and repetition penalties apply once to each
 // distinct token of `output`, the tokens the request has generated so far: like production, they never
@@ -41,6 +49,12 @@ void require_finite_topk(std::span<const float> vals, std::span<const int> ids, 
 // top-k, top-p and min-p and a draw from `rng`. Throws NonFiniteLogits if any logit is NaN or inf.
 int sample_logits(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
                   std::mt19937_64& rng);
+// The same under a token mask (structured output): bit id%32 of mask[id/32] set means the grammar allows id. The
+// others are skipped while the top k is selected, after the penalties, so the draw is sample_logits' draw over the
+// allowed ids only. Throws ConstraintError when the mask allows no id. Logprobs never see the mask.
+int sample_logits_masked(std::span<const float> logits, const SamplingParams& p, std::span<const int> output,
+                         std::mt19937_64& rng, const int32_t* mask);
+inline bool mask_allows(const int32_t* mask, int id) { return (uint32_t(mask[id >> 5]) >> (id & 31)) & 1u; }
 
 // sample_logits' draw, from a row's top k values (descending) and their ids, for a temperature above zero and no
 // penalties: the same token from the same generator, so a row sampled from its top k on the GPU is one sampled from

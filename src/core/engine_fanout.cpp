@@ -161,7 +161,8 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
   for (int i = 0; i < n; ++i) {
     pin_->rows[i] = seqs[i].anchor;
     segs.push_back({&sessions_[seqs[i].session], i, 1, nullptr});
-    ks[i] = row_top_k(*seqs[i].params);
+    // A constrained row (structured output) is drawn on the host from all its logits under its mask.
+    ks[i] = constraint_armed(sessions_[seqs[i].session]) ? 0 : row_top_k(*seqs[i].params);
     kmax = std::max(kmax, ks[i]);
   }
   // Every row of two or more is kept, whatever its sampling does (a row that fails resets its session below), so the
@@ -211,16 +212,20 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
       if (ks[i] == 0) {
         const std::vector<float>& l = seqs[i].row_logits ? *seqs[i].row_logits : full[i];
         const size_t output = std::min(s.history.size(), s.prompt_len);
-        next = sample_logits(l, p, std::span<const int>(s.history).subspan(output), s.rng);
+        const std::span<const int> out = std::span<const int>(s.history).subspan(output);
+        next = constraint_armed(s) ? sample_constrained(s, l, p, out) : sample_logits(l, p, out, s.rng);
       } else {
         require_finite_topk({vals, size_t(ks[i])}, {ids, size_t(ks[i])}, static_cast<int>(vocab));
         next = ks[i] == 1 && p.temperature <= 0.f ? ids[0]
                                                   : sample_topk({vals, size_t(ks[i])}, {ids, size_t(ks[i])}, p, s.rng);
       }
+      constraint_advance(s, next);
       seqs[i].out = {next};
       seqs[i].rows = 1;
       ok.push_back(&s);
     } catch (const NonFiniteLogits&) {
+      seqs[i].error = std::current_exception();
+    } catch (const ConstraintError&) {
       seqs[i].error = std::current_exception();
     }
   }

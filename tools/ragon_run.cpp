@@ -8,6 +8,7 @@
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
 //            [--drafter ID=DIR ...] [--switch-check]
 //            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pool-mb N | --kv-flat]
+//            [--grammar-schema FILE | --grammar-tools FILE] [--structured-out FILE]
 //
 // --lora LIBRARY/NAME loads that adapter (LORA §3) into one GPU slot and runs every session on it, so each check
 // below holds with an adapter as well as on the base.
@@ -103,7 +104,9 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iterator>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -121,6 +124,9 @@
 #include "serve/image_input.hpp"
 #include "tokenizer/chat_template.hpp"
 #include "tokenizer/tokenizer.hpp"
+#ifdef RAGON_HAS_GRAMMAR
+#include "serve/structured.hpp"
+#endif
 
 namespace {
 
@@ -359,6 +365,7 @@ int main(int argc, char** argv) {
   int sparse_head_dynamic = 16384;
   std::string vision_prompts, vision_check, force_file, greedy_out;  // images (VISION §20.8)
   bool vision_bench = false, vision_dump = false;
+  std::string grammar_schema, grammar_tools, structured_out;  // structured output, stage 2 (RAGON_GRAMMAR builds)
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -424,6 +431,9 @@ int main(int argc, char** argv) {
     else if (a == "--vision-dump") vision_dump = true;
     else if (a == "--force-file") force_file = next();
     else if (a == "--greedy-out") greedy_out = next();
+    else if (a == "--grammar-schema") grammar_schema = next();
+    else if (a == "--grammar-tools") grammar_tools = next();
+    else if (a == "--structured-out") structured_out = next();
     else {
       std::cerr << "unknown argument " << a << "\n";
       return 2;
@@ -568,6 +578,40 @@ int main(int argc, char** argv) {
     // RAGON_PROBE_SKIP's runs (src/core/launch.cuh) produce garbage tokens; they decode to --max-tokens regardless.
     const bool no_end = std::getenv("RAGON_PROBE_SKIP") != nullptr;
     auto is_end = [&](int t) { return !no_end && (t == engine.config().eos_token || t == im_end); };
+    // Structured output, stage 2 (SPECULATION "Structured output, stage 2"): --grammar-schema FILE constrains every
+    // generation to response_format json_schema with that schema, --grammar-tools FILE (a tools array) to
+    // tool_choice "required" with those tools, as ragon-serve does with RAGON_STRUCTURED=1. The constraint arms after
+    // </think> when the prompt ends inside a thinking span, else at once.
+    std::function<std::shared_ptr<ragon::TokenConstraint>()> make_constraint;
+    const int think_open = tok.token_id("<think>"), think_close = tok.token_id("</think>");
+    auto arm_token = [&](const std::vector<int>& prompt) {
+      for (size_t i = prompt.size(); i-- > 0;) {
+        if (prompt[i] == think_close) return -1;
+        if (prompt[i] == think_open) return think_close;
+      }
+      return -1;
+    };
+    if (!grammar_schema.empty() || !grammar_tools.empty()) {
+#ifdef RAGON_HAS_GRAMMAR
+      static ragon::grammar::Vocab gvocab(tok, engine.config().vocab);
+      static ragon::grammar::Compiler gcomp(gvocab);
+      ragon::serve::Request r;
+      r.chat = true;
+      if (!grammar_tools.empty()) {
+        r.tools = nlohmann::json::parse(read_file(grammar_tools));
+        r.tool_choice_required = true;
+      } else {
+        r.response_format = nlohmann::json{
+            {"type", "json_schema"},
+            {"json_schema", {{"name", "check"}, {"schema", nlohmann::json::parse(read_file(grammar_schema))}}}};
+      }
+      const ragon::grammar::Grammar g = *ragon::serve::request_grammar(gcomp, r);
+      const int words = gvocab.words();
+      make_constraint = [g, words] { return std::make_shared<ragon::serve::GrammarConstraint>(g, words); };
+#else
+      throw std::runtime_error("--grammar-schema and --grammar-tools need a build with RAGON_GRAMMAR");
+#endif
+    }
     // The agreement study's engine side for these prompts (bench/vision/agree.py), as bench/agreement/ragon_force does
     // for text: plain greedy decoding, and teacher-forced top-20 log-probs over production's continuation.
     const int pad_id = tok.token_id("<|image_pad|>");
@@ -651,6 +695,7 @@ int main(int argc, char** argv) {
                      stats.image_tokens, stats.vision_seconds, stats.images_encoded);
       ragon::StreamDecoder dec(tok);
       std::vector<int> out;
+      if (make_constraint) engine.set_constraint(engine.active_session(), make_constraint(), arm_token(prompt));
       auto t2 = std::chrono::steady_clock::now();
       std::vector<int> pending = {engine.sample(logits, sp, engine.history())};
       bool done = false;
@@ -1557,6 +1602,97 @@ int main(int argc, char** argv) {
             while (i < eager.size() && i < graph.size() && eager[i] == graph[i]) ++i;
             std::printf("  first difference at output token %zu\n", i);
           }
+        }
+        continue;
+      }
+      if (spec_check && make_constraint) {
+        // Constrained greedy, plainly and speculatively: the same tokens; each token's row (what its logprobs come
+        // from) bit for bit the unconstrained model's on those tokens; the state as a plain replay's.
+        sp.temperature = 0.f;
+        auto run = [&](bool use_spec, std::vector<float>& rows, double* secs, ragon::SpecStats* st) {
+          engine.reset();
+          std::vector<float> logits = engine.prefill(prompt, nullptr, false, IMG);
+          engine.set_constraint(engine.active_session(), make_constraint(), arm_token(prompt));
+          engine.reset_spec_stats();
+          rows.assign(logits.begin(), logits.end());
+          std::vector<int> out, pending = {engine.sample(logits, sp, engine.history())};
+          const auto t0 = std::chrono::steady_clock::now();
+          for (bool done = false; !done;) {
+            for (size_t j = 0; j < pending.size(); ++j) {
+              out.push_back(pending[j]);
+              if (is_end(pending[j]) || static_cast<int>(out.size()) >= max_tokens) {
+                done = true;
+                rows.resize(out.size() * logits.size());
+                break;
+              }
+            }
+            if (done) break;
+            if (use_spec) {
+              std::vector<float> r;
+              pending = engine.speculate(pending.back(), sp, &r);
+              rows.insert(rows.end(), r.begin(), r.end());
+            } else {
+              logits = engine.step(pending.back());
+              rows.insert(rows.end(), logits.begin(), logits.end());
+              pending = {engine.sample(logits, sp, engine.history())};
+            }
+          }
+          *secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          if (st) *st = engine.spec_stats();
+          engine.set_constraint(engine.active_session(), nullptr);
+          return out;
+        };
+        std::vector<float> plain_rows, spec_rows;
+        double t_plain = 0, t_spec = 0;
+        ragon::SpecStats st;
+        const std::vector<int> plain = run(false, plain_rows, &t_plain, nullptr);
+        const std::vector<int> fast = run(true, spec_rows, &t_spec, &st);
+        const uint64_t h_spec = engine.state_hash();
+        const std::vector<int> processed(engine.history().begin() + prompt.size(), engine.history().end());
+        // The unconstrained model on the constrained tokens.
+        engine.reset();
+        std::vector<float> ref(engine.prefill(prompt, nullptr, false, IMG));
+        ref.reserve(plain.size() * ref.size());
+        for (size_t j = 0; j + 1 < plain.size(); ++j) {
+          const std::vector<float>& l = engine.step(plain[j]);
+          ref.insert(ref.end(), l.begin(), l.end());
+        }
+        engine.reset();
+        engine.prefill(prompt, nullptr, false, IMG);
+        for (int t : processed) engine.step(t);
+        const uint64_t h_plain = engine.state_hash();
+        const bool same = plain == fast, state = h_spec == h_plain;
+        const bool rows_plain = plain_rows.size() == ref.size() &&
+                                std::memcmp(plain_rows.data(), ref.data(), ref.size() * sizeof(float)) == 0;
+        const bool rows_spec = same && spec_rows.size() == ref.size() &&
+                               std::memcmp(spec_rows.data(), ref.data(), ref.size() * sizeof(float)) == 0;
+        // The answer after the thinking span (all of it when the prompt left none open).
+        size_t from = 0;
+        if (arm_token(prompt) >= 0) {
+          const auto it = std::find(plain.begin(), plain.end(), arm_token(prompt));
+          from = it == plain.end() ? plain.size() : size_t(it - plain.begin()) + 1;
+        }
+        const bool ended = !plain.empty() && is_end(plain.back());
+        std::vector<int> answer(plain.begin() + from, plain.end() - (ended ? 1 : 0));
+        failures += !same + !state + !rows_plain + !rows_spec;
+        std::printf("prompt %zu tokens, constrained: plain %zu tokens %.2f tok/s | spec %zu tokens %.2f tok/s, %ld steps, "
+                    "%.2f tokens/step, %.1f ms/step | tokens %s, state %s, rows plain %s, rows spec %s, %s\n",
+                    prompt.size(), plain.size(), plain.size() / t_plain, fast.size(), fast.size() / t_spec, st.steps,
+                    st.steps ? double(st.accepted + st.steps) / st.steps : 0.0,
+                    st.steps ? 1e3 * (st.draft_seconds + st.verify_seconds + st.commit_seconds) / st.steps : 0.0,
+                    same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS", rows_plain ? "identical" : "DIFFER",
+                    rows_spec ? "identical" : "DIFFER", ended ? "ended" : "cut at --max-tokens");
+        if (!same) {
+          size_t i = 0;
+          while (i < plain.size() && i < fast.size() && plain[i] == fast[i]) ++i;
+          std::printf("  first difference at output token %zu\n", i);
+        }
+        if (!structured_out.empty()) {
+          std::ofstream f(structured_out, std::ios::app);
+          f << nlohmann::json{{"prompt_tokens", prompt.size()}, {"ended", ended}, {"answer", tok.decode(answer)},
+                              {"ids", plain}}
+                   .dump()
+            << "\n";
         }
         continue;
       }

@@ -99,6 +99,35 @@ __global__ void topk_stage1(const float* __restrict__ x, int V, int K, float* __
   }
 }
 
+// topk_stage1 under a token mask (structured output): row r reads mask row r (`words` int32 words, bit id%32 of
+// word id/32); a disallowed id is skipped as a NaN is, so it never enters the list. A row that allows fewer than K
+// ids ends in the empty entries (-FLT_MAX, 0x7fffffff). Separate from topk_stage1 so the unmasked kernel is untouched.
+__global__ void topk_stage1_masked(const float* __restrict__ x, int V, int K, float* __restrict__ pv,
+                                   int* __restrict__ pi, const int32_t* __restrict__ mask, int words) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float lv[64];
+  __shared__ int li[64];
+  const int row = blockIdx.y, seg = blockIdx.x;
+  const int per = (V + kSegments - 1) / kSegments;
+  const int start = seg * per, n = max(0, min(V, start + per) - start);
+  const float* r = x + static_cast<size_t>(row) * V + start;
+  const uint32_t* m = reinterpret_cast<const uint32_t*>(mask) + static_cast<size_t>(row) * words;
+  int count = 0;
+  warp_topk(
+      [&](int e, float& v, int& i) {
+        i = start + e;
+        v = (m[i >> 5] >> (i & 31)) & 1u ? r[e] : __int_as_float(0x7fc00000);  // NaN: skipped
+      },
+      n, K, WarpList{lv, li}, count);
+  __syncwarp();
+  const int lane = threadIdx.x;
+  for (int e = lane; e < K; e += 32) {
+    const size_t o = (static_cast<size_t>(row) * kSegments + seg) * K + e;
+    pv[o] = e < count ? lv[e] : -FLT_MAX;
+    pi[o] = e < count ? li[e] : 0x7fffffff;
+  }
+}
+
 __global__ void topk_stage2(const float* __restrict__ pv, const int* __restrict__ pi, int K, float* __restrict__ vals,
                             int* __restrict__ ids) {
   pdl_begin();  // first statement: see launch.cuh
@@ -126,6 +155,17 @@ void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* va
   int* pi = reinterpret_cast<int*>(scratch + static_cast<size_t>(rows) * kSegments * K);
   launch_kernel("topk_rows", topk_stage1, dim3(kSegments, rows), dim3(32), 0, s, x, V, K, pv, pi);
   launch_kernel("topk_rows", topk_stage2, dim3(rows), dim3(32), 0, s, pv, pi, K, vals, ids);
+}
+
+void topk_rows_masked(const float* x, int rows, int V, int K, const int32_t* mask, int words, float* scratch,
+                      float* vals, int* ids, cudaStream_t s) {
+  if (K < 1 || K > 64) throw std::runtime_error("topk_rows_masked: K must be in [1, 64]");
+  if (words * 32 < V) throw std::runtime_error("topk_rows_masked: the mask is shorter than the row");
+  float* pv = scratch;
+  int* pi = reinterpret_cast<int*>(scratch + static_cast<size_t>(rows) * kSegments * K);
+  launch_kernel("topk_rows_masked", topk_stage1_masked, dim3(kSegments, rows), dim3(32), 0, s, x, V, K, pv, pi, mask,
+                words);
+  launch_kernel("topk_rows_masked", topk_stage2, dim3(rows), dim3(32), 0, s, pv, pi, K, vals, ids);
 }
 
 }  // namespace ragon::kernels

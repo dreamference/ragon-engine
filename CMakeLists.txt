@@ -203,6 +203,18 @@ if(RAGON_GRAMMAR)
   target_link_libraries(ragon-grammar-tests PRIVATE ragon_grammar)
   add_test(NAME grammar COMMAND ragon-grammar-tests)
   set_tests_properties(grammar PROPERTIES SKIP_RETURN_CODE 77)
+  # ragon-structured-tests: stage 2's request grammar and constraint (serve/structured.hpp), same tokenizer.
+  add_executable(ragon-structured-tests tests/structured_tests.cpp)
+  target_link_libraries(ragon-structured-tests PRIVATE ragon_grammar ragon_api)
+  add_test(NAME structured COMMAND ragon-structured-tests)
+  set_tests_properties(structured PROPERTIES SKIP_RETURN_CODE 77)
+  # Structured output, stage 2: ragon-serve (RAGON_STRUCTURED=1) and ragon-run constrain decoding with it.
+  foreach(t ragon-serve ragon-run)
+    if(TARGET ${t})
+      target_link_libraries(${t} PRIVATE ragon_grammar)
+      target_compile_definitions(${t} PRIVATE RAGON_HAS_GRAMMAR=1)
+    endif()
+  endforeach()
   # ragon-grammar-bench: mask cost at the model's vocabulary (not a test).
   add_executable(ragon-grammar-bench bench/grammar_bench.cpp)
   target_link_libraries(ragon-grammar-bench PRIVATE ragon_grammar Threads::Threads)
