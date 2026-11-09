@@ -995,8 +995,9 @@ class Scheduler {
   // Whether r's next decode step can join the batch of the kind it would take alone.
   bool batchable_now(const Running& r) const {
     if (r.prefilling) return false;
-    // A constrained speculative turn steps alone (its verify reads mask rows; riders sample unmasked on the device).
-    if (ctx_.structured && spec_turn(r) && ctx_.engine->constrained(r.job.session)) return false;
+    // A constrained speculative turn joins as a drafting sequence (its rows carry their masks); as a rider it steps
+    // alone (riders sample unmasked on the device).
+    if (ctx_.structured && rider(r) && ctx_.engine->constrained(r.job.session)) return false;
     return spec_step(r) ? batchable(r) : ctx_.engine->can_step_batch(r.job.session);
   }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
