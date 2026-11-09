@@ -402,6 +402,293 @@ __global__ void __launch_bounds__(kWarps * 32)
                                                                      PdlBegin{}, (b & 1) * NT * 8);
 }
 
+// RAGON_SG64_CLUSTER=1 (experiment): the pair kernel's two blocks of a tile as one cluster of two that reads each
+// weight chunk from memory once. Rank r loads tiles 2r and 2r + 1 of the four and pushes them, lane by lane, into the
+// other block's shared memory with st.async (complete_tx on that block's `full` barrier); it takes the other two tiles
+// from its own shared memory. Warp w of one block works in lockstep with warp w of the other (the same chunks) through
+// a ring of S stages per warp: `full` (the bytes have arrived) and `empty` (the receiver has computed the slot; it
+// arrives on the sender's barrier remotely). Every accumulator takes the pair kernel's MMAs in the same order and the
+// reduction is the same, so the bits are the same. TMA multicast (cp.async.bulk .multicast::cluster) is the other way
+// to share a load: it delivers to both blocks on sm_121a, but ptxas warns of "substantially reduced performance" and
+// lowers it to a call into a runtime routine, not one bulk copy.
+// Measured 2026-11-08 (ragon-stream-tests --bench-groups): bit-exact, but about half the pair kernel's GB/s at M = 48
+// and 64 (gate|up fp4 at 64: 105 against 180), at the same occupancy and with three stages as with two. Without the
+// push and the barriers (timing only, wrong output) it runs at the pair kernel's speed or below (gate|up 165 at 64)
+// although each block then reads only half the weights: at 64 rows the pair kernel is bound by its MMAs and register
+// traffic, not by the weight reads, so sharing them cannot make it faster. Off by default for that reason.
+namespace cl {
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ uint32_t mapa(uint32_t a, uint32_t rank) {
+  uint32_t o;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(o) : "r"(a), "r"(rank));
+  return o;
+}
+__device__ __forceinline__ void bar_init(uint32_t a, int count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(count) : "memory");
+}
+__device__ __forceinline__ void arrive_expect(uint32_t a, int bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(a), "r"(bytes) : "memory");
+}
+// The receiver's reads of the slot have been consumed by its MMAs before this, so no release is needed (a release at
+// cluster scope is a full GPU memory barrier on this toolchain).
+__device__ __forceinline__ void arrive_remote(uint32_t cluster_addr) {
+  asm volatile("mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [%0];" ::"r"(cluster_addr) : "memory");
+}
+__device__ __forceinline__ void wait(uint32_t a, uint32_t parity) {
+  uint32_t done = 0;
+  while (!done)
+    asm volatile(
+          "{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}"
+          : "=r"(done)
+          : "r"(a), "r"(parity)
+          : "memory");
+}
+__device__ __forceinline__ void st_async(uint32_t cluster_addr, const uint4& v, uint32_t cluster_bar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(
+                   cluster_addr),
+               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "r"(cluster_bar)
+               : "memory");
+}
+__device__ __forceinline__ void cluster_arrive() { asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory"); }
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+__device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); }
+}  // namespace cl
+
+// 16-byte items a lane pushes per chunk for its block's two tiles: NVFP4 four value pieces and one of scales (raw) or
+// codes; FP8 eight value pieces.
+template <bool FP4>
+constexpr int cl_items() {
+  return FP4 ? 5 : 8;
+}
+template <int NT, bool FP4, int S>
+constexpr size_t cl_alias_bytes() {
+  const size_t ring = size_t(kWarps) * S * cl_items<FP4>() * 32 * 16;
+  return ring > pair_red_bytes<NT, 4>() ? ring : pair_red_bytes<NT, 4>();
+}
+template <int NT, bool FP4, int S>
+constexpr size_t cl_smem_bytes() {
+  return cl_alias_bytes<NT, FP4, S>() + size_t(kWarps) * S * 2 * sizeof(uint64_t);
+}
+
+template <bool FP4, bool CODED>
+__device__ __forceinline__ uint4 cl_item(const WeightRegs<2, FP4, CODED>& r, int it) {
+  if constexpr (FP4) {
+    if (it < 4) return r.v[it >> 1][it & 1][0];
+    if constexpr (CODED) return make_uint4(r.cw[0][0], r.cw[0][1], r.cw[1][0], r.cw[1][1]);
+    else return make_uint4(r.sc[0][0], r.sc[0][1], r.sc[1][0], r.sc[1][1]);
+  } else {
+    return r.v[it >> 2][(it >> 1) & 1][it & 1];
+  }
+}
+
+template <bool FP4, bool CODED>
+__device__ __forceinline__ void cl_set_item(WeightRegs<2, FP4, CODED>& r, int it, const uint4& v) {
+  if constexpr (FP4) {
+    if (it < 4) {
+      r.v[it >> 1][it & 1][0] = v;
+    } else if constexpr (CODED) {
+      r.cw[0][0] = v.x, r.cw[0][1] = v.y, r.cw[1][0] = v.z, r.cw[1][1] = v.w;
+    } else {
+      r.sc[0][0] = v.x, r.sc[0][1] = v.y, r.sc[1][0] = v.z, r.sc[1][1] = v.w;
+    }
+  } else {
+    r.v[it >> 2][(it >> 1) & 1][it & 1] = v;
+  }
+}
+
+// One chunk of two tiles into their accumulators: stream_gemm_body's arithmetic for TILES = 2, one group.
+template <int NT, bool FP4, bool CODED>
+__device__ __forceinline__ void cl_mma(float (&acc)[2][NT][4], const WeightRegs<2, FP4, CODED>& cur,
+                                       const uint32_t (&xw)[NT][16], const uint8_t* tab) {
+  uint32_t sc_h2[2][2][2];
+  if constexpr (FP4) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint32_t pair = cur.sc[i][h];
+        if constexpr (CODED) {
+          const uint32_t f = ((cur.cw[i][0] >> (8 * h)) & 0xffu) | (((cur.cw[i][1] >> (4 * h)) & 0xfu) << 8);
+          pair = uint32_t(tab[f & 63u]) | (uint32_t(tab[(f >> 6) & 63u]) << 8);
+        }
+        const uint32_t s2 = e4m3x2_to_h2(pair);
+        sc_h2[i][h][0] = (s2 & 0xffffu) | (s2 << 16);
+        sc_h2[i][h][1] = (s2 >> 16) | (s2 & 0xffff0000u);
+      }
+  }
+#pragma unroll
+  for (int s = 0; s < 8; ++s) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      uint32_t a[2][2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        if constexpr (FP4) {
+          const uint32_t word = word_of(cur.v[i][h][0], s >> 1);
+          const uint32_t bytes = word >> (16 * (s & 1));
+          const uint32_t scale = sc_h2[i][h][s >> 2];
+          a[h][0] = hmul2(e2m1x2_to_h2(bytes & 0xffu), scale);
+          a[h][1] = hmul2(e2m1x2_to_h2((bytes >> 8) & 0xffu), scale);
+        } else {
+          const uint32_t word = word_of(cur.v[i][h][s >> 2], s & 3);
+          a[h][0] = e4m3x2_to_h2(word & 0xffffu);
+          a[h][1] = e4m3x2_to_h2(word >> 16);
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < NT; ++j)
+        mma16816(acc[i][j], a[0][0], a[1][0], a[0][1], a[1][1], xw[j][2 * s], xw[j][2 * s + 1]);
+    }
+  }
+}
+
+template <int NT, bool FP4, bool CODED, int S>
+__global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(kWarps * 32)
+    stream_gemm_cluster_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
+                               int K) {
+  constexpr int TILES = 4, ITEMS = cl_items<FP4>(), BYTES = ITEMS * 32 * 16;
+  using Regs = WeightRegs<2, FP4, CODED>;
+  const int b = blockIdx.x, bx = b >> 1, tok0 = (b & 1) * NT * 8;
+  const uint32_t rank = b & 1, peer = rank ^ 1u;  // cluster (2, 1, 1): %cluster_ctarank is blockIdx.x % 2
+  int pi = 0;
+  while (pi + 1 < pr.count && bx >= pr.block0[pi + 1]) ++pi;
+  const uint8_t* __restrict__ w = pr.w[pi];
+  const float gscale = pr.gscale[pi];
+  const int N = pr.N[pi];
+  float* __restrict__ y = pr.y[pi] + static_cast<size_t>(tok0) * N;
+  x += static_cast<size_t>(tok0) * K;
+  xinv += tok0;
+  M -= tok0;
+  extern __shared__ __align__(16) unsigned char cl_smem[];
+  using Red = float[kWarps][TILES * 16][NT * 8 + 1];
+  Red& red = *reinterpret_cast<Red*>(cl_smem);  // after the chunk loop, over the ring
+  uint4* ring = reinterpret_cast<uint4*>(cl_smem);  // [warp][S][ITEMS][32]
+  uint64_t* bars = reinterpret_cast<uint64_t*>(cl_smem + cl_alias_bytes<NT, FP4, S>());  // full[warp][S], empty[...]
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t = lane & 3;
+  const int row0 = (bx - pr.block0[pi]) * TILES * 16;
+  const int chunks = K / kChunk;
+  const int nk = warp < chunks ? (chunks - warp + kWarps - 1) / kWarps : 0;  // this warp's chunks
+  uint4* my_ring = ring + static_cast<size_t>(warp) * S * ITEMS * 32 + lane;
+  const uint32_t full0 = cl::smem_u32(bars + warp * S), empty0 = cl::smem_u32(bars + kWarps * S + warp * S);
+  const uint32_t peer_ring = cl::mapa(cl::smem_u32(my_ring), peer), peer_full0 = cl::mapa(full0, peer),
+                 peer_empty0 = cl::mapa(empty0, peer);
+
+  if (lane == 0) {
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+      cl::bar_init(full0 + 8 * s, 1);
+      cl::bar_init(empty0 + 8 * s, 1);
+    }
+#pragma unroll
+    for (int s = 0; s < S; ++s)
+      if (s < nk) cl::arrive_expect(full0 + 8 * s, BYTES);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+
+  float acc_own[2][NT][4], acc_peer[2][NT][4];
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc_own[i][j][e] = acc_peer[i][j][e] = 0.f;
+
+  // Own tiles 2r, 2r + 1: chunk k computed, k + 1 pushed, k + 2 in flight.
+  Regs buf[3];
+  const int own_row0 = row0 + 32 * static_cast<int>(rank);
+  if (nk > 0) load_weights<2, FP4, CODED>(buf[0], w, own_row0, N, K, warp, g, t);
+  if (nk > 1) load_weights<2, FP4, CODED>(buf[1], w, own_row0, N, K, warp + kWarps, g, t);
+  __shared__ uint8_t tab[CODED ? kScaleCodes : 1];
+  if constexpr (CODED)
+    if (threadIdx.x < kScaleCodes) tab[threadIdx.x] = pr.table[pi][threadIdx.x];
+  if constexpr (CODED) __syncthreads();
+  // Both blocks' barriers exist before anything reaches them (fence.mbarrier_init above, as CUTLASS's pipelines).
+  cl::cluster_arrive_relaxed();
+  cl::cluster_wait();
+  auto push = [&](const Regs& r, int s) {
+    const uint32_t dst = peer_ring + s * BYTES, bar = peer_full0 + 8 * s;
+#pragma unroll
+    for (int it = 0; it < ITEMS; ++it) cl::st_async(dst + it * 512, cl_item<FP4, CODED>(r, it), bar);
+  };
+  if (nk > 0) push(buf[0], 0);
+  pdl_begin();  // only weights and shared memory before this (launch.cuh)
+
+  for (int k = 0; k < nk; ++k) {
+    const int c = warp + k * kWarps, s = k % S;
+    if (k + 2 < nk) load_weights<2, FP4, CODED>(buf[2], w, own_row0, N, K, c + 2 * kWarps, g, t);
+    if (k + 1 < nk) {
+      const int s1 = (k + 1) % S;
+      if (k + 1 >= S) cl::wait(empty0 + 8 * s1, (((k + 1) / S) + 1) & 1);
+      push(buf[1], s1);
+    }
+    uint32_t xw[NT][16];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+      const int n = g + 8 * j;
+      if (n < M) {
+        const uint4* p = reinterpret_cast<const uint4*>(x + static_cast<size_t>(n) * K + c * kChunk + t * 32);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const uint4 v = __ldg(p + q);
+          xw[j][4 * q] = v.x;
+          xw[j][4 * q + 1] = v.y;
+          xw[j][4 * q + 2] = v.z;
+          xw[j][4 * q + 3] = v.w;
+        }
+      } else {
+#pragma unroll
+        for (int q = 0; q < 16; ++q) xw[j][q] = 0u;
+      }
+    }
+    cl_mma<NT, FP4, CODED>(acc_own, buf[0], xw, tab);
+    cl::wait(full0 + 8 * s, (k / S) & 1);
+    Regs other;
+#pragma unroll
+    for (int it = 0; it < ITEMS; ++it) cl_set_item<FP4, CODED>(other, it, my_ring[(s * ITEMS + it) * 32]);
+    cl_mma<NT, FP4, CODED>(acc_peer, other, xw, tab);
+    __syncwarp();
+    if (lane == 0 && k + S < nk) {  // the slot takes chunk k + S: arm its next phase, then free it
+      cl::arrive_expect(full0 + 8 * s, BYTES);
+      cl::arrive_remote(peer_empty0 + 8 * s);
+    }
+    buf[0] = buf[1];
+    buf[1] = buf[2];
+  }
+  cl::cluster_arrive();  // this block's last remote access is done; neither block exits before the other's
+  __syncthreads();       // every warp has read its ring: the reduction buffer may overwrite it
+
+  const int own_tile0 = 2 * static_cast<int>(rank), peer_tile0 = 2 * static_cast<int>(peer);
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+      const int ro = 16 * (own_tile0 + i) + g, rp = 16 * (peer_tile0 + i) + g;
+      red[warp][ro][8 * j + 2 * t] = acc_own[i][j][0];
+      red[warp][ro][8 * j + 2 * t + 1] = acc_own[i][j][1];
+      red[warp][ro + 8][8 * j + 2 * t] = acc_own[i][j][2];
+      red[warp][ro + 8][8 * j + 2 * t + 1] = acc_own[i][j][3];
+      red[warp][rp][8 * j + 2 * t] = acc_peer[i][j][0];
+      red[warp][rp][8 * j + 2 * t + 1] = acc_peer[i][j][1];
+      red[warp][rp + 8][8 * j + 2 * t] = acc_peer[i][j][2];
+      red[warp][rp + 8][8 * j + 2 * t + 1] = acc_peer[i][j][3];
+    }
+  __syncthreads();
+  for (int e = threadIdx.x; e < TILES * 16 * NT * 8; e += blockDim.x) {
+    const int r = e / (NT * 8), n = e % (NT * 8);
+    if (n >= M || row0 + r >= N) continue;
+    float sum = 0.f;
+#pragma unroll
+    for (int wi = 0; wi < kWarps; ++wi) sum += red[wi][r][n];
+    y[static_cast<size_t>(n) * N + row0 + r] = sum * gscale * xinv[n];
+  }
+  cl::cluster_wait();
+}
+
 template <int NT, int GROUPS = 1>
 __global__ void __launch_bounds__(kWarps * 32)
     stream_gemm_gather_kernel(const __half* __restrict__ x, const float* __restrict__ xinv, int M, StreamProblems pr,
@@ -736,10 +1023,45 @@ void launch_k(int tiles, const __half* x, const float* xinv, int M, const Stream
 // ragon-stream-tests --bench-groups: the step's GEMMs at M = 64 90 ms, two groups 102-104 ms; at M = 48 83 against
 // 88 ms; two chunks in flight 95-97 ms at 64). RAGON_SG64=0 (experiment) brings back the two groups (P1),
 // RAGON_SG64_PF=2 two chunks in flight.
+template <int NT, bool FP4, bool CODED, int S>
+void launch_cluster(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
+  StreamProblems pr{};
+  int blocks = 0;
+  for (int i = 0; i < n; ++i) {
+    pr.w[i] = t[i].w;
+    pr.gscale[i] = t[i].scale;
+    pr.y[i] = t[i].y;
+    pr.N[i] = t[i].N;
+    pr.table[i] = t[i].wscale;
+    pr.block0[i] = blocks;
+    blocks += (t[i].N + 63) / 64;
+  }
+  pr.count = n;
+  constexpr size_t smem = cl_smem_bytes<NT, FP4, S>();
+  static const cudaError_t set = cudaFuncSetAttribute(stream_gemm_cluster_kernel<NT, FP4, CODED, S>,
+                                                      cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+  if (set != cudaSuccess) throw std::runtime_error(std::string("stream_gemm cluster: ") + cudaGetErrorString(set));
+  launch_kernel("stream_gemm cluster", stream_gemm_cluster_kernel<NT, FP4, CODED, S>, dim3(2 * blocks),
+                dim3(kWarps * 32), smem, s, x, xinv, M, pr, K);
+}
+
 template <int NT, bool FP4>
 void launch_pair(const __half* x, const float* xinv, int M, const StreamTarget* t, int n, int K, cudaStream_t s) {
   static const int pf = sg_env("RAGON_SG64_PF", 1);
+  static const int cluster = sg_env("RAGON_SG64_CLUSTER", 0), stages = sg_env("RAGON_SG64_CLUSTER_STAGES", 2);
   const bool coded = FP4 && t[0].wscale != nullptr;
+  if (cluster) {  // one weight read per tile for both halves of the tokens (stream_gemm_cluster_kernel)
+    if constexpr (FP4) {
+      if (coded) {
+        if (stages == 3) launch_cluster<NT, FP4, true, 3>(x, xinv, M, t, n, K, s);
+        else launch_cluster<NT, FP4, true, 2>(x, xinv, M, t, n, K, s);
+        return;
+      }
+    }
+    if (stages == 3) launch_cluster<NT, FP4, false, 3>(x, xinv, M, t, n, K, s);
+    else launch_cluster<NT, FP4, false, 2>(x, xinv, M, t, n, K, s);
+    return;
+  }
   if (coded) {
     if constexpr (FP4) {
       if (pf == 2) launch<NT, 4, FP4, 2, true, 1, true>(x, xinv, M, t, n, K, s);
