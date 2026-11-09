@@ -2754,8 +2754,8 @@ int main(int argc, char** argv) try {
   ctx.think_end = tok.token_id("</think>");
   if (const char* e = std::getenv("RAGON_STRUCTURED"); e && std::string(e) == "1") {
 #ifdef RAGON_HAS_GRAMMAR
-    ctx.grammar_vocab = std::make_unique<grammar::Vocab>(tok, engine.config().vocab);
-    ctx.grammar_compiler = std::make_unique<grammar::Compiler>(*ctx.grammar_vocab);
+    ctx.grammar_vocab = std::make_unique<ragon::grammar::Vocab>(tok, engine.config().vocab);
+    ctx.grammar_compiler = std::make_unique<ragon::grammar::Compiler>(*ctx.grammar_vocab);
     ctx.structured = true;
     std::cerr << "structured output on (RAGON_STRUCTURED=1): chat response_format and tool_choice \"required\"\n";
 #else
