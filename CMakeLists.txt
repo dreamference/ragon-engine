@@ -181,3 +181,29 @@ add_test(NAME api COMMAND ragon-api-tests)
 add_executable(ragon-admission-tests tests/admission_tests.cpp)
 target_link_libraries(ragon-admission-tests PRIVATE ragon_api)
 add_test(NAME admission COMMAND ragon-admission-tests)
+
+# Structured output, stage 1 (BACKLOG §19.17): the grammar library on the CPU, against the XGrammar prebuilt that
+# scripts/build_xgrammar.sh installs. OFF by default; OFF leaves the build as it was.
+option(RAGON_GRAMMAR "Build the grammar library (structured output) against the XGrammar prebuilt" OFF)
+set(RAGON_XGRAMMAR_PREFIX "$ENV{HOME}/ragon-deps/xgrammar" CACHE PATH "Install prefix of the XGrammar prebuilt")
+if(RAGON_GRAMMAR)
+  if(NOT EXISTS "${RAGON_XGRAMMAR_PREFIX}/lib/libxgrammar.a")
+    message(FATAL_ERROR "RAGON_GRAMMAR: no XGrammar under ${RAGON_XGRAMMAR_PREFIX}; run scripts/build_xgrammar.sh")
+  endif()
+  add_library(xgrammar::xgrammar STATIC IMPORTED)
+  set_target_properties(xgrammar::xgrammar PROPERTIES
+    IMPORTED_LOCATION "${RAGON_XGRAMMAR_PREFIX}/lib/libxgrammar.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${RAGON_XGRAMMAR_PREFIX}/include"
+    INTERFACE_LINK_LIBRARIES Threads::Threads)
+  add_library(ragon_grammar STATIC src/grammar/grammar.cpp src/grammar/json_schema.cpp src/grammar/lark.cpp
+                                   src/grammar/tool_calls.cpp)
+  target_link_libraries(ragon_grammar PUBLIC ragon_tokenizer PRIVATE xgrammar::xgrammar)
+  # ragon-grammar-tests: the tokenizer from RAGON_TOKENIZER_JSON, else the model snapshot in the Hugging Face cache.
+  add_executable(ragon-grammar-tests tests/grammar_tests.cpp)
+  target_link_libraries(ragon-grammar-tests PRIVATE ragon_grammar)
+  add_test(NAME grammar COMMAND ragon-grammar-tests)
+  set_tests_properties(grammar PROPERTIES SKIP_RETURN_CODE 77)
+  # ragon-grammar-bench: mask cost at the model's vocabulary (not a test).
+  add_executable(ragon-grammar-bench bench/grammar_bench.cpp)
+  target_link_libraries(ragon-grammar-bench PRIVATE ragon_grammar Threads::Threads)
+endif()
