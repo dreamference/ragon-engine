@@ -44,8 +44,26 @@ namespace ragon::serve {
 inline constexpr size_t kDraftRingBytes = size_t(5) * 2 * 8224 * 1024 * 2;
 // What the engine allocates besides weights and sessions (activations for a 2,048-row chunk and their second set for
 // the side prefill, logits, the checkpoint store, graphs), measured on node-b on 2026-11-04: 2.5-3.4 GB at one to
-// four sessions; 4 GB with margin.
+// four sessions; 4 GB with margin. The prefix KV store's arena is its own term (MemoryPlan::store, P4f).
 inline constexpr size_t kScratchBytes = size_t(4) << 30;
+// P4f: what a start takes beyond the plan's other terms, each measured once (2026-11-08; Qwen3.8-27B NVFP4 with the
+// DFlash drafter at block 12, paged KV, the prefix KV store's 4,096 MiB; MemAvailable before the start less its lowest
+// through the start and two rounds of N concurrent 800-token requests, less planned_bytes and the store):
+// - the engine's fixed part (CUDA context, kernel modules, the side prefill's and the first requests' workspaces,
+//   about 0.8 GiB of it at the first request): 2,116 MiB with images off at 4 x 65,536, less the pool's 4,096 pages'
+//   own cost below -> kEngineFixedBytes;
+// - the page pool beside its pages: its allocation step took 53-55 KiB per page more than the pages (227 MiB at 4,096
+//   pages, 657 MiB at 12,288) -> kKvPageOverheadBytes, counted in MemoryPlan::kv_pool;
+// - the vision tower beyond the 1,100 MB of tower scratch and the embedding cache the start already plans: images on
+//   took 742 MiB more than off at 4 x 65,536 (its device step 955 MiB more; the tower logs 881 MB) -> kVisionTowerBytes;
+// - CUDA graphs (--graphs): no term; with them 4 x 65,536 took 189 MiB less than without (the noise is ~200 MiB);
+// - per-session state: no term beyond session_bytes; the remainder was 3,146, 2,858 and 3,052 MiB at 1, 4 and 16
+//   sessions (images on), flat in the session count.
+// Checked against starts at 3 x 262,144 (no flags), 8 and 12 x 65,536 and 23 x 32,768: the measured start was within
+// -1.2 to +0.9 GB of planned_bytes (two identical starts differed by 2.2 GB, the drift of MemAvailable itself).
+inline constexpr size_t kEngineFixedBytes = size_t(1920) << 20;
+inline constexpr size_t kVisionTowerBytes = size_t(896) << 20;
+inline constexpr size_t kKvPageOverheadBytes = size_t(54) << 10;
 // One LoRA GPU slot (Engine::lora_alloc: rank 16 on every site of the 64 layers, about 95 MB), rounded up.
 inline constexpr size_t kLoraSlotPlanBytes = size_t(100) << 20;
 
@@ -79,7 +97,9 @@ struct MemoryPlan {
   // P4b: the KV page pool (its pages and the reserved page 0), and the pages it hands out; 0 without --kv-pages.
   size_t kv_pool = 0;
   long kv_pool_pages = 0;
-  size_t total() const { return weights + sessions + scratch + kv_pool; }
+  // P4f: the prefix KV store's arena with the page pool (allocated before the pool, from the same budget); 0 flat.
+  size_t store = 0;
+  size_t total() const { return weights + sessions + scratch + kv_pool + store; }
 };
 
 // The bytes of the *.safetensors files in a checkpoint directory (what the engine uploads, within a few percent).
@@ -105,23 +125,26 @@ inline MemoryPlan plan_memory(const ModelConfig& c, size_t weight_bytes, int ses
 }
 
 // P4b: sizes the plan's KV page pool (p from plan_memory with kv_pages). pool_mb >= 0 (--kv-pool-mb): that many MB of
-// pages; else what MemAvailable (avail_mb) leaves after the plan, `other_bytes` (the prefix KV store's budget, which
-// sizes itself after the engine) and reserve_mb; with nothing to judge by (avail_mb < 0, or no reserve) every session's
-// max_context. Never more pages than sessions x max_context positions need, never fewer than 0. Returns the pages.
+// pages; else what MemAvailable (avail_mb) leaves after the plan, `other_bytes` (the prefix KV store's arena, which
+// the engine allocates before the pool; P4f: the plan counts it as `store` from here) and reserve_mb; with nothing to
+// judge by (avail_mb < 0, or no reserve) every session's max_context. Never more pages than sessions x max_context
+// positions need, never fewer than 0. Returns the pages.
 inline long plan_kv_pool(MemoryPlan& p, const ModelConfig& c, int max_context, long avail_mb, long reserve_mb,
                          size_t other_bytes, long pool_mb) {
-  const size_t page = kv_page_bytes(c);
+  const size_t page = kv_page_bytes(c), per = page + kKvPageOverheadBytes;
   const long cap = long(p.session_count) * kv_pages_for(max_context);
+  p.store = other_bytes;
   long pages = cap;
   if (pool_mb >= 0) {
     pages = static_cast<long>((size_t(pool_mb) << 20) / page);
   } else if (avail_mb >= 0 && reserve_mb > 0) {
-    const size_t have = size_t(avail_mb) << 20, keep = p.total() + other_bytes + (size_t(reserve_mb) << 20) + page;
-    pages = have > keep ? static_cast<long>((have - keep) / page) : 0;
+    const size_t have = size_t(avail_mb) << 20, keep = p.total() + (size_t(reserve_mb) << 20) + page;
+    pages = have > keep ? static_cast<long>((have - keep) / per) : 0;
   }
   pages = std::max(0L, std::min(pages, cap));
   p.kv_pool_pages = pages;
-  p.kv_pool = size_t(pages + 1) * page;  // with the reserved page 0
+  // With the reserved page 0 and (P4f) each page's own cost beside it.
+  p.kv_pool = size_t(pages + 1) * page + size_t(pages) * kKvPageOverheadBytes;
   return pages;
 }
 
@@ -179,6 +202,7 @@ inline std::string refuse_start(const MemoryPlan& p, long avail_mb, long reserve
   o << "ragon-serve would need " << gb(p.total()) << " (weights " << gb(p.weights) << ", " << p.session_count
     << " sessions x " << gb(p.per_session) << ", scratch " << gb(p.scratch);
   if (p.kv_pool) o << ", KV page pool " << gb(p.kv_pool);
+  if (p.store) o << ", prefix KV store " << gb(p.store);
   o << ") and keep " << reserve_mb
     << " MB free, but only " << avail_mb << " MB of host memory is available: short by "
     << (need_mb + reserve_mb - avail_mb) << " MB. Use fewer --sessions, a smaller --max-context, or stop what else "
@@ -186,8 +210,8 @@ inline std::string refuse_start(const MemoryPlan& p, long avail_mb, long reserve
   return o.str();
 }
 
-// P4d: what the plan needs to know about the KV page pool. `store_bytes` is the prefix KV store's budget the pool
-// leaves (0 when the store sizes itself after the engine), `pool_mb` --kv-pool-mb (< 0: sized from the plan).
+// P4d: what the plan needs to know about the KV page pool. `store_bytes` is the prefix KV store's arena, allocated
+// before the pool (P4f; 0 when there is no store), `pool_mb` --kv-pool-mb (< 0: sized from the plan).
 struct KvPlanInputs {
   bool on = false;
   size_t store_bytes = 0;
@@ -212,7 +236,8 @@ inline StartPlan start_plan(const ModelConfig& c, size_t weight_bytes, size_t sc
   return s;
 }
 
-// --plan-only's line (read by Ragon's pre-load check): what runs and the plan's bytes, the page pool included.
+// --plan-only's line (read by Ragon's pre-load check): what runs and the plan's bytes, the page pool and the prefix KV
+// store included (P4f; scratch_bytes holds the measured terms beside the weights, sessions, pool and store).
 // sessions, batch, max_context and planned_bytes are the contract; the pool's fields and the reserve are additive.
 inline std::string plan_json(int sessions, int batch, int max_context, const MemoryPlan& p, bool kv_pages,
                              long reserve_mb) {
@@ -220,6 +245,7 @@ inline std::string plan_json(int sessions, int batch, int max_context, const Mem
   o << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions) << ",\"max_context\":" << max_context
     << ",\"planned_bytes\":" << p.total() << ",\"kv_pages\":" << (kv_pages ? "true" : "false")
     << ",\"kv_pool_bytes\":" << p.kv_pool << ",\"kv_pool_pages\":" << p.kv_pool_pages
+    << ",\"kv_store_bytes\":" << p.store << ",\"scratch_bytes\":" << p.scratch
     << ",\"host_reserve_bytes\":" << (size_t(std::max(0L, reserve_mb)) << 20) << "}";
   return o.str();
 }
@@ -230,7 +256,7 @@ inline std::string plan_json(int sessions, int batch, int max_context, const Mem
 // would need more pages than the pool has, the scheduler requeues (P4c), it does not refuse the start.
 // P4e: that share is for sessions the operator gives. Sessions auto-size picks itself ask for the full pool (`share`
 // kAutoPagedFitShare): n x max_context positions, as the flat plan's n slots, so that an auto-sized start plans what
-// flat did (no flags on second-puffin: 3 x 262,144, not 4 with the pool filled to the host reserve).
+// flat did (no flags on node-b: 3 x 262,144, not 4 with the pool filled to the host reserve).
 inline constexpr long kPagedFitShare = 2;
 inline constexpr long kAutoPagedFitShare = 1;
 inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_context, long share = kPagedFitShare) {
@@ -241,9 +267,10 @@ inline bool paged_sessions_fit(const MemoryPlan& p, int sessions, int max_contex
 // Auto-size (BATCHING §5.6): the most sessions chosen without --sessions (the owner's cap on node-b until a larger
 // number is approved; at most the engine's kMaxSeqs), and the shortest context chosen without --max-context. P4e kept
 // it at 4 when the page pool became the default: at 32 an auto-sized start planned to the host reserve and left the
-// prefix KV store no room (one stream's TTFT +6%); a fan-out gives --sessions. Raising it waits on the store being
-// allocated before the pool.
-inline constexpr int kAutoSessionsCap = 4;
+// prefix KV store no room (one stream's TTFT +6%). P4f allocates the store before the pool and plans every measured
+// term, so the cap is kMaxSeqs: on node-b the starts it picks (12 x 65,536, 23 x 32,768) kept the store and at least
+// the reserve free. Without flags the start is still 3 x 262,144: the context is chosen first.
+inline constexpr int kAutoSessionsCap = 32;
 inline constexpr int kAutoContextFloor = 32768;
 // What ragon-serve runs when it does not size itself (--auto-size 0, or MemAvailable unreadable): today's defaults.
 inline constexpr int kDefaultSessions = 2;

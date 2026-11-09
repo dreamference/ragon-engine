@@ -169,6 +169,32 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
   kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
 
+  // The prefix KV store's arena (BACKLOG 35): one allocation made at start, so the store's footprint is fixed and never
+  // grows while serving. It takes at most prefix_kv_mb and leaves RAGON_PREFIX_KV_RESERVE_MB (default 16 GB) of the
+  // device's free memory untouched (the host's safety margin and what the step graphs and the stream pool still take);
+  // below 512 MB the store is off. P4f: with the page pool it is sized and allocated before the pool, from the same
+  // budget (the memory plan counts it and gives the pool what remains), so a pool sized to the host reserve no longer
+  // squeezes it out; with flat slots it is allocated last, from what the engine's own allocations left, as before.
+  int store_mb = opts_.prefix_kv_mb;
+  if (const char* e = std::getenv("RAGON_PREFIX_KV_MB")) store_mb = std::atoi(e);
+  const bool store_asked = store_mb > 0 && opts_.prefix_checkpoints > 0;
+  size_t store_size = 0, store_free = 0, store_reserve = size_t(16384) << 20;
+  if (const char* e = std::getenv("RAGON_PREFIX_KV_RESERVE_MB")) store_reserve = size_t(std::atoll(e)) << 20;
+  auto alloc_store_arena = [&] {
+    if (!store_asked) return;
+    size_t total_b = 0;
+    check(cudaMemGetInfo(&store_free, &total_b), "memory info");
+    const size_t want = size_t(store_mb) << 20, avail = store_free > store_reserve ? store_free - store_reserve : 0;
+    size_t size = std::min(want, avail);
+    size -= size % (size_t(2) << 20);
+    if (size >= (size_t(512) << 20) && cudaMalloc(&kv_arena_base_, size) == cudaSuccess) {
+      store_size = size;
+    } else {
+      cudaGetLastError();
+      kv_arena_base_ = nullptr;
+    }
+  };
+
   // The session slots (M4 §1), each allocated in full here: nothing is allocated while serving.
   if (opts_.sessions < 1) throw std::runtime_error("sessions must be at least 1");
   sessions_.resize(opts_.sessions);
@@ -188,6 +214,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     // to the run of the page with the next id (consecutive pages are one stream, as the flat caches are) and the table
     // holds id * PT * D. The kernels see only a larger head stride: the same values, the same results. Verify passes
     // read faster so (4 sessions at 65,536: 35.1 tok/s against 33.8 interleaved). RAGON_KV_HEAD_MAJOR=0 interleaves.
+    alloc_store_arena();  // P4f: the store first, the pool from what remains
     kv_page_elems_ = size_t(n_full) * 2 * kvsize * PT;
     const long cap = long(opts_.sessions) * pages_per_session;
     const int pool_pages = static_cast<int>(opts_.kv_pool_pages > 0 ? std::min<long>(opts_.kv_pool_pages, cap) : cap);
@@ -378,21 +405,13 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
                  opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
   }
-  // The prefix KV store (BACKLOG 35) last, from what the engine's own allocations left: one arena allocated now, so the
-  // footprint is fixed at start and never grows while serving. It takes at most prefix_kv_mb and leaves
-  // RAGON_PREFIX_KV_RESERVE_MB (default 16 GB) of the device's free memory untouched (the host's safety margin and what
-  // the step graphs and the stream pool still take); below 512 MB the store is off.
-  int mb = opts_.prefix_kv_mb;
-  if (const char* e = std::getenv("RAGON_PREFIX_KV_MB")) mb = std::atoi(e);
-  if (mb > 0 && opts_.prefix_checkpoints > 0) {
-    size_t free_b = 0, total_b = 0;
-    check(cudaMemGetInfo(&free_b, &total_b), "memory info");
-    size_t reserve = size_t(16384) << 20;
-    if (const char* e = std::getenv("RAGON_PREFIX_KV_RESERVE_MB")) reserve = size_t(std::atoll(e)) << 20;
-    const size_t want = size_t(mb) << 20, avail = free_b > reserve ? free_b - reserve : 0;
-    size_t size = std::min(want, avail);
-    size -= size % (size_t(2) << 20);
-    if (size >= (size_t(512) << 20) && cudaMalloc(&kv_arena_base_, size) == cudaSuccess) {
+  // The prefix KV store's tree over its arena (allocated before the page pool, or here with flat slots).
+  if (!kv_pages_) alloc_store_arena();
+  if (store_asked) {
+    const int mb = store_mb;
+    const size_t free_b = store_free, reserve = store_reserve, size = store_size;
+    const char* when = kv_pages_ ? "before the page pool" : "after the engine's own memory";
+    if (kv_arena_base_) {
       kv_arena_ = std::make_unique<ArenaAlloc>(size, size_t(2) << 20);
       const size_t per_token = size_t(c.layers - n_linear_) * 2 * c.kv_heads * c.head_dim * sizeof(__nv_bfloat16);
       const size_t state = size_t(n_linear_) * (size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim +
@@ -428,12 +447,11 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
         ops.drop = [this](int page) { kv_book_->release(page); };
       }
       kv_tree_ = std::make_unique<PrefixKvTree>(size, kv_book_ ? 0 : per_token, state, std::move(ops));
-      std::fprintf(stderr, "prefix KV store: %zu MB of %d asked (%zu MB free after the engine's own memory, %zu kept free; %zu KB a token, %zu MB a state)\n",
-                   size >> 20, mb, free_b >> 20, reserve >> 20, per_token >> 10, state >> 20);
+      std::fprintf(stderr, "prefix KV store: %zu MB of %d asked (%zu MB free %s, %zu kept free; %zu KB a token, %zu MB a state)\n",
+                   size >> 20, mb, free_b >> 20, when, reserve >> 20, per_token >> 10, state >> 20);
     } else {
-      cudaGetLastError();
-      std::fprintf(stderr, "prefix KV store: off (%zu MB free after the engine's own memory, %zu kept free, %d asked)\n",
-                   free_b >> 20, reserve >> 20, mb);
+      std::fprintf(stderr, "prefix KV store: off (%zu MB free %s, %zu kept free, %d asked)\n", free_b >> 20, when,
+                   reserve >> 20, mb);
     }
   }
 }

@@ -52,6 +52,17 @@ void plan_only() {
         "the pool's fields");
   check(j["planned_bytes"].get<size_t>() >= p.plan.kv_pool + kWeights, "planned_bytes counts the pool");
   check(j["host_reserve_bytes"].get<size_t>() == size_t(kReserve) << 20, "the reserve the pool leaves");
+  check(j["kv_store_bytes"] == 0 && j["scratch_bytes"].get<size_t>() == kScratchBytes, "no store; the scratch");
+  // P4f: the prefix KV store is allocated before the pool and counted in planned_bytes; the pool takes what remains.
+  const KvPlanInputs paged_store{true, size_t(4096) << 20, -1};
+  const StartPlan ps = start_plan(c, kWeights, kScratchBytes, true, 4, 262144, kNodeB, kReserve, paged_store);
+  const nlohmann::json js = nlohmann::json::parse(plan_json(4, 4, 262144, ps.plan, true, kReserve));
+  check(js["kv_store_bytes"].get<size_t>() == size_t(4096) << 20, "P4f: the store's field");
+  check(js["planned_bytes"].get<size_t>() == ps.plan.total() &&
+            ps.plan.total() >= kWeights + ps.plan.kv_pool + (size_t(4096) << 20),
+        "P4f: planned_bytes counts the store");
+  check(ps.plan.kv_pool_pages < p.plan.kv_pool_pages && p.plan.kv_pool_pages - ps.plan.kv_pool_pages <= 1025,
+        "P4f: the pool gives the store its 1,024 pages");
   // The pool takes what the reserve leaves: planned + reserve is MemAvailable within a page (and the reserved page 0).
   const size_t have = size_t(kNodeB) << 20, planned = p.plan.total() + (size_t(kReserve) << 20);
   check(planned <= have && have - planned < 2 * kv_page_bytes(c), "the pool fills what the reserve leaves");
@@ -102,6 +113,19 @@ void paged_auto_size() {
       check(sp.plan.kv_pool_pages == 3L * 4096, "paged: the pool is the three sessions' full context");
       check(sp.refusal.empty(), "paged: the choice starts");
     }
+  // P4f: the start's measured terms (the engine's fixed part, the vision tower) and a 4 GiB store: still three at
+  // 262,144 with nothing else on the GPU, and the plan leaves the reserve.
+  {
+    const size_t honest = kScratchBytes + kEngineFixedBytes + (size_t(1100 + 512) << 20) + kVisionTowerBytes;
+    const KvPlanInputs store4{true, size_t(4096) << 20, -1};
+    const SizeChoice h = choose(109423L, honest, store4);
+    const StartPlan hp = start_plan(c, kWeights, honest, true, h.sessions, h.max_context, 109423L, kReserve, store4);
+    std::printf("measured terms and a 4 GiB store: %d x %d, planned %s\n", h.sessions, h.max_context,
+                gb(hp.plan.total()).c_str());
+    check(h.sessions == 3 && h.max_context == 262144, "P4f: three at 262,144 with the measured terms and the store");
+    check(hp.refusal.empty() && static_cast<long>(hp.plan.total() >> 20) + kReserve <= 109423L,
+          "P4f: and the reserve is left");
+  }
   // The rule bites: a host whose pool holds one conversation at 262,144 but not two runs one; four given still start.
   // Pool pages = (avail - weights - n x ~0.5 GB - scratch - reserve) / 4 MiB; 8,192 pages are 32 GiB.
   const long tight = 16384 + 22383 + 4096 + 2048 + 24576;  // reserve, weights, scratch, sessions' fixed, 24 GiB pool

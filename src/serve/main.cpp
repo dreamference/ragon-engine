@@ -2625,14 +2625,17 @@ int main(int argc, char** argv) try {
     }
     // With images on (VISION §20.4) the tower's scratch at the largest image and the embedding cache come on top of
     // the checkpoint's bytes (which hold the tower's weights): 1,100 MB at 65,536 patches, an upper bound below it.
-    const size_t scratch = as::kScratchBytes + (opts.vision ? size_t(1100 + vision_cache_mb) << 20 : 0) +
+    // P4f: and what the start was measured to take beyond the plan (admission.hpp): the engine's fixed part, and the
+    // vision tower's beyond its scratch and cache.
+    const size_t scratch = as::kScratchBytes + as::kEngineFixedBytes +
+                           (opts.vision ? (size_t(1100 + vision_cache_mb) << 20) + as::kVisionTowerBytes : 0) +
                            size_t(opts.lora_slots) * as::kLoraSlotPlanBytes;
     const long avail = as::mem_available_mb();
     const int full_context = as::model_full_context(model_dir + "/config.json");  // 0: sized from 65,536
     // With paged KV the pool takes what the rest of the plan, the prefix KV store's budget and the reserve leave, or
     // --kv-pool-mb; auto-size sizes by the same plan. Since P4c the store's arena holds DeltaNet and conv states only
-    // (its KV is pool pages); the engine allocates it after the pool at min(prefix_kv_mb, free above its own reserve),
-    // so counting prefix_kv_mb here is what it takes, not a second count.
+    // (its KV is pool pages); since P4f the engine allocates it before the pool, at min(prefix_kv_mb, free above its
+    // own reserve), so the plan counts prefix_kv_mb (planned_bytes includes it) and the pool takes what remains.
     as::KvPlanInputs kv{kv_pages, 0, kv_pool_mb};
     if (kv_pages) {
       long store_mb = opts.prefix_kv_mb;
@@ -2672,7 +2675,10 @@ int main(int argc, char** argv) try {
               << std::min(batch, sessions) << " (" << why(bool(batch_arg), size.sessions_auto) << "), context "
               << max_context << " (" << why(bool(max_context_arg), size.context_auto) << "); memory: available "
               << (avail >= 0 ? as::gb(size_t(avail) << 20) : std::string("unknown")) << ", weights and scratch "
-              << as::gb(mp.weights + mp.scratch) << ", " << as::gb(mp.per_session) << " a session, kept free "
+              << as::gb(mp.weights + mp.scratch) << " (the engine's fixed part "
+              << as::gb(as::kEngineFixedBytes + (opts.vision ? as::kVisionTowerBytes : 0)) << " of it, measured)"
+              << (mp.store ? ", prefix KV store " + as::gb(mp.store) : std::string()) << ", "
+              << as::gb(mp.per_session) << " a session, kept free "
               << (host_reserve_mb > 0 ? as::gb(size_t(host_reserve_mb) << 20) : std::string("none")) << ", planned "
               << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
   }
