@@ -125,3 +125,26 @@ def test_tool_choice_auto_unchanged(structured):
         "messages": [{"role": "user", "content": "Hello! How are you today?"}], "tools": TOOLS,
         "temperature": 0, "max_tokens": 200, "chat_template_kwargs": NO_THINK})
     assert chat_text(out).strip()
+
+
+def test_logprobs_stay_raw(structured):
+    """The mask steers the sampler only: the reported logprobs are the model's. A prose prompt's first token under
+    a schema has the same top_logprobs as without one, and the token the grammar forces carries its raw logprob."""
+    def first(fmt):
+        body = {"messages": [{"role": "user", "content": "Write a haiku about rain."}], "temperature": 0,
+                "max_tokens": 3, "logprobs": True, "top_logprobs": 5, "chat_template_kwargs": NO_THINK}
+        if fmt:
+            body["response_format"] = fmt
+        return structured.post("/v1/chat/completions", body)["choices"][0]["logprobs"]["content"][0]
+    # top_logprobs lists the chosen token first, then the most likely others (api.cpp top_logprobs).
+    free, held, again = first(None), first(schema_format(CITY)), first(None)
+    top = lambda e: [(t["token"], t["logprob"]) for t in e["top_logprobs"]]
+    assert top(free) == top(again)  # the comparison below is only as good as this
+    raw = dict(top(free))
+    assert held["token"] != free["token"], (free["token"], held["token"])  # the grammar overrode the argmax
+    others = [(t, lp) for t, lp in top(held) if t != held["token"]]
+    print(f"\nlogprobs_stay_raw: free {free['token']!r} {free['logprob']:.6f}, held {held['token']!r} "
+          f"{held['logprob']:.6f}; held others {others}")
+    assert others and others == [(t, raw[t]) for t, _ in others], (top(free), top(held))  # bit-identical
+    assert others == top(free)[:len(others)]
+    assert held["logprob"] == top(held)[0][1] and held["logprob"] < top(free)[-1][1]  # raw, not renormalised
