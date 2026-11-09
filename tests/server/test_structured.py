@@ -76,8 +76,8 @@ def test_json_schema_sampled(structured):
 
 
 def test_json_schema_streamed(structured):
-    # The prompt bounds the list: stage 1's subset has no maxItems, and greedy decoding can repeat inside an
-    # unbounded array until max_tokens (seen 2026-11-09: "Tell me about Osaka." listed prefectures in a loop).
+    # The prompt bounds the list: greedy decoding can repeat inside an unbounded array until max_tokens (seen
+    # 2026-11-09: "Tell me about Osaka." listed prefectures in a loop); test_bounded_array_stops bounds it by maxItems.
     status, events = structured.stream("/v1/chat/completions", {
         "messages": [{"role": "user", "content": "Tell me about Osaka, with three of its districts."}],
         "temperature": 0, "max_tokens": 1000, "stream": True, "response_format": schema_format(CITY), "chat_template_kwargs": NO_THINK})
@@ -85,6 +85,19 @@ def test_json_schema_streamed(structured):
     content, _, _, finishes, _, done = stream_chat_parts(events)
     assert done and finishes[-1] == "stop", content
     check_city(content)
+
+
+def test_bounded_array_stops(structured):
+    """Stage 3: with maxItems the grammar closes the array after its last item, so the prompt that looped above
+    without a bound in it ends, with at most three districts."""
+    schema = json.loads(json.dumps(CITY))
+    schema["properties"]["districts"]["maxItems"] = 3
+    out = structured.post("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "Tell me about Osaka."}], "temperature": 0, "max_tokens": 1000,
+        "response_format": schema_format(schema), "chat_template_kwargs": NO_THINK})
+    assert out["choices"][0]["finish_reason"] == "stop", chat_text(out)
+    check_city(chat_text(out))
+    assert len(json.loads(chat_text(out))["districts"]) <= 3
 
 
 def test_json_schema_after_thinking(structured):
