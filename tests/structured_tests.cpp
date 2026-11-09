@@ -189,6 +189,22 @@ void test_routes() {
          complete(*g, "Done.") && complete(*g, shell_call + "\n" + patch_call));
   EXPECT(g && !complete(*g, grammar::custom_tool_prefix("apply_patch") + "--- a/a.txt\n+++ b/a.txt\n" + kCallEnd));
   EXPECT(g && !complete(*g, grammar::custom_tool_prefix("apply_patch") + "*** Begin Patch\n" + kCallEnd));
+  // Code Mode's `exec` beside apply_patch, as the launcher offers both: its grammar compiles and takes any source.
+  json eb = responses_body();
+  eb["tools"].push_back({{"type", "custom"}, {"name", "exec"}, {"description", "Run JavaScript"},
+                         {"format", {{"type", "grammar"}, {"syntax", "lark"},
+                                     {"definition", "start: pragma_source | plain_source\n"
+                                                    "pragma_source: PRAGMA_LINE NEWLINE SOURCE\nplain_source: SOURCE\n\n"
+                                                    "PRAGMA_LINE: /[ \\t]*\\/\\/ @exec:[^\\r\\n]*/\nNEWLINE: /\\r?\\n/\n"
+                                                    "SOURCE: /[\\s\\S]+/\n"}}}});
+  r = parse_responses_request(eb);
+  EXPECT(r.custom_formats.size() == 2);
+  g = request_grammar(*g_comp, r);
+  const std::string exec_pre = grammar::custom_tool_prefix("exec");
+  EXPECT(g && complete(*g, exec_pre + "const r = await tools.exec_command({cmd: \"ls\"});\ntext(r);" + kCallEnd) &&
+         complete(*g, exec_pre + "// @exec: {\"yield_time_ms\": 1000}\ntext(\"hi\");" + kCallEnd) &&
+         complete(*g, "Checking.\n\n" + exec_pre + "text(1)" + kCallEnd + "\n" + patch_call) &&
+         !complete(*g, exec_pre + kCallEnd));
   // Named custom tool, in the Responses shape.
   rb["tool_choice"] = {{"type", "custom"}, {"name", "apply_patch"}};
   g = request_grammar(*g_comp, parse_responses_request(rb));
