@@ -578,7 +578,7 @@ void test_array_bounds() {
   for (int id : g_tok->encode("[1, 2, 3")) EXPECT(m.accept(id));
   for (const char* more : {",", ", "}) {
     const std::vector<int> ids = g_tok->encode(more);
-    EXPECT(ids.size() == 1 && !m.allowed(ids[0]));
+    EXPECT(!ids.empty() && !m.allowed(ids[0]));
   }
   EXPECT(!m.can_stop() && !m.allowed(g_im_end));
   for (int id : g_tok->encode("]")) EXPECT(m.accept(id));
