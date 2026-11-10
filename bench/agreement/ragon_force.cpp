@@ -6,8 +6,14 @@
 //   ragon-force score MODEL K < cases.jsonl               -> per case: engine top-K log-probs at each forced position
 //        case: {"prompt": [ids], "cont": [ids]}; position j scores the token after prompt + cont[:j]
 //   ragon-force gen MODEL MAXTOK < cases.jsonl            -> greedy continuation of {"prompt": [ids]}: {"ids", "text"}
+//   ragon-force dump MODEL < cases.jsonl                  -> a cold prefill of each {"ids": [ids]} with RAGON_DUMP_FEATURES
+//        set and a drafter loaded, so the engine appends every position's drafter features (DRAFTER_RETRAIN §3);
+//        prints {"n": len, "ms": prefill ms} per case. bench/drafter/teacher_dump.py drives it.
+// RAGON_FORCE_DRAFT=DIR loads that drafter (dump needs one: the features are the drafter's target layers);
+// RAGON_FORCE_MAX_CONTEXT=N raises the context from 40000.
 // RAGON_LORA=LIBRARY/NAME: score and generate with that adapter (LORA §3, one GPU slot) instead of the base.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +61,8 @@ int main(int argc, char** argv) {
   }
   ragon::EngineOptions opts;
   opts.max_context = 40000;
+  if (const char* m = std::getenv("RAGON_FORCE_MAX_CONTEXT")) opts.max_context = std::atoi(m);
+  if (const char* d = std::getenv("RAGON_FORCE_DRAFT")) opts.draft_dir = d;
   const char* lora = std::getenv("RAGON_LORA");
   if (lora) opts.lora_slots = 1;
   ragon::Engine engine(model, opts);
@@ -86,6 +94,22 @@ int main(int argc, char** argv) {
         if (j + 1 < cont.size()) logits = &engine.step(cont[j]);
       }
       std::cout << json{{"pos", out}}.dump() << "\n" << std::flush;
+    }
+    return 0;
+  }
+  if (mode == "dump") {
+    if (opts.draft_dir.empty() || !std::getenv("RAGON_DUMP_FEATURES")) {
+      std::fprintf(stderr, "ragon-force dump: set RAGON_FORCE_DRAFT and RAGON_DUMP_FEATURES\n");
+      return 2;
+    }
+    while (std::getline(std::cin, line)) {
+      if (line.empty()) continue;
+      const std::vector<int> ids = json::parse(line)["ids"];
+      engine.reset();
+      const auto t0 = std::chrono::steady_clock::now();
+      engine.prefill(ids, nullptr, true);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      std::cout << json{{"n", ids.size()}, {"ms", ms}}.dump() << "\n" << std::flush;
     }
     return 0;
   }

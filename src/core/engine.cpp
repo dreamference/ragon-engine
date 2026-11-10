@@ -2836,6 +2836,27 @@ bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
   }
   if (keep_at > 0 && run.soft_at < 0) s_->snap_pos = snap_at;
   if (draft_) {
+    // RAGON_DUMP_FEATURES=FILE (the drafter retrain's teacher dump, DRAFTER_RETRAIN §3): every prefill chunk's
+    // drafter features appended to FILE as int32 [magic 0x54414546, pos0, n, nfeat, hidden], the chunk's token ids
+    // [n] (int32) and its cap_ rows [n][nfeat * hidden] (bf16): row k is the residual stream after each of the
+    // drafter's target layers (config order) at position pos0 + k, whose input token is ids[k]. Host-side copy only.
+    static std::FILE* feat_dump = [] {
+      const char* p = std::getenv("RAGON_DUMP_FEATURES");
+      return p && *p ? std::fopen(p, "ab") : nullptr;
+    }();
+    if (feat_dump && n == end - i) {
+      static std::vector<uint16_t> host;
+      const size_t count = size_t(n) * cap_stride_;
+      host.resize(count);
+      check(cudaMemcpyAsync(host.data(), cap_ + size_t(run.cap0) * cap_stride_, count * sizeof(uint16_t),
+                            cudaMemcpyDeviceToHost, stream_), "feature dump");
+      check(cudaStreamSynchronize(stream_), "feature dump");
+      const int32_t head[5] = {0x54414546, pos0, n, cap_stride_ / model_->config().hidden, model_->config().hidden};
+      std::fwrite(head, sizeof head, 1, feat_dump);
+      std::fwrite(prompt.data() + i, sizeof(int32_t), size_t(n), feat_dump);
+      std::fwrite(host.data(), sizeof(uint16_t), count, feat_dump);
+      std::fflush(feat_dump);
+    }
     const int first = std::max(pos0, window);
     if (first < pos0 + n) draft_materialize(pos0 + n - first, first, run.cap0 + first - pos0);  // still quantized_
   }
