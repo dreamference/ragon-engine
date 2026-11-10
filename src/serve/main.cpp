@@ -6,7 +6,7 @@
 //              [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16] [--kv-fp8 --kv-fp8-scales F]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N]
+//              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N]
 //              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
 //              [--kv-pool-mb N | --kv-flat]
 //              [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N]
@@ -38,6 +38,14 @@
 // is the one with the fewest decode passes in the trailing 16 (serve/pairing.hpp), not the first in running order,
 // so at four decoding conversations each takes 2 passes in 4 instead of 4/2/1/1. Only which requests step together
 // changes. RAGON_STEP_TRACE=FILE writes one JSON line per scheduler unit (serve/step_trace.hpp).
+// --decode-floor F|on (C3, design A2 and A3; default 0, off; "on" is 36; RAGON_DECODE_FLOOR overrides): while any
+// decoding request's trailing rate (its tokens over the wall time of its last 16 steps) is below F tokens/s, the side
+// stream holds a prefill's next chunk, at one decoder or more (serve/floor.hpp). A prefill with at most 2,048 tokens
+// left (a warm append) is never held, and a held prefill takes its next chunk after --prefill-max-hold S seconds
+// (default 3) whatever the rates. While a decoder runs beside it, a longer prompt's side chunk is cut to
+// --floor-side-chunk N tokens (default 1,024; 0 full chunks). With the floor on, --fair-pairing defaults to 1 and
+// --side-share to 0 (either still given explicitly wins). Only the order and size of prefill units change; the
+// request line counts the holds and why each side chunk went.
 //
 // --draft-off-below X (BACKLOG 10; default 1.5, 0 off; RAGON_DRAFT_OFF_BELOW overrides it): the drafter-off guard. A
 // session whose running mean of tokens per speculative step falls below X decodes one plain row per step, with no
@@ -144,6 +152,7 @@
 #include "tokenizer/tokenizer.hpp"
 #include "serve/image_input.hpp"
 #include "serve/kv_policy.hpp"
+#include "serve/floor.hpp"
 #include "serve/pairing.hpp"
 #include "serve/step_trace.hpp"
 #ifdef RAGON_HAS_GRAMMAR
@@ -441,6 +450,20 @@ struct Running {
   bool kv_wait = false;  // its last decode turn waited for KV pages (P4b)
   Periods alone, beside;  // step periods without and with another request's prefill in between
   PassWindow window;      // the decode passes it took part in, in the trailing kFairWindow (--fair-pairing)
+  // C3: the periods beside a prefill split by whether a chunk of it ran in between (flight) or it was held, waiting
+  // its turn or its partner (held); chunk_seen and flight_at_last are the scheduler's chunk count and whether a side
+  // chunk was in flight at its last step.
+  Periods flight, held;
+  long chunk_seen = 0;
+  bool flight_at_last = false;
+  RateWindow rate;  // its trailing decode rate (--decode-floor, serve/floor.hpp)
+  // --decode-floor, while it prefills: held since held_t0 (floor_held), the holds and their seconds, and why each side
+  // chunk went (the rates allowed it, the hold cap released it, a warm append) and how many were cut (A3).
+  bool floor_held = false;
+  FloorVerdict release = FloorVerdict::Off;
+  std::chrono::steady_clock::time_point held_t0;
+  int floor_holds = 0, chunks_rate = 0, chunks_cap = 0, chunks_warm = 0, chunks_cut = 0;
+  double floor_held_s = 0;
 };
 
 // The engine thread (M4 §3). Up to `batch` requests run at once, each in its own resident session: a request
@@ -457,7 +480,8 @@ class Scheduler {
  public:
   Scheduler(ServerContext& ctx, double protect_seconds, int batch, int contended, int side_share = 0,
             bool fair_pairing = false, int fanout_plain_above = 0, int fanout_gang_above = -1,
-            bool fanout_plain_explicit = true, int fanout_wide_above = 0, int fanout_wide_block = 0)
+            bool fanout_plain_explicit = true, int fanout_wide_above = 0, int fanout_wide_block = 0,
+            double decode_floor = 0, double prefill_max_hold = 3, int floor_side_chunk = 0)
       : ctx_(ctx),
         protect_seconds_(protect_seconds),
         batch_(batch),
@@ -470,6 +494,9 @@ class Scheduler {
         fanout_wide_above_(fanout_wide_above),
         base_block_(ctx.engine->draft_block()),
         wide_block_(fanout_wide_block > 0 ? fanout_wide_block : ctx.engine->draft_block()),
+        decode_floor_(decode_floor),
+        prefill_max_hold_(prefill_max_hold),
+        floor_side_chunk_(floor_side_chunk),
         thread_([this] { run(); }) {}
   ~Scheduler() {
     {
@@ -1254,8 +1281,7 @@ class Scheduler {
     const auto now = std::chrono::steady_clock::now();
     for (size_t i = 0; i < batch.size(); ++i) {
       Running& r = *batch[i];
-      (other_prefilling(r) ? r.beside : r.alone).add(std::chrono::duration<double>(now - r.last_step).count());
-      r.last_step = now;
+      step_period(r, now);
       ++r.passes;
       ++r.batched;
       r.kv_wait = false;
@@ -1313,11 +1339,63 @@ class Scheduler {
       if (r.get() != &self && !r->prefilling) ++n;
     return n;
   }
-  // Whether r's next side chunk waits (--side-share N): while two or more other requests decode, N decode passes
-  // run on the main stream alone after the last side chunk (any request's) before the next one starts.
-  bool hold_side(const Running& r) const {
-    if (side_share_ <= 0 || side_mark_ < 0 || others_decoding(r) < 2) return false;
-    return decode_passes_ - side_mark_ < side_share_;
+  // Whether r's next side chunk waits, and the trace's kind for it (null: it goes). --side-share N (C1): while two or
+  // more other requests decode, N decode passes run on the main stream alone after the last side chunk (any
+  // request's) before the next one starts ("hold"). --decode-floor F (C3 A2, serve/floor.hpp): while a decoding
+  // request's trailing rate is below F, at one decoder or more, unless r is a warm append or has been held for
+  // --prefill-max-hold ("floor"). Starts r's hold clock and notes why a chunk that goes was let go.
+  const char* side_wait(Running& r) {
+    if (share_hold(side_share_, side_mark_, decode_passes_, others_decoding(r))) return "hold";
+    if (decode_floor_ <= 0) return nullptr;
+    const auto now = FloorClock::now();
+    FloorInput in;
+    in.floor = decode_floor_;
+    in.max_hold = prefill_max_hold_;
+    in.left = prefill_left(r);
+    in.held = r.floor_held;
+    in.held_s = r.floor_held ? std::chrono::duration<double>(now - r.held_t0).count() : 0;
+    for (const auto& o : running_)
+      if (o.get() != &r && !o->prefilling) in.rates.push_back(o->rate.rate(now, o->produced));
+    r.release = floor_verdict(in);
+    if (r.release != FloorVerdict::Hold) return nullptr;
+    if (!r.floor_held) {
+      r.floor_held = true;
+      r.held_t0 = now;
+      ++r.floor_holds;
+    }
+    return "floor";
+  }
+  // Launches r's next chunk on the side stream: a full chunk, or --floor-side-chunk tokens while the floor is on and
+  // a decoder runs beside it (A3); ends r's hold and counts why the chunk went.
+  void side_launch(Running& r) {
+    const int cut = floor_side_chunk(decode_floor_, floor_side_chunk_, other_decoding(r), prefill_left(r));
+    ctx_.engine->prefill_chunk_launch(r.cur, cut);
+    r.side_flight = true;
+    ++chunk_epoch_;
+    count_interleaved(r);
+    if (decode_floor_ <= 0) return;
+    if (r.floor_held) {
+      r.floor_held_s += std::chrono::duration<double>(FloorClock::now() - r.held_t0).count();
+      r.floor_held = false;
+    }
+    (r.release == FloorVerdict::Cap ? r.chunks_cap : r.release == FloorVerdict::Warm ? r.chunks_warm : r.chunks_rate) += 1;
+    r.chunks_cut += cut > 0;
+  }
+  // At the start of each decode step of r: the period since its last one, as alone or beside a prefill and then as
+  // beside a chunk or a held prefill (C3 §1's note), and its rate window's mark.
+  void step_period(Running& r, std::chrono::steady_clock::time_point now) {
+    const double s = std::chrono::duration<double>(now - r.last_step).count();
+    const bool busy = ctx_.engine->side_busy();
+    if (other_prefilling(r)) {
+      r.beside.add(s);
+      (r.flight_at_last || busy || r.chunk_seen != chunk_epoch_ ? r.flight : r.held).add(s);
+    } else {
+      r.alone.add(s);
+    }
+    r.last_step = now;
+    r.chunk_seen = chunk_epoch_;
+    r.flight_at_last = busy;
+    r.rate.record(now, r.produced);
   }
   bool other_prefilling(const Running& self) const {
     for (const auto& r : running_)
@@ -1360,17 +1438,15 @@ class Scheduler {
       if (eng.side_enabled() && (r.side_flight || (contended && !eng.side_busy()))) {
         // A full chunk on the side stream; the decoding request's turns go on while it runs.
         if (!r.side_flight) {
-          if (hold_side(r)) {
-            unit_kind_ = "hold";
+          if (const char* wait = side_wait(r)) {
+            unit_kind_ = wait;
             return false;
           }
           if (yield_prefill(r)) {
             unit_kind_ = "yield";
             return false;
           }
-          eng.prefill_chunk_launch(r.cur, 0);
-          r.side_flight = true;
-          count_interleaved(r);
+          side_launch(r);
           unit_kind_ = "side_launch";
           return false;
         }
@@ -1380,11 +1456,8 @@ class Scheduler {
         side_mark_ = decode_passes_;
         unit_kind_ = "side_finish";
         if (!last_chunk) {
-          if (other_decoding(r) && !hold_side(r) && !yield_prefill(r)) {  // the next chunk at once, unless a short prefill waits
-            eng.prefill_chunk_launch(r.cur, 0);
-            r.side_flight = true;
-            count_interleaved(r);
-          }
+          if (other_decoding(r) && !side_wait(r) && !yield_prefill(r))  // the next chunk at once, unless held or a short prefill waits
+            side_launch(r);
           return false;
         }
         r.prefilling = false;
@@ -1399,6 +1472,7 @@ class Scheduler {
       }
       unit_kind_ = "chunk";
       const bool last = eng.prefill_chunk(r.cur, contended ? contended_ : 0);
+      ++chunk_epoch_;
       if (contended) count_interleaved(r);
       if (!last) return false;
       r.prefilling = false;
@@ -1406,9 +1480,7 @@ class Scheduler {
       start_forks(r);
       return emit(r) && end(r);
     }
-    const auto now = std::chrono::steady_clock::now();
-    (other_prefilling(r) ? r.beside : r.alone).add(std::chrono::duration<double>(now - r.last_step).count());
-    r.last_step = now;
+    step_period(r, std::chrono::steady_clock::now());
     eng.select_session(r.job.session);
     ++r.passes;
     ++decode_passes_;
@@ -1580,13 +1652,24 @@ class Scheduler {
     if (r.alone.n + r.beside.n > 0)
       std::snprintf(periods, sizeof periods, "; step period %.1f ms mean, %.1f max over %d; beside a prefill %.1f ms mean, %.1f max over %d",
                     r.alone.mean_ms(), 1e3 * r.alone.max, r.alone.n, r.beside.mean_ms(), 1e3 * r.beside.max, r.beside.n);
+    // C3: the periods beside a prefill split by whether a chunk ran in between; with --decode-floor, the prefill's
+    // holds and why its side chunks went.
+    char split[320] = "";
+    int at = 0;
+    if (r.beside.n > 0)
+      at = std::snprintf(split, sizeof split, "; beside a chunk %.1f ms mean over %d, beside a held prefill %.1f ms mean over %d",
+                         r.flight.mean_ms(), r.flight.n, r.held.mean_ms(), r.held.n);
+    if (decode_floor_ > 0 && r.chunks_beside > 0)
+      std::snprintf(split + at, sizeof split - at,
+                    "; floor: held %d times, %.2f s; side chunks %d by rate, %d by the hold cap, %d warm, %d cut",
+                    r.floor_holds, r.floor_held_s, r.chunks_rate, r.chunks_cap, r.chunks_warm, r.chunks_cut);
     // Only with several drafters, so a one-drafter server's log reads as it always did.
     const std::string drafter_note = eng.drafters() > 1 ? ", drafter " + job.req.drafter_id + " (" + job.req.drafter_how +
                                                               (r.drafter_changed ? ", changed)" : ")")
                                                         : "";
     std::fprintf(stderr,
                  "request: session %d%s%s, %zu prompt tokens (%d reused%s), prefill %.2f s (%d chunks, %d beside a decode, "
-                 "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes (%d batched)%s%s\n",
+                 "%.0f tok/s of compute); %d tokens in %.2f s (%.1f tok/s), %s; %d passes (%d batched)%s%s%s\n",
                  job.session, job.fresh ? " (new)" : "", drafter_note.c_str(), job.prompt.size(), stats.reused_tokens,
                  stats.store_tokens > 0 ? ", from the prefix KV store" : "", stats.prefill_seconds,
                  stats.chunks, r.chunks_beside,
@@ -1595,7 +1678,7 @@ class Scheduler {
                  r.spec && steps > 0 ? (", " + std::to_string(double(r.produced) / std::max(1, r.passes)).substr(0, 4) +
                                         " tokens/pass").c_str()
                                      : "",
-                 periods);
+                 periods, split);
     job.sink.done(r.finish == "cancelled" ? "stop" : r.finish, static_cast<int>(job.prompt.size()), r.produced,
                   stats.reused_tokens, r.reasoning);
     return true;
@@ -1619,6 +1702,10 @@ class Scheduler {
   mutable std::vector<StepCandidate> cand_;  // the partner choice's view for the trace (filled while it is on)
   long decode_passes_ = 0;  // decode passes run (a batched step counts once), for --side-share
   long side_mark_ = -1;     // decode_passes_ when the last side chunk finished (--side-share)
+  long chunk_epoch_ = 0;    // prefill chunks started (side or main stream), for the periods' split (step_period)
+  double decode_floor_;     // --decode-floor: tokens/s, 0 for off (serve/floor.hpp)
+  double prefill_max_hold_; // --prefill-max-hold: seconds a held prefill waits at most
+  int floor_side_chunk_;    // --floor-side-chunk: the side chunk's tokens while the floor is on, 0 for full
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
@@ -2406,12 +2493,16 @@ int main(int argc, char** argv) try {
   bool kv_pages = true;  // the page pool by default (P4e, BATCHING §5.3); --kv-flat the flat slots
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
   bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
-  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = 16;
+  int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = -1;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
   std::optional<int> sessions_arg, max_context_arg, batch_arg;
-  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = 0, fanout_plain_above = -1,
+  long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = -1, fanout_plain_above = -1,
        fanout_gang_above = -1, fanout_default = 1, fanout_draft_block = -1;
   double protect_seconds = 30;
+  // --decode-floor (0 off), --prefill-max-hold, --floor-side-chunk (C3 A2/A3); --side-share and --fair-pairing are -1
+  // until given, so the floor can choose their defaults.
+  double decode_floor = 0, prefill_max_hold = 3;
+  int floor_side_chunk = 1024;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
@@ -2473,6 +2564,11 @@ int main(int argc, char** argv) try {
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
     else if (a == "--side-share") side_share = std::stoi(next());
+    else if (a == "--decode-floor") {
+      const std::string v = next();
+      decode_floor = v == "on" ? ragon::serve::kDecodeFloorOn : v == "off" ? 0 : std::stod(v);
+    } else if (a == "--prefill-max-hold") prefill_max_hold = std::stod(next());
+    else if (a == "--floor-side-chunk") floor_side_chunk = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--auto-size") auto_size = std::stol(next());
@@ -2503,7 +2599,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2656,6 +2752,21 @@ int main(int argc, char** argv) try {
         return 2;
       }
     }
+  if (const char* e = std::getenv("RAGON_DECODE_FLOOR")) {
+    try {
+      decode_floor = std::string(e) == "on" ? ragon::serve::kDecodeFloorOn : std::stod(e);
+    } catch (const std::exception&) {
+      std::cerr << "RAGON_DECODE_FLOOR must be a number or on\n";
+      return 2;
+    }
+  }
+  if (decode_floor < 0 || prefill_max_hold < 0 || floor_side_chunk < 0) {
+    std::cerr << "--decode-floor, --prefill-max-hold and --floor-side-chunk must not be negative\n";
+    return 2;
+  }
+  // With the floor on, fair pairing and no pass-count hold, unless given (C3 §2: the floor replaces --side-share).
+  if (fair_pairing < 0) fair_pairing = decode_floor > 0 ? 1 : 0;
+  if (side_share < 0) side_share = decode_floor > 0 ? 0 : 16;
   // P4b: the engine reads RAGON_KV_PAGES itself; the plan must agree with it.
   if (const char* e = std::getenv("RAGON_KV_PAGES")) kv_pages = std::atoi(e) != 0;
   if (kv_pool_mb >= 0 && !kv_pages) {
@@ -2830,6 +2941,12 @@ int main(int argc, char** argv) try {
               << "\n";
   }
   std::fprintf(stderr, "pairing: %s\n", fair_pairing ? "fair (--fair-pairing 1)" : "running order (--fair-pairing 0)");
+  if (decode_floor > 0)
+    std::fprintf(stderr, "floor: %.1f tok/s (--decode-floor), hold at most %.1f s, side chunk %s while a decoder runs; side-share %d\n",
+                 decode_floor, prefill_max_hold,
+                 floor_side_chunk > 0 ? (std::to_string(floor_side_chunk) + " tokens").c_str() : "full", side_share);
+  else
+    std::fprintf(stderr, "floor: off (--decode-floor 0); side-share %d\n", side_share);
   const bool plain_explicit = fanout_plain_above >= 0;
   if (fanout_plain_above < 0) fanout_plain_above = draft_dir.empty() ? 1 : kFanoutPlainAboveDrafting;
   // The fork prefills gang above the same count unless told otherwise (BATCHING §5.8: speculation under fan-out needs
@@ -2854,7 +2971,8 @@ int main(int argc, char** argv) try {
                  fanout_gang_above);
   ragon::serve::Scheduler scheduler(ctx, protect_seconds, batch, contended, side_share, fair_pairing != 0,
                                      static_cast<int>(fanout_plain_above), static_cast<int>(fanout_gang_above),
-                                     plain_explicit, wide_above, static_cast<int>(fanout_draft_block));
+                                     plain_explicit, wide_above, static_cast<int>(fanout_draft_block), decode_floor,
+                                     prefill_max_hold, floor_side_chunk);
 
   proxygen::HTTPServerOptions options;
   options.threads = 2;

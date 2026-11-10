@@ -5,7 +5,7 @@
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]]
 //            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--kv-fp8 --kv-fp8-scales F] [--graph-check] [--seed N]
-//            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
+//            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N] [--side-prefill N [--side-chunk N]]]
 //            [--drafter ID=DIR ...] [--switch-check]
 //            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pool-mb N | --kv-flat]
 //            [--grammar-schema FILE | --grammar-tools FILE] [--structured-out FILE]
@@ -69,7 +69,8 @@
 //
 // --side-prefill N (with --interleave-check): B's chunks run on the engine's side stream (EngineOptions::side_prefill:
 // a green context of N SMs, or a plain second stream for -1), each a full chunk launched while A goes on taking steps
-// on the main stream, finished when its pass is done; the same comparison with the runs alone.
+// on the main stream, finished when its pass is done; the same comparison with the runs alone. --side-chunk N: the side
+// chunks beside A are N tokens instead of full (ragon-serve --decode-floor cuts them to --floor-side-chunk, C3 A3).
 //
 // --vision-prompts F (images, VISION §20.8): one chat-completions request body (JSON) per line, image parts as data:
 // URLs or file paths, rendered and prepared as ragon-serve does; the prompts take part in every check above with their
@@ -361,7 +362,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 0;
   int attn_prefetch = 2;
   std::string draft, lora;
-  int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0;
+  int block = 12, lookup = 1, lookup_min = 8, sessions = 1, chunk_check = 0, contended = 256, side_prefill = 0, side_chunk = 0;
   bool fanout_check = false;
   bool fork_check = false, joint_check = false;
   bool interleave_check = false, batch_check = false, batch_bench = false, batch_mixed = false, draft_bf16 = false, switch_check = false;
@@ -434,6 +435,7 @@ int main(int argc, char** argv) {
     else if (a == "--batch-mixed") batch_mixed = true;
     else if (a == "--prefill-chunk-contended") contended = std::stoi(next());
     else if (a == "--side-prefill") side_prefill = std::stoi(next());
+    else if (a == "--side-chunk") side_chunk = std::stoi(next());
     else if (a == "--vision-prompts") vision_prompts = next();
     else if (a == "--vision-check") vision_check = next();
     else if (a == "--vision-bench") vision_bench = true;
@@ -922,7 +924,7 @@ int main(int argc, char** argv) {
                 // The side path: a full chunk queued beside A's steps; finished once its pass is done (or when A
                 // has nothing left to run beside it).
                 if (!engine.side_busy()) {
-                  engine.prefill_chunk_launch(cur, 0);
+                  engine.prefill_chunk_launch(cur, a.done ? 0 : side_chunk);
                   chunks_beside += !a.done;
                 } else if (a.done || engine.side_ready()) {
                   if (engine.prefill_chunk_finish()) b.pending = {engine.sample(engine.logits(), sp, engine.history())};
