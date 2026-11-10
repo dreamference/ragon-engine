@@ -164,6 +164,8 @@ struct Engine::StepPlan {
   int accepted = 0, next = 0;
   bool failed = false;
   bool ride = false;  // a drafter-off sequence's one plain row in the batch's verify (speculate_batch)
+  size_t topk_at = 0;  // where its top K lands in vals_dev_ / pin_->topk_vals (verify_batch_launch)
+  int topk_run = 1;    // the sequences from here on that share one top-K launch (0: inside another's run)
 };
 
 void Engine::alloc_drafter() {
@@ -181,6 +183,7 @@ void Engine::alloc_drafter() {
   cap_stride_ = nfeat * H;
   cap_ = alloc<__nv_bfloat16>(size_t(R) * cap_stride_);
   if (const char* e = std::getenv("RAGON_COMMIT_DRAFT_BATCH")) commit_draft_batch_ = std::atoi(e);
+  if (const char* e = std::getenv("RAGON_TOPK_BATCH")) topk_batch_ = std::atoi(e) != 0;
   if (commit_draft_batch_ && cap_gather_stride_ < cap_stride_) {  // draft_materialize_rows' gathered rows
     cap_gather_ = alloc<__nv_bfloat16>(size_t(kernels::kMaxStreamRows) * cap_stride_);
     cap_gather_stride_ = cap_stride_;
@@ -1306,11 +1309,16 @@ void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
     segs.push_back({sp.s, sp.row0, sp.V, sp.tree ? tree_dev_ + i : nullptr});
   }
   forward_rows(pin_->rows, V, Pass::Verify, -1, segs);
-  // Each sequence's top K over its own rows (K differs between a greedy and a sampled one), at 64 values per row
-  // from its first row on, so the regions never overlap.
-  for (const StepPlan& sp : plans) {
-    const size_t at = size_t(sp.row0) * 64, n = size_t(sp.V) * sp.K;
-    kernels::topk_rows(logits_dev_ + size_t(sp.row0) * c.vocab, sp.V, c.vocab, sp.K, topk_scratch_, vals_dev_ + at,
+  // Each sequence's top K over its own rows (K differs between a greedy and a sampled one), or one launch over a run
+  // of sequences with the same K (speculate_batch sets the runs and offsets): the kernels work per row, so the bits are
+  // the same either way.
+  for (size_t i = 0; i < plans.size(); ++i) {
+    const StepPlan& sp = plans[i];
+    if (sp.topk_run == 0) continue;
+    const StepPlan& last = plans[i + sp.topk_run - 1];
+    const int rows = last.row0 + last.V - sp.row0;
+    const size_t at = sp.topk_at, n = size_t(rows) * sp.K;
+    kernels::topk_rows(logits_dev_ + size_t(sp.row0) * c.vocab, rows, c.vocab, sp.K, topk_scratch_, vals_dev_ + at,
                        ids_out_dev_ + at, stream_);
     check(cudaMemcpyAsync(pin_->topk_vals + at, vals_dev_ + at, n * sizeof(float), cudaMemcpyDeviceToHost, stream_),
           "topk");
@@ -1485,6 +1493,21 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     seqs[i].rows = plans[i].V;
   }
   if (V > kernels::kMaxStreamRows) throw std::runtime_error("speculate_batch: more rows than kMaxStreamRows");
+  // Each sequence's top K at 64 values per row from its first row on; with RAGON_TOPK_BATCH a run of neighbours with
+  // the same K shares one launch, its sequences' values back to back from the run's first row on (the regions still
+  // never overlap: a run of r rows takes r x K <= r x 64). Set here, outside the launch, so a graph replay reads them.
+  for (int i = 0; i < n;) {
+    int j = i + 1;
+    if (topk_batch_)
+      while (j < n && plans[j].K == plans[i].K) ++j;
+    plans[i].topk_run = j - i;
+    for (int k = i; k < j; ++k) {
+      plans[k].topk_at = size_t(plans[i].row0) * 64 + size_t(plans[k].row0 - plans[i].row0) * plans[i].K;
+      if (k > i) plans[k].topk_run = 0;
+    }
+    if (j - i > 1) ++topk_batch_launches_, topk_batch_seqs_ += j - i;
+    i = j;
+  }
   for (StepPlan& sp : plans) kv_ensure(*sp.s, sp.s->pos, sp.s->pos + sp.V, stream_);  // P4b: mapped above; a check
   auto t1 = std::chrono::steady_clock::now();
 
@@ -1533,7 +1556,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   check(cudaStreamSynchronize(stream_), "verify");
   for (size_t i = 0; i < plans.size(); ++i) {
     StepPlan& sp = plans[i];
-    const size_t at = size_t(sp.row0) * 64;
+    const size_t at = sp.topk_at;
     try {
       if (sp.ride) {  // the token step_batch draws for this row (its anchor counted in the history the seed sees)
         const SamplingParams& p = *sp.p;

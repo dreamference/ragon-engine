@@ -680,6 +680,8 @@ class Engine {
   __nv_bfloat16* cap_gather_ = nullptr;
   int cap_gather_stride_ = 0;
   long commit_draft_passes_ = 0, commit_draft_rows_ = 0, commit_draft_fallbacks_ = 0, commit_draft_checked_ = 0;
+  bool topk_batch_ = false;  // RAGON_TOPK_BATCH: one top-K launch per run of joint-verify sequences with the same K
+  long topk_batch_launches_ = 0, topk_batch_seqs_ = 0;
   bool commit_pending_ = false;
   cudaStream_t commit_stream_ = nullptr;
   cudaEvent_t commit_done_ = nullptr;
