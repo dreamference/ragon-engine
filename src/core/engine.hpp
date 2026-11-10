@@ -713,9 +713,9 @@ class Engine {
   // resets and hashes) joins first; the draft and the drafter's context KV (draft_materialize) do not need to.
   bool commit_overlap_ = false;
   bool commit_state_batch_ = true;  // speculate_batch: commit_state_seqs, not one replay per sequence
-  // RAGON_COMMIT_DRAFT_BATCH: 0 off (default), 1 speculate_batch's drafter commit in one pass (draft_materialize_rows),
+  // RAGON_COMMIT_DRAFT_BATCH: 0 off, 1 (default) speculate_batch's drafter commit in one pass (draft_materialize_rows),
   // 2 the same, then each sequence's own commit over it and a byte compare of the ring slots (a check: throws).
-  int commit_draft_batch_ = 0;
+  int commit_draft_batch_ = 1;
   __nv_bfloat16* cap_gather_ = nullptr;
   int cap_gather_stride_ = 0;
   long commit_draft_passes_ = 0, commit_draft_rows_ = 0, commit_draft_fallbacks_ = 0, commit_draft_checked_ = 0;
