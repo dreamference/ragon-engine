@@ -718,7 +718,7 @@ class Engine {
   cudaEvent_t commit_done_ = nullptr;
   float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)
   void join_commit();
-  // RAGON_MK_GDN_FUSED=1 (off by default; needs the batched commit beside the draft): speculate_batch's commit runs
+  // RAGON_MK_GDN_FUSED (on by default, =0 turns it off; needs the batched commit beside the draft): speculate_batch's commit runs
   // only the conv half beside the draft and keeps the recurrence's inputs (p_post_, p_g_, p_beta_); the next joint
   // verify replays them inside its own recurrence (kernels::gdn_recurrent_fused_seqs), so a DeltaNet layer reads each
   // sequence's state once and writes it once per step instead of the commit's read and write and the verify's read.

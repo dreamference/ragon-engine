@@ -362,6 +362,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  gdn_fused_ = commit_overlap_ && commit_state_batch_;  // on by default since 2026-11-10 (exact; RAGON_MK_GDN_FUSED=0 turns it off)
   if (const char* e = std::getenv("RAGON_MK_GDN_FUSED")) gdn_fused_ = commit_overlap_ && commit_state_batch_ && std::atoi(e);
   if (gdn_fused_) {
     pend_dev_ = alloc<int>(2 * kernels::kMaxSeqs);
