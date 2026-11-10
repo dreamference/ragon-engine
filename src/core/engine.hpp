@@ -168,6 +168,13 @@ struct EngineOptions {
   int tree_max_depth = 1000;
   int tree_chain = 8;        // the chain's length within the block (the block's later positions hold tree nodes)
   double tree_min_mass = 0;  // a step whose extra nodes' summed path probability is below this verifies the chain alone
+  // Wider and batched trees (BACKLOG 26, BATCHING 5.1), both off by default. tree_rows > 0: a one-stream step (and a
+  // batch with one drafting sequence) verifies a tree of this many rows in place of the chain + tree_nodes default
+  // (RAGON_TREE_ROWS). tree_batch_rows[n - 2] > 0: a batch of n drafting sequences (2 to 4) gives each a tree of this
+  // many rows, wherever it fits the tier, independent of the one-stream shape (RAGON_TREE_BATCH=R2,R3,R4, or 1 for
+  // 24,16,16). 0: as tree_nodes.
+  int tree_rows = 0;
+  int tree_batch_rows[3] = {0, 0, 0};
   // BACKLOG 19: the drafter's context-aware sparse head. "full": the target's whole LM head. "sparse" (the default):
   // per step the drafter scores the fixed list, the session's context vocabulary (the token ids of its prompt and
   // output) and the `sparse_head_dynamic` rows a rank-256 copy of the head rates best, and takes its top 16 among
@@ -769,7 +776,7 @@ class Engine {
   void plan_walk(StepPlan& sp, int B, const int* cand, const float* scores);
   // BACKLOG 26: the chain and its tree (scores: this sequence's), when the step takes one and it is full and worth its
   // rows; desc gets its description.
-  void plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc);
+  void plan_tree(StepPlan& sp, int B, int nodes, const float* scores, bool want_logits, kernels::TreeDesc& desc);
   void plan_fixed(StepPlan& sp);
   void plan_mask_rows(StepPlan& sp, int row0, int rows);  // a batch's constrained sequence: its mask rows  // structured output: a lookup chain's masks and cut (after its padding)
   void plan_accept(StepPlan& sp, const float* vals, const int* ids);  // rows' top K -> accepted, next
@@ -1007,7 +1014,9 @@ class Engine {
   const kernels::TreeDesc* tree_ = nullptr;
   int tree_grid_ = 1;
   int* gather_rows_dev_ = nullptr;
-  bool tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const;
+  bool tree_step(const Session& s, bool use_lookup, bool want_logits, int B, int nodes) const;
+  // The tree nodes beyond the chain a sequence verifies when nd sequences draft together (1: one stream), block B.
+  int tree_nodes_for(int nd, int B) const;
   // The drafter-off guard (BACKLOG 10): its configuration, and whether it applies to requests with p.
   DraftGuardConfig guard_cfg_;
   bool guarded(const SamplingParams& p) const {
