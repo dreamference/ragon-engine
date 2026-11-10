@@ -6,7 +6,7 @@
 //              [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16] [--kv-fp8 --kv-fp8-scales F]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
-//              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N]
+//              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on|off] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N]
 //              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
 //              [--kv-pool-mb N | --kv-flat]
 //              [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N]
@@ -38,7 +38,7 @@
 // is the one with the fewest decode passes in the trailing 16 (serve/pairing.hpp), not the first in running order,
 // so at four decoding conversations each takes 2 passes in 4 instead of 4/2/1/1. Only which requests step together
 // changes. RAGON_STEP_TRACE=FILE writes one JSON line per scheduler unit (serve/step_trace.hpp).
-// --decode-floor F|on (C3, design A2 and A3; default 0, off; "on" is 36; RAGON_DECODE_FLOOR overrides): while any
+// --decode-floor F|on|off (C3, design A2 and A3; default on, 36; 0 or off turns it off; RAGON_DECODE_FLOOR overrides): while any
 // decoding request's trailing rate (its tokens over the wall time of its last 16 steps) is below F tokens/s, the side
 // stream holds a prefill's next chunk, at one decoder or more (serve/floor.hpp). A prefill with at most 2,048 tokens
 // left (a warm append) is never held, and a held prefill takes its next chunk after --prefill-max-hold S seconds
@@ -2499,9 +2499,9 @@ int main(int argc, char** argv) try {
   long host_reserve_mb = 16384, admit_reserve_mb = 8192, auto_size = 1, fair_pairing = -1, fanout_plain_above = -1,
        fanout_gang_above = -1, fanout_default = 1, fanout_draft_block = -1;
   double protect_seconds = 30;
-  // --decode-floor (0 off), --prefill-max-hold, --floor-side-chunk (C3 A2/A3); --side-share and --fair-pairing are -1
+  // --decode-floor (on at 36 by default; 0 off), --prefill-max-hold, --floor-side-chunk (C3 A2/A3); --side-share and --fair-pairing are -1
   // until given, so the floor can choose their defaults.
-  double decode_floor = 0, prefill_max_hold = 3;
+  double decode_floor = ragon::serve::kDecodeFloorOn, prefill_max_hold = 3;
   int floor_side_chunk = 1024;
   bool draft_bf16 = false;
   std::string repetition_arg, repetition_report = "incomplete";
@@ -2754,9 +2754,9 @@ int main(int argc, char** argv) try {
     }
   if (const char* e = std::getenv("RAGON_DECODE_FLOOR")) {
     try {
-      decode_floor = std::string(e) == "on" ? ragon::serve::kDecodeFloorOn : std::stod(e);
+      decode_floor = std::string(e) == "on" ? ragon::serve::kDecodeFloorOn : std::string(e) == "off" ? 0 : std::stod(e);
     } catch (const std::exception&) {
-      std::cerr << "RAGON_DECODE_FLOOR must be a number or on\n";
+      std::cerr << "RAGON_DECODE_FLOOR must be a number, on or off\n";
       return 2;
     }
   }

@@ -92,7 +92,7 @@ Order: W-A0 and W-A1 in one slot (no new kernels; the trace and A1 are a day's w
 
 ## 7. Built: design A (2026-11-10)
 
-`--decode-floor F` (`on` = 36 tokens/s; default 0 = off), `--prefill-max-hold S` (3 s), `--floor-side-chunk N` (1,024). The policy is host-only in `src/serve/floor.hpp`, with tests in `tests/floor_tests.cpp`. Scheduler hooks in `src/serve/main.cpp`:
+`--decode-floor F` (`on` = 36 tokens/s, the default since the 2026-11-10 integration; `off` or 0 turns it off), `--prefill-max-hold S` (3 s), `--floor-side-chunk N` (1,024). The policy is host-only in `src/serve/floor.hpp`, with tests in `tests/floor_tests.cpp`. Scheduler hooks in `src/serve/main.cpp`:
 - **A1** is the existing fair pairing (`pairing.hpp`). It is on by default when the floor is on (`--fair-pairing` still overrides).
 - **A2**: `side_wait` holds the next side chunk while any other decoding request's trailing rate is below F. The rate is its last 16 steps, measured to now; with fewer than 4 steps a request has no opinion. The hold applies at one decoder or more. A prefill with at most 2,048 tokens left is never held, and a held prefill takes its next chunk after the cap. With the floor on, `--side-share` defaults to 0.
 - **A3**: `side_launch` cuts a long prompt's side chunk to 1,024 tokens while a decoder runs beside it.
