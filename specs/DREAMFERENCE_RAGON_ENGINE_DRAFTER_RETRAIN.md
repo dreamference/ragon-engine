@@ -202,7 +202,7 @@ The GB10 side runs in parallel:
 
 - **Save** every 250 updates (~8M tokens, ~21 min) and at each epoch end. Keep the last 3 and the best by held-out loss.
 - **Held-out loss.** One converted chunk of held-out tasks (never trained), evaluated at each save: loss and SpecForge's per-position acceptance. This is a cheap trend, not the bar.
-- **Candidates.** The best two saves of each epoch go through §4.6 to NVFP4 and then rung 1 and rung 2 on a GB10 node in a GPU window. Each candidate costs about 2 × 25 min (rung 1, two seeds) + ~40 min (rung 2).
+- **Candidates.** The best two saves of each epoch go through §4.6 to NVFP4 and then rung 1 and rung 2 on a GB10 node in a GPU window. Each candidate costs about 20 min (rung 1, two seeds) + 29 min (rung 2), measured with the served drafter.
 
 ### 4.6 Back to the served format
 
@@ -236,9 +236,9 @@ Measured with the served drafter (one GB10 node, 2026-11-10):
 | sparse (production) | 2026 | 5.66 | 105.0 | 53.55 |
 | full | 1013 | 5.79 | 106.6 | 53.96 |
 | full | 2026 | 5.69 | 106.2 | 53.25 |
-| full, earlier baseline (w4) | 1013 / 2026 | 5.570 / 5.471 | 99.1 / 99.3 | 55.81 / 54.74 |
+| full, pre-integration build (16 tree rows, earlier) | 1013 / 2026 | 5.570 / 5.471 | 99.1 / 99.3 | 55.81 / 54.74 |
 
-On this build the two heads accept the same (5.80 vs 5.79, 5.66 vs 5.69: within a seed's noise), and the sparse head is about 1.2 ms per step cheaper (+0.8 and +0.3 decode tok/s). The earlier full-head baseline is a different build: since the 2026-11-10 integration a one-stream step verifies 24 tree rows instead of 16, which raises tokens per step by about 0.2 and ms per step by about 7. A candidate is therefore compared only with a served-drafter run on the same build, in the same window. The retrained drafter keeps the sparse head unchanged (§1: the LM head is frozen) and is measured with it.
+On this build the two heads accept the same (5.80 vs 5.79, 5.66 vs 5.69: within a seed's noise), and the sparse head is about 1.2 ms per step cheaper (+0.8 and +0.3 decode tok/s). The earlier full-head baseline (5.57 / 5.47, the 5.4-5.5 the served drafter was known for) is the 16-row tree: since the 2026-11-10 integration a one-stream step verifies 24 tree rows. Measured on this build with `RAGON_TREE_ROWS=0` (16 rows), full head, seed 1013: 5.57 tokens per step, 99.7 ms, 55.44 tok/s, the old numbers. So 24 rows add 0.22 tokens per step and 6.9 ms per step, and decode tok/s drops by 1.5 at one stream on this replay. A candidate is therefore compared only with a served-drafter run on the same build, in the same window. The retrained drafter keeps the sparse head unchanged (§1: the LM head is frozen) and is measured with it.
 
 ### 5.2 Rung 2
 
@@ -257,7 +257,8 @@ Measured with the served drafter, sparse head (W2, one GB10 node, 2026-11-10):
 - checks: `--spec-check` and `--graph-check` pass; `--batch-check` passes under `RAGON_TREE_ROWS=0` (W3; at the default 24/16 rows it reports a difference in steps, not in tokens);
 - tokens per step at production's flags: 25-40K 6.94 (8 turns), 40-64K 7.20 (8 turns), all 7.11 (16 turns, 5,287 tokens; 63.7 decode tok/s, 111 ms per step);
 - agreement against production's tokens: short 20/54 exact (matched prefix 0.492), long 5/24 (0.198). These are the build's numbers a candidate must equal, with `same` reporting 0 texts differing;
-- the per-depth chain acceptance was not measured in W2 (W2 ran the earlier script, whose step dump stayed empty under the tree); the first candidate A/B measures both drafters with the script as committed.
+- the chain alone (`--tree 0`, W5 with the committed script): 6.01 tokens per step over the 16 turns (25-40K 5.65, 40-64K 6.23; the tree adds about 1.1). Acceptance at draft depth 1-11 over all 906 dumped steps: 0.906, 0.773, 0.662, 0.557, 0.477, 0.405, 0.337, 0.274, 0.234, 0.194, 0.171 (40-64K: 0.919 … 0.209; 25-40K: 0.889 … 0.117). The dump's tokens per step (5.99) matches the server's counters;
+- `rung2.py same` against W2's texts: 0 of 78 differ (two runs of the served drafter on the same build), so the criterion does not fire on noise. The whole script takes 29 minutes in a window.
 
 ### 5.3 Acceptance target
 
