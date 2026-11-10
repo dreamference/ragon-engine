@@ -1,4 +1,4 @@
-# Loads bw.co through the driver's System32 HIP runtime with TheRock off PATH (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.4).
+# Loads bw.co through the driver's System32 HIP runtime with TheRock off PATH (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.4).
 $ErrorActionPreference = "Stop"
 $src = @"
 using System; using System.Runtime.InteropServices;

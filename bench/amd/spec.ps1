@@ -1,4 +1,4 @@
-# llama-server (release zips) on prompts.json at temperature 0: decode, draft acceptance, answer hashes (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.2).
+# llama-server (release zips) on prompts.json at temperature 0: decode, draft acceptance, answer hashes (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.2).
 param([string]$Backend = "vulkan", [string]$Tag = "none", [string]$Extra = "", [int]$Port = 18765)
 $ErrorActionPreference = "Continue"
 $dir = "$($env:AMD_PORT_DIR)"

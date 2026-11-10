@@ -1,4 +1,4 @@
-# Compiles vg.hip with several layouts and block sizes and times the 16-row kernels (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5).
+# Compiles vg.hip with several layouts and block sizes and times the 16-row kernels (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.5).
 $d = "$($env:AMD_PORT_DIR)"; $cl = "C:\TheRock\build\lib\llvm\bin\clang++.exe"
 $cfgs = @(@("-DKC=256 -DNT -DKMAJOR", 256), @("-DKC=256 -DNT -DKMAJOR -DBWAVES=16", 512), @("-DKC=512 -DNT -DKMAJOR -DBWAVES=16", 512), @("-DKC=256 -DNT -DKMAJOR -DBWAVES=32 -DXROWS=16", 1024))
 $i = 20

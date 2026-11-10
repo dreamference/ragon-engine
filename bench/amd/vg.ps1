@@ -1,6 +1,6 @@
 # Host for vg.hip, the first milestone's verify-GEMM probe: correctness against an FP32 reference, then us and GB/s per matrix
 # for M = 1, 16, 32 rows (events and wall clock), and the plain read stream over the same bytes. -Quick 1..7 select
-# the reduced runs of specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.6 (7: 90 s continuous, wall clock per window).
+# the reduced runs of specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.6 (7: 90 s continuous, wall clock per window).
 param([int]$TB = 256, [int]$L = 8, [int]$Iters = 10, [string]$Co = "$($env:AMD_PORT_DIR)\vg.co", [int]$Quick = 0)
 $ErrorActionPreference = "Stop"
 $src = @"

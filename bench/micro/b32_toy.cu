@@ -9,7 +9,7 @@
 // kernel exits; it never hangs the GPU of a unified-memory host), and a timings store (per item: SM, start and end
 // in globaltimer nanoseconds) for the per-SM timeline.
 //
-//   nvcc -std=c++20 -O3 -gencode arch=compute_121a,code=sm_121a -Isrc bench/micro/b32_toy.cu build/libling_core.a \
+//   nvcc -std=c++20 -O3 -gencode arch=compute_121a,code=sm_121a -Isrc bench/micro/b32_toy.cu build/libragon_core.a \
 //        -o build/b32-toy && build/b32-toy [--timings out.csv]
 //
 // Coherence: the cross-block inputs (g and u for the row step, the FP16 copy for the down tiles) are written inside

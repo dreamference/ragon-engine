@@ -2,12 +2,12 @@
 
 Part of the ragon-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ragon-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status (2026-10-27):** the first milestone passed at 140 W (§6.7), and **the owner postponed the AMD/Windows engine port to 2.0, to finish 1.x first. Superseded on 2026-11-06:** the port is planned again as part of Ragon's Windows node (`DREAMFERENCE_WINDOWS_NODE.md` in the ragon repository's `specs/`); the "postponed to 2.0" lines below record the earlier decision. The Windows-only plan of §5 is what a restart picks up. No engine code is ported. The probes and their results stay in `bench/amd/` and in a working folder on the box (§6.1). The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decisions:**
 
-- **2026-10-26:** there is no interim llama.cpp engine in Mightling.
+- **2026-10-26:** there is no interim llama.cpp engine in Ragon.
 - **2026-10-27, superseding the Linux-first plan of 2026-10-26:** the port is **Windows only**. There is no Linux phase ("later, if ever") and the box's Linux dual boot is off.
 - **2026-10-27:** **the first milestone passed** at the box's 140 W setting (§6.7).
 - **2026-10-27:** **the port is postponed to 2.0**, so that 1.x is finished first. §5 is the plan for when it restarts.
 
-Every figure is tagged: *measured* (on `the AMD box`, 2026-10-26, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Mightling's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Mightling's `specs/DREAMFERENCE_MIGHTLING_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
+Every figure is tagged: *measured* (on `the AMD box`, 2026-10-26, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Ragon's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Ragon's `specs/DREAMFERENCE_RAGON_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
 
 ## Short answer
 
@@ -221,7 +221,7 @@ Read from `main` at `c5ec4ec`. Line counts are from `wc -l`.
 
 **Weight format.** AMD has no FP4 or FP8 matrix unit, but decode never needed one (§2). Prefill becomes W4A16/W8A16 on FP16 WMMA, or W8A8 on INT8 WMMA (FP16 activations quantized per row). Two formats were weighed:
 
-- **GGUF Q4_K.** It would read about 1 GB less per pass (§6: UD-Q4_K_XL's ~16.7 GB against 17.6 GB). But it changes the model Mightling validated and is not the checkpoint the GB10 serves.
+- **GGUF Q4_K.** It would read about 1 GB less per pass (§6: UD-Q4_K_XL's ~16.7 GB against 17.6 GB). But it changes the model Ragon validated and is not the checkpoint the GB10 serves.
 - **A uniform NVFP4 re-quantization of the FP8 projections** (MODEL §5.2: 17.6 → 14.4 GB, −18% per pass). It goes through the same quality gate on both machines, so it is a GB10 decision first.
 
 **Exactness.** Yes, by the engine's own definition: speculative greedy is identical to the same build's non-speculative greedy over the same weights. The port keeps the policy that every row runs through the same kernel. With WMMA at M ≤ 16 a single row and 16 rows execute the same instruction sequence, so batch invariance comes for free. Identity with the GB10's output is not possible, because the arithmetic differs, and it is not the goal.
@@ -304,7 +304,7 @@ The owner chose a Windows-only port (2026-10-27). §5 re-estimates the work for 
 **Risks.**
 
 - Other people's roadmaps: gufo is two months old and releases daily.
-- The result is not ragon-engine. Tree, lookup and kernel work land in an engine Mightling does not control. gufo is MIT, so a fork is always possible.
+- The result is not ragon-engine. Tree, lookup and kernel work land in an engine Ragon does not control. gufo is MIT, so a fork is always possible.
 - The Windows build is gufo's, and gufo itself calls it "a supported native build target for development"; its production packages are Linux-only.
 
 ### 3.3 (c) A Vulkan compute backend
@@ -366,14 +366,14 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 **Best on Windows:**
 
-- **Of the engines that exist today:** llama.cpp (release zips, *measured* here) and gufo (native Windows build, upstream). The owner decided against an interim llama.cpp engine in Mightling (2026-10-26), so neither is planned as a Mightling engine.
+- **Of the engines that exist today:** llama.cpp (release zips, *measured* here) and gufo (native Windows build, upstream). The owner decided against an interim llama.cpp engine in Ragon (2026-10-26), so neither is planned as a Ragon engine.
 - **For ragon-engine itself:** (a), on Windows only. This is the owner's choice of 2026-10-27 (§5).
 
 **Best on Linux:** (d), which is (a) built where ROCm is first-class. Not pursued: the port is Windows only (§5).
 
 ---
 
-## 4. How Mightling would use it
+## 4. How Ragon would use it
 
 ### 4.1 The node role
 
@@ -382,9 +382,9 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 - AMD_NODES §7 unchanged.
 - The registry entry names `engine: "ragon"` with a platform `gfx1151`, the same checkpoint (`RadixArk/Qwen3.8-27B-NVFP4`) and the same DFlash2 drafter. The launch builder gets the AMD device prefix (`--device /dev/kfd --device /dev/dri …`).
 - The image is a ROCm base with `ragon-serve`, pinned by digest.
-- Mightling's tools ask the server which model runs (`/v1/models`), so a client cannot tell the AMD node from a GB10 except by speed.
+- Ragon's tools ask the server which model runs (`/v1/models`), so a client cannot tell the AMD node from a GB10 except by speed.
 
-**On Windows (the chosen target).** There is no Docker. The launcher's engine supervisor (Mightling's WINDOWS_ARM §8.3, designed, not built) runs `ragon-serve.exe` as a child in a Job Object.
+**On Windows (the chosen target).** There is no Docker. The launcher's engine supervisor (Ragon's WINDOWS_ARM §8.3, designed, not built) runs `ragon-serve.exe` as a child in a Job Object.
 
 - **The registry recipe** reaches Rust as a JSON export in the release (AMD_NODES §6.3).
 - **The binary** is a release asset, `ragon-engine-<version>-windows-gfx1151.zip`: `ragon-serve.exe`, its code objects and the vcpkg DLLs, pinned by SHA-256 like llama.cpp's zips in AMD_NODES §13.4.
@@ -419,7 +419,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 | Date | Decision |
 |---|---|
-| 2026-10-26 | No interim llama.cpp engine in Mightling |
+| 2026-10-26 | No interim llama.cpp engine in Ragon |
 | 2026-10-26 | If the first milestone passes, port on Linux and Windows, Linux first, each phase exact against a reference. *Superseded the next day* |
 | **2026-10-27** | **The port is Windows only.** No Linux phase: Linux is "later, if ever". The box's Linux dual boot is off |
 | 2026-10-27 | The box's front power knob set to 140 W. The first milestone was re-measured at it and **passed** (§6.7) |
@@ -461,7 +461,7 @@ The rule makes the references below checkable. It also keeps a later Linux build
 | **W2** | Prefill on WMMA (W4A16/W8A16 FP16, or W8A8 INT8), prefill DeltaNet; `ragon-serve` with a Windows HTTP layer (a small server for the routes of [API](./DREAMFERENCE_RAGON_ENGINE_API.md), or proxygen if it builds); WDDM host safety (the DXGI budget, TDR-bounded kernels, the 96 GB carve-out, kill and restart); packaging as a zip against the driver's HIP runtime; signing | 6–9 weeks | W2's reference; prefill ≥ 500 tokens/s at 32K; a Work session from a client against the box |
 | **Total** | | **15–21 engineer-weeks** | |
 
-**Outside the engine, and separate:** Mightling's side of a Windows node (AMD_NODES §6.4, about 4–5 weeks). That covers the launcher's engine supervisor, the registry export, the watchdog, the advertisement and the egress audit of the engine's process. It can run beside W1–W2.
+**Outside the engine, and separate:** Ragon's side of a Windows node (AMD_NODES §6.4, about 4–5 weeks). That covers the launcher's engine supervisor, the registry export, the watchdog, the advertisement and the egress audit of the engine's process. It can run beside W1–W2.
 
 **Needs from the owner:**
 
@@ -488,7 +488,7 @@ The probes are in this repository under `bench/amd/`. a working folder on the bo
 | `rt.ps1` | the driver's HIP runtime with TheRock off `PATH` (§6.4) |
 | `vg.hip`, `vg.ps1`, `vg-tune.ps1`, `vg-attrib.ps1` | the first milestone's verify-GEMM probe (§6.5, §6.6) |
 | `graph.ps1` | the per-node cost of a captured `hipGraph` (§6.6) |
-| `ag.ps1`, `cmp.ps1` (the request bodies came from `bench-sets` and the template from Mightling's `ChatTemplatePatcher`; neither is kept) | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Mightling's patched chat template |
+| `ag.ps1`, `cmp.ps1` (the request bodies came from `bench-sets` and the template from Ragon's `ChatTemplatePatcher`; neither is kept) | the first four agentlong turns (25–33K tokens of context, `bench/agentlong/manifest.json`), sent to `llama-server`'s `/v1/responses` with temperature 0 and Ragon's patched chat template |
 
 The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, SHA-256 `1a25c568…31ebd`, equal to the LFS object). It runs with `--spec-type draft-dflash -ngld 99`. llama.cpp logs `block_size=8, n_extract=5`.
 
@@ -526,7 +526,7 @@ The drafter is z-lab's `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1,143,006,816 bytes, S
 
 ### 6.3 Four agentlong turns
 
-*Measured*, ROCm (TheRock 10.0), `-c 40960`, no prompt cache between configurations. The turns are t00–t03 of `bench/agentlong/manifest.json`: 28,307–32,458 tokens of context, the same request bodies `bench/agentlong/run.py` sends to `ragon-serve`, at temperature 0, through `/v1/responses` with Mightling's patched chat template. Every answer is a message plus a tool call, 111–522 tokens long.
+*Measured*, ROCm (TheRock 10.0), `-c 40960`, no prompt cache between configurations. The turns are t00–t03 of `bench/agentlong/manifest.json`: 28,307–32,458 tokens of context, the same request bodies `bench/agentlong/run.py` sends to `ragon-serve`, at temperature 0, through `/v1/responses` with Ragon's patched chat template. Every answer is a message plus a tool call, 111–522 tokens long.
 
 | Drafting | Decode, pooled over the 4 turns | τ (tokens per step) | Step | Prefill at 28–32K |
 |---|---|---|---|---|
@@ -655,7 +655,7 @@ Two findings came out of these runs:
 
 ### 6.7 The first milestone at 140 W: passed
 
-The owner set the box's front power knob to 140 W on 2026-10-27. *Measured* the same morning (box clock, 08:57–09:03 UTC) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ling exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
+The owner set the box's front power knob to 140 W on 2026-10-27. *Measured* the same morning (box clock, 08:57–09:03 UTC) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ragon exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
 
 **The NVFP4 16-row kernel**, the gate's open item:
 
@@ -724,4 +724,4 @@ Read on the web on 2026-10-26 unless dated otherwise. "Third-party" means not me
 
 From this repository: `src/` at `c5ec4ec` (§2's inventory); [BACKLOG](./DREAMFERENCE_RAGON_ENGINE_BACKLOG.md) §19 items 19, 26, 27 and 28; [MODEL](./DREAMFERENCE_RAGON_ENGINE_MODEL.md) §5; [OVERVIEW](./DREAMFERENCE_RAGON_ENGINE_OVERVIEW.md) §4; [ARCHITECTURE](./DREAMFERENCE_RAGON_ENGINE_ARCHITECTURE.md) §8–9; [INTEGRATION](./DREAMFERENCE_RAGON_ENGINE_INTEGRATION.md) §12; `bench/agentlong/manifest.json`.
 
-From Mightling: `specs/DREAMFERENCE_MIGHTLING_AMD_NODES.md` §1–§13 (the box, its setup, the Windows memory model, the node pieces, the first llama.cpp measurements); WINDOWS_ARM §8.3, §9 and §16.3 as cited there.
+From Ragon: `specs/DREAMFERENCE_RAGON_AMD_NODES.md` §1–§13 (the box, its setup, the Windows memory model, the node pieces, the first llama.cpp measurements); WINDOWS_ARM §8.3, §9 and §16.3 as cited there.

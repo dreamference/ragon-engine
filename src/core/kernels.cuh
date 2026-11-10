@@ -117,7 +117,7 @@ void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
 // Row-invariant: a row's result is bit-for-bit the same whatever M is, so a token verified in a block of
 // 16 gets exactly the numbers it would get decoded alone.
 //
-// Two limits (batching P1, specs/DREAMFERENCE_LING_ENGINE_BATCHING.md §5.1):
+// Two limits (batching P1, specs/DREAMFERENCE_RAGON_ENGINE_BATCHING.md §5.1):
 //   - kMaxStreamRows, the rows of one pass: a batched verify's sequences together (two trees of up to 24 rows each
 //     since P1), and every buffer and pinned array sized by a pass's rows. 33 to 64 rows take the stream GEMMs' second
 //     row group (stream_gemm.cu, GROUPS = 2: the weights read once for both groups, each row's arithmetic unchanged);

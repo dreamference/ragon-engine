@@ -1,5 +1,5 @@
 # The per-node cost of a captured hipGraph of ~330 near-empty kernels, against direct launches
-# (the first milestone's graph-gap gate, specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5). Uses bw.co's wr kernel with n = 0.
+# (the first milestone's graph-gap gate, specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.5). Uses bw.co's wr kernel with n = 0.
 param([int]$Nodes = 330, [int]$Reps = 200)
 $ErrorActionPreference = "Stop"
 $src = @"

@@ -1,4 +1,4 @@
-# Compares the content (messages, function calls) of ag.ps1's answers across configurations (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.3).
+# Compares the content (messages, function calls) of ag.ps1's answers across configurations (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.3).
 $d = "$($env:AMD_PORT_DIR)"
 foreach ($t in @("t00","t01","t02","t03")) {
   $line = "$t"

@@ -1,6 +1,6 @@
 # Host for bw.hip on Windows without MSVC: C# compiled by PowerShell, calling amdhip64_7.dll through P/Invoke.
 # Build the code object first: clang++ -x hip --offload-arch=gfx1151 --cuda-device-only --no-gpu-bundle-output -nogpuinc -nogpulib -O3 -o bw.co bw.hip
-# (specs/DREAMFERENCE_LING_ENGINE_AMD.md §1.1, §6.1)
+# (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §1.1, §6.1)
 param([int]$GiB = 4, [int]$Iters = 20)
 $ErrorActionPreference = "Stop"
 $env:Path = "C:\TheRock\build\bin;" + $env:Path

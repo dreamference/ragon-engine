@@ -1,4 +1,4 @@
-# Host for wmma.hip: WMMA throughput per type (specs/DREAMFERENCE_LING_ENGINE_AMD.md §1.1).
+# Host for wmma.hip: WMMA throughput per type (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §1.1).
 param([int]$Iters = 20000)
 $ErrorActionPreference = "Stop"
 $env:Path = "C:\TheRock\build\bin;" + $env:Path

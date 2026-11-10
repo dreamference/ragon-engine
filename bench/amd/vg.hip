@@ -2,7 +2,7 @@
 // (NVFP4: E2M1 codes [N][K/2] low nibble first + E4M3 scales [N][K/16]; FP8: E4M3 [N][K]), are decoded
 // to FP16 in registers and multiplied on WMMA 16x16x16 against M <= 16*MT activation rows staged in LDS.
 // One wave owns one 16-column tile of N and walks all of K. Header-free (no HIP headers on the box).
-// The fastest configuration on 2026-10-26 (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5, §6.6): -DKMAJOR -DNT -DKC=256
+// The fastest configuration on 2026-10-26 (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.5, §6.6): -DKMAJOR -DNT -DKC=256
 // -DLUT -DXDB; for FP8 also -DBWAVES=32 -DXROWS=16 with 1024-thread blocks. The fp4_/fp8_ kernels are the first,
 // row-major attempt; fp4w_/fp8w_ give each wave two tiles; NODEC, NOWMMA, NOX, NOBAR and XFAKE strip or fake parts
 // for attribution.

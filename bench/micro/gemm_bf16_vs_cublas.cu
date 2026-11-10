@@ -3,7 +3,7 @@
 // one place cuBLAS is still linked (the engine itself no longer is):
 //
 //   nvcc -std=c++20 -O2 -gencode arch=compute_121a,code=sm_121a -Isrc bench/micro/gemm_bf16_vs_cublas.cu \
-//        build/libling_core.a -lcublas -o build/gemm-bf16-vs-cublas && build/gemm-bf16-vs-cublas
+//        build/libragon_core.a -lcublas -o build/gemm-bf16-vs-cublas && build/gemm-bf16-vs-cublas
 //
 // Prints per shape: the outputs that differ from cuBLAS's (bitwise), the largest difference relative to
 // the outputs' RMS, and the median of 20 timed runs of each, in ms and TFLOPS.

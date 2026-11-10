@@ -1,5 +1,5 @@
 # The first four agentlong turns (bench/agentlong; bodies from bench-sets, not in the repository) through llama-server's /v1/responses
-# with Mightling's patched chat template (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.3). cmp.ps1 compares the answers' content.
+# with Ragon's patched chat template (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.3). cmp.ps1 compares the answers' content.
 param([string]$Backend = "rocm", [string]$Tag = "none", [string]$Extra = "--spec-type none", [int]$Port = 18766)
 $ErrorActionPreference = "Continue"
 $dir = "$($env:AMD_PORT_DIR)"

@@ -1,7 +1,7 @@
 // ragon_force: the engine side of the agreement study (bench/agreement/run.sh), built by hand against any
 // ragon-engine build's libraries so older builds can be scored too:
 //   nvcc -std=c++20 -O2 -gencode arch=compute_121a,code=sm_121a -I$SRC/src ragon_force.cpp \
-//        $SRC/build/libling_core.a $SRC/build/libling_tokenizer.a -lcuda -lpcre2-8 -licuuc -lpng16 -lwebp -o ragon-force
+//        $SRC/build/libragon_core.a $SRC/build/libragon_tokenizer.a -lcuda -lpcre2-8 -licuuc -lpng16 -lwebp -o ragon-force
 //   ragon-force tokenize MODEL < prompts.jsonl            -> {"ids": [...]} per line (prompt strings, JSON)
 //   ragon-force score MODEL K < cases.jsonl               -> per case: engine top-K log-probs at each forced position
 //        case: {"prompt": [ids], "cont": [ids]}; position j scores the token after prompt + cont[:j]

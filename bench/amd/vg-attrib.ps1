@@ -1,4 +1,4 @@
-# Times the 16-row NVFP4 kernel with one part switched off at a time: staging (NOX), decode (NODEC), WMMA (NOWMMA) (specs/DREAMFERENCE_LING_ENGINE_AMD.md §6.5).
+# Times the 16-row NVFP4 kernel with one part switched off at a time: staging (NOX), decode (NODEC), WMMA (NOWMMA) (specs/DREAMFERENCE_RAGON_ENGINE_AMD.md §6.5).
 $d = "$($env:AMD_PORT_DIR)"; $cl = "C:\TheRock\build\lib\llvm\bin\clang++.exe"
 $cfgs = @("-DKC=256 -DNT -DKMAJOR", "-DKC=256 -DNT -DKMAJOR -DNOX", "-DKC=256 -DNT -DKMAJOR -DNODEC", "-DKC=256 -DNT -DKMAJOR -DNOWMMA")
 $i = 30
