@@ -293,6 +293,13 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
     - **Prefill:** 2,249 → 2,410 tok/s at 25.7K tokens.
     - **Agent traces (24 prompts, teacher-forced against the served checkpoint):** tool names 72/72 tokens; top-1 flips 1.6%; mean KL 0.008 nats.
     - **Shortfall:** the ×1.16 is not reached because acceptance does not hold. The drafter was trained on the served checkpoint, so the gap is the case for retraining it on Minima.
+  - **Rung 2 (2026-11-10), partial, not yet a verdict.** It ran on SGLang, teacher-forced against BF16 Qwen3.8-27B, with top-20 log-probs, no drafter and text only. Both NVFP4 arms ran W4A4 there. It covered 1.69M positions of the replay set (60 of its 239 sequences). Agentlong was scored for BF16 and Minima, but the box went off the network during the served window. As measured, Minima fails every bar:
+    - **Mean KL:** 1.38 against served 0.77, ×1.79 (95% CI 1.70–1.86; bar ×1.25).
+    - **Top-1:** 55.6% against 71.9%, −16.3 pt (bar −0.5 pt).
+    - **KL by position:** it grows. Minima is ×1.10 of served under 8K, ×1.79 at 16–25K and ×1.84 at 25–49K.
+    - **Tool-argument top-1:** 86.3% against 97.5%.
+    - **Assistant tokens only:** KL 0.37 against 0.014. NLL 0.82 against 0.31 for served and BF16.
+    - **Why it is not yet a verdict:** it contradicts the engine's own check above (KL 0.008 against served). Two causes are open: SGLang quantizes Minima's activations to FP4, which the engine does not, and the Minima window's KV dtype was not recorded. **Next:** a W4A16 arm (Minima dequantized to BF16) on the same positions.
 - **1.3× needs (a2) on top** (×1.29 with (a1), ×1.39 with (a1) and (c)). The kernel side is shown to work: the 3-bit stream runs at the bus rate. The quality side is the open risk: the literature says plain post-training 3-bit loses 4–7 points on code for 32B Qwen models, so it enters only through rung 2.
 - **1.6× is out of reach of weight formats at one stream.** It would take about 40 ms off a 106 ms step, more than 3-bit everything plus FP8 KV gives (35 ms). Batches of three and four (BACKLOG §19 item 31) and more tokens per step are the levers for the rest.
 - **No-go on 2:4 sparsity:**
