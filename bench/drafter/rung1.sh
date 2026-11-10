@@ -37,8 +37,10 @@ for seed in $SEEDS; do
   srv=$!
   [ -n "${PIDS_FILE:-}" ] && echo $srv >> "$PIDS_FILE"
   for _ in $(seq 1 120); do curl -sf -m 2 "localhost:$PORT/health" > /dev/null && break; sleep 3; done
-  if ! grep -q "drafter head: $want" "$OUT/$label.serve.log"; then
-    echo "rung1: $label: serve log lacks 'drafter head: $want'" >&2; kill $srv; tail --pid=$srv -f /dev/null; exit 3
+  # the full head prints no head line (only a sparse head that failed to load says "drafter head: full")
+  if { [ $want = sparse ] && ! grep -q "drafter head: sparse" "$OUT/$label.serve.log"; } || \
+     { [ $want = full ] && grep -q "drafter head: sparse" "$OUT/$label.serve.log"; }; then
+    echo "rung1: $label: serve log does not show the $want head" >&2; kill $srv; tail --pid=$srv -f /dev/null; exit 3
   fi
   (cd "$REPLAY_DIR" && python3 -I "$REPLAY_PY" --url "http://127.0.0.1:$PORT" --model "$NAME" \
      --tools tools-capture.json --tools-index tools-index.json --sessions-file set12.txt --window 12 \
