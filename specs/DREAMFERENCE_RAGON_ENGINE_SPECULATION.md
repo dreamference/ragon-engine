@@ -24,6 +24,47 @@ Changes to how the drafter runs (production already uses the NVFP4 build, so its
 
 **An agent-tuned drafter (stretch).** DFlash2 was trained on generic data; Ragon's agent writes tool calls, patches and short status text. The drafter is small (5 layers, ~1.9B parameters) and its training signal is the target's own output, which Ragon already produces every night. A fine-tune on the user's own recorded sessions is feasible on the Spark itself: about 11 GFLOP per training token for the drafter, so 50M tokens are roughly 570 PFLOP, a few hours, plus a few hours of target forward passes to produce the hidden features. Nothing leaves the machine, and the result is specific to how this user's agent works. The fine-tune competes with Night Shift for the same memory and hours, so it runs under the same admission as other night work, on nights with time to spare. The target is acceptance 8 on the replay; it is scheduled after M4 and nothing before it depends on it. A block-16 retrain is the same work with a different block size.
 
+**Where one stream's step goes (measured 2026-11-10).** One sequence, the 16-row tree (block 8 plus 7 alternatives), greedy, `--graphs --pdl`, 400 tokens on a 25.7K-token prompt and on a 2K one, three interleaved runs each on the measuring box: 98.4-98.6 ms per step at 25.7K (draft 9.5, verify 88.2, commit 0.8 host-timed; 4.53 accepted tokens per step on this prompt) and 93.6-93.9 ms at 2K. An nsys node trace with the graphs kept charges each kernel the time it extends the GPU's busy frontier, so overlapped and PDL work owns only what it adds. The floor is the stage's bytes at 257 GB/s.
+
+| Stage or kernel, per step | calls | 25.7K ms | us a call | bytes a call | GB/s | floor ms | gap ms | 2K ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **FFN** | | **42.8** | | | | 37.5 | 5.3 | 42.6 |
+| `ffn_persistent<4>` on 48 blocks (gate, up, SiLU, FP16 copy, down) | 62.3 | 41.3 | 675 | 150.5 MB | 223 | 36.5 | 4.8 | 41.2 |
+| one layer on the stream GEMMs | 1 | 0.6 | 640 | 150.5 MB | 235 | 0.6 | 0.05 | 0.7 |
+| post-attention norms | 63 | 0.8 | 12 | | | | 0.8 | 0.6 |
+| **DeltaNet**: `gdn_persistent` (norm, projections, conv, recurrence, gated norm, out) plus norms | 47.5 | **25.6** | 536 | 121.7 MB | 227 | 22.7 | 2.9 | 25.4 |
+| **Attention** | | **15.7** | | | | 12.9 | 2.8 | 11.0 |
+| `attention_mma`: 7 of 17 key ranges live at 25.7K (28 blocks), 1 at 2K (4 blocks) | 15.8 | 8.2 | 520 | 105 MB | 202 | 6.5 | 1.7 | 3.5 (37 GB/s) |
+| q, k, v stream GEMM | 15.8 | 4.8 | 316 | 73.4 MB | 232 | 4.6 | 0.3 | 4.8 |
+| o stream GEMM | 15.8 | 2.1 | 136 | 31.5 MB | 231 | 2.0 | 0.1 | 2.2 |
+| prepare, norms, combine, gate, add | | 0.6 | | | | | 0.6 | 0.5 |
+| **LM head and top-K** | 1 | **3.2** | 3090 | 0.72 GB | 233 | 2.8 | 0.4 | 3.2 |
+| **Draft** | | **7.9** | | | | ~6.4 | ~1.4 | 7.6 |
+| the drafter's head: the full target head (the sparse head's file absent) | 1 | 3.0 | 3030 | 0.72 GB | 238 | 2.8 | 0.2 | 3.0 |
+| the drafter's layer GEMMs (an estimated 0.9-1.0 GB of its 1.55 GB file a step: MLP 0.75, attention ~0.13, fc and conv projections as NVFP4 copies ~0.1; the selector's codebooks are lookups) | | 3.6 | | ~0.9-1.0 GB, estimated | at the floor within the estimate | ~3.6 | ~0 | 3.5 |
+| conv, FP16 rows, draft attention, top-K, norms, adds | | 1.2 | | | | | 1.2 | 1.1 |
+| **Commit**, beyond its overlap with the draft (recurrence 1.2, conv 0.6, GEMM 0.4) | | **2.2** | | | | 0 | 2.2 | 2.5 |
+| **GPU idle** (host gaps between graphs) | | **0.4** | | | | 0 | 0.4 | 0.4 |
+| **Step** (traced) | | **97.8** | | | | **~82.5** | **~15.3** | **92.6** |
+
+Only the attention core depends on context: going from 25.7K to 2K saves 5.1 ms, all of it there. The megakernel stamps (`RAGON_MK_TIMES=1`) split an FFN layer's 672 us as follows:
+
+- gate and up: 417 us at 240 GB/s;
+- between them and down: 25 us of done flags, SiLU, row maxima and the grid barrier;
+- down: 208 us at 241 GB/s;
+- the tail norm: 20 us.
+
+That leaves the bus idle for 45 us a layer, 2.8 ms per step. A DeltaNet layer takes 532 us against 481 us for its bytes at 240 GB/s. On the chain's blocks the conv (40 us) and the recurrence (93 us) take about as long as in_z on the streaming blocks.
+
+The levers that keep the greedy output bitwise identical, with what each can save per step at 25.7K:
+
+1. *Query rows per attention block* (one kernel round, measured). Instead of 96, a block takes 48, 32 or 16 query rows. A row's keys, ranges and tile order do not depend on its block, and the output was identical in every arm. The change saves 1.0 ms at 2K (4 to 8 live blocks) but costs 0.7 ms at 25.7K, and 8.4 ms at 16 rows. The probable causes, not measured apart: 56 or more live blocks need a second wave at one 67.6 KB block per SM, and each extra block reads its range's keys and values again. Half the stages (48 rows with a single 33.8 KB stage, the same arithmetic) was not tried. It was not kept. Changing the key range's size (`RAGON_ATTN_CHUNK`) is not exact, since it changes the combine, and 2,048 keys is also slower at 25.7K (verify +1.9 ms, 52 live blocks).
+2. *Ship the drafter's sparse head* ([BACKLOG §19.19](./DREAMFERENCE_RAGON_ENGINE_BACKLOG.md)). It is on by default but reads `<drafter>/sparse-head/model.safetensors`, written by `bench/sparse_head/build.py`. Where that file is missing, the drafter runs the full 0.72 GB head (3.0 ms). Its saving, measured in §19.19's rework, not by this job: 1.0 to 1.8 ms per step. It needs no kernel work, only an asset shipped with the drafter. Greedy output is unchanged by construction, because only the proposals change; acceptance can move, which is §19.19's gate.
+3. *FFN layer bubbles.* The ceiling is the 2.8 ms above; about 1 to 1.5 ms is realistic, by keeping weights streaming across the two grid barriers of a layer. This takes more than one round. For comparison, the persistent FFN saves only 0.3 ms over the stream GEMMs (`RAGON_MK_FFN=0`: 98.8 ms).
+4. *Commit and DeltaNet critical path.* Fusing the commit's replay into the next verify could save 1 to 2 ms; without the commit overlap (`RAGON_COMMIT_OVERLAP=0`) the host-timed commit goes from 0.8 to 2.6 ms. Shortening the DeltaNet chain could save about 1 ms. Each takes several rounds.
+
+The verdict: 90 ms at 25.7K is not reachable with exact levers alone. At the 240 GB/s the persistent kernels sustain, the step's bytes alone take about 88 ms. Reaching 90 would mean recovering about 8 of the roughly 10 ms of overhead above that. The exact levers above add up to 4-6 ms at best, which gives about 92-94 ms. The rest needs the low-bit levers of [LOWBIT](./DREAMFERENCE_RAGON_ENGINE_LOWBIT.md): by bytes, NVFP4 attention and DeltaNet projections save about 12.5 ms and an FP8 KV cache about 3.2 ms at 25.7K.
+
 **Exactness.** Under greedy decoding a draft token is accepted only if it equals the target's argmax, so the output is identical to plain decoding; under sampling the accept kernel uses the standard rejection rule with the drafter's probabilities (the lookup branch is a deterministic proposal, probability 1), which preserves the target distribution. The Qwen sampling chain (temperature, top-k 20, top-p, min-p, presence penalty 1.5 in instruct mode) is applied to the target logits before acceptance, so penalties are honoured exactly. The MTP module ships with the model and is kept as a fallback drafter; it is autoregressive and about one layer in size, so it drafts 3–4 tokens at modest cost and is only used if no DFlash2 drafter exists for a checkpoint.
 
 Sources: [DFlash paper, arXiv 2602.06036](https://hyper.ai/ja/papers/2602.06036) · [DFlash2 drafter W8 card](https://huggingface.co/lued/Qwen3.8-27B-DFlash2-W8) · [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) · the simulation in [`bench/lookup_sim.py`](../bench/lookup_sim.py), run on the recorded sessions
