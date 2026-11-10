@@ -20,6 +20,7 @@ Three causes, in order of weight:
 1. **One decoder beside a prime has no hold.** `hold_side` (`src/serve/main.cpp:579-582`) holds the side stream only while `others_decoding(r) >= 2`. When the other small appends have finished, the last decoder runs every step beside a side chunk (223-266 ms against ~100 alone) for the rest of the prime: s3 and s2 above, the two slowest requests of the run. The hold was scoped to two or more decoders to keep the probe's prime unchanged with one decoder (BATCHING §2.2).
 2. **The pairing favours the oldest request.** `run()` gives the turn round-robin (`main.cpp:463`), but `batch_with` (`main.cpp:508-516`) pairs the request whose turn it is with the *first* batchable request in `running_` order. With A, B, C decoding and D prefilling, the turns A, B, C, D form (A,B), (B,A), (C,A) and D's no-op: per three passes A steps 3 times, B twice, C once. With four decoding: A 4, B 2, C 1, D 1 per four passes. The pooled rate is the same as a fair pairing; the slowest conversation's step rate is a third to a half of it. This fits the one fast stream in every four-stream run (W11 `m4w` 27.0 / 33.9 / 37.0 / 60.9; `g16w` 27.3 / 36.9 / 44.2 / 53.9).
 3. **All four decoding is a pair in turn.** `fit = kMaxStreamRows / draft_block` = 32 / 12 = 2. Four decoders cannot exceed half a pass each: 6.37 tokens per step (the run's mean) at 121.7 ms a pair is 26.2 tokens/s each, below the floor however they are scheduled. The phase is short today (1.6-2.3 s of a run, BATCHING §2.2), but its share grows as A shortens the prefill-beside phases.
+   *Stale at 4033b76f (checked 2026-11-10):* `kMaxStreamRows` is 64 (`src/core/kernels.cuh:127`), so `fit` = 64 / 12 = 5 (`src/serve/main.cpp:1029`), and `speculate.cpp:1349-1355` plans each sequence's 16-row tree while the rows left hold the rest: four trees take 64 rows, one pass. The step trace of a four-stream run with the floor on shows passes of four sessions at 64 rows. This cause no longer binds, and design A needed no batching change.
 
 Note on the counters: "beside a prefill" in the request line (`main.cpp:656`) means another request is *mid-prefill*, not that a chunk is in flight, so a held step counts as beside. The trace in §5 separates the two.
 
@@ -88,3 +89,28 @@ All on node-b under `streams_window.sh` (the lock, the production server stopped
 | W-C | the kill test, Nsight on node-c | 1 h (node-c) | whether C enters the current release line |
 
 Order: W-A0 and W-A1 in one slot (no new kernels; the trace and A1 are a day's work), then W-A2, then W-B0 and W-C on node-c beside them, then W-B1. Each merge follows the standing rule: exact, gates green, one stream within noise of main.
+
+## 7. Built: design A (2026-11-10)
+
+`--decode-floor F` (`on` = 36 tokens/s; default 0 = off), `--prefill-max-hold S` (3 s), `--floor-side-chunk N` (1,024). The policy is host-only in `src/serve/floor.hpp`, with tests in `tests/floor_tests.cpp`. Scheduler hooks in `src/serve/main.cpp`:
+- **A1** is the existing fair pairing (`pairing.hpp`). It is on by default when the floor is on (`--fair-pairing` still overrides).
+- **A2**: `side_wait` holds the next side chunk while any other decoding request's trailing rate is below F. The rate is its last 16 steps, measured to now; with fewer than 4 steps a request has no opinion. The hold applies at one decoder or more. A prefill with at most 2,048 tokens left is never held, and a held prefill takes its next chunk after the cap. With the floor on, `--side-share` defaults to 0.
+- **A3**: `side_launch` cuts a long prompt's side chunk to 1,024 tokens while a decoder runs beside it.
+- The request line counts holds, held seconds and why each side chunk went (rate, cap, warm, cut). It also splits the step periods beside a prefill into beside a chunk in flight and beside a held prefill. The step trace gains the kind `floor`.
+- With the floor off, `share_hold` is the old `hold_side` unchanged.
+
+Measured on another node (not node-b; its base numbers are in the table): warm agentlong, `--sessions 4 --batch 4 --max-context 65536`, three interleaved runs per arm, medians.
+
+| | slowest at 4 | pooled at 4 | TTFT median at 4 | slowest at 2 | at 1 |
+|---|---|---|---|---|---|
+| C1 g16w (node-b) | 27.3 | 35.6 | 1.17 s | | |
+| base 4033b76f, same box | 29.0 (29.0-37.9) | 37.1 | 2.02 s | 39.1 | 64.3 |
+| floor 36 | **36.5** (36.4-37.1) | **41.4** | **1.27 s** | **47.9** | 64.2 |
+| floor 42 (one run) | 39.2 | 43.6 | 1.55 s | | |
+
+- Greedy output is identical per conversation, 16/16, at 1, 2 and 4 streams with the floor on.
+- At one stream the step is 103.72 ms against 103.56 (+0.15%).
+- With the floor off and seed 2026 at two streams, the total passes and batched passes equal the base's (814 and 134).
+- `--batch-check` passes, and so does `--interleave-check`: plain, with `--side-prefill 40`, and with `--side-prefill 40 --side-chunk 1024` (new: A3's cut chunk beside a decode). ctest is green (the new `floor` test included), and `tests/server` is green with the floor off and on.
+- Floor 42 lifts the slowest conversation further, but it costs the warm append's TTFT (1.55 s), so `on` stays 36.
+- The floor rides just above F, not well above it: with 1.2 s chunks the host simulation settles at about 0.94 F. A3's shorter chunk makes the hold finer.
