@@ -6,7 +6,7 @@
 //          "side":B}
 //   t        seconds since the trace was opened, at the end of the unit
 //   pass     decode passes run so far (a batched step counts once)
-//   kind     decode | side_launch | side_finish | chunk | hold | yield
+//   kind     decode | side_launch | side_finish | chunk | hold | floor | yield (hold: --side-share; floor: --decode-floor)
 //   turn     the running index whose turn it was
 //   sessions the sessions in the unit (several for a batched step)
 //   rows     the verify rows of each (decode), 0 for a prefill unit
