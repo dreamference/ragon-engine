@@ -37,12 +37,14 @@
 // by the order of its sessions (they bake each one's pointers and the row split) and read each sequence's position
 // from pos_dev_[i]; each sequence's commit graph is its session's, keyed by its slot and accepted count.
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -1384,9 +1386,37 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   // 2. One verify over every sequence's rows, then 3. each sequence's accept. A non-finite row fails only its own
   // sequence: the verify wrote no state of it, its commit is skipped and its session reset.
   for (const StepPlan& sp : plans) std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows + sp.row0);
-  join_commit();  // the previous step's DeltaNet replays, beside this step's draft until here
   bool any_tree = false;
   for (const StepPlan& sp : plans) any_tree = any_tree || sp.tree;
+  // RAGON_MK_GDN_FUSED: every joint verify runs the fused recurrence (its graphs too); it takes the previous step's
+  // pending rows when all their sessions are in it, each at its slot's row of pend_dev_; otherwise join_commit
+  // flushes them first and the counts are 0.
+  const bool fused = gdn_fused_ && n > 1 && !any_tree;
+  gdn_defer_ = fused;  // a tree step commits as before: the next verify is likely a tree too, so beside the draft
+  if (fused) {
+    std::array<int, 2 * kernels::kMaxSeqs> pend{};
+    bool take = gdn_deferred_;
+    for (size_t j = 0; take && j < pend_s_.size(); ++j) {
+      int i = 0;
+      while (i < n && plans[i].s != pend_s_[j]) ++i;
+      take = i < n;
+      if (take) pend[i] = pend_r0_[j], pend[kernels::kMaxSeqs + i] = pend_n_[j];
+    }
+    if (!take) pend = {};
+    // From pageable memory: the copy is staged before the call returns, so pend may go.
+    check(cudaMemcpyAsync(pend_dev_, pend.data(), sizeof(pend), cudaMemcpyHostToDevice, stream_), "pending rows");
+    if (take) {
+      gdn_deferred_ = false;  // this verify replays them
+      ++gdn_fused_verifies_;
+      gdn_fused_seqs_ += static_cast<long long>(pend_s_.size());
+      if ((gdn_fused_verifies_ & (gdn_fused_verifies_ - 1)) == 0)  // the server's log: 1, 2, 4, ...
+        std::fprintf(stderr, "gdn fused: %lld verifies, %lld sequences replayed in them, %lld flushes\n",
+                     gdn_fused_verifies_, gdn_fused_seqs_, gdn_fused_flushes_);
+    }
+  }
+  join_commit();  // the previous step's DeltaNet replays, beside this step's draft until here
+  verify_fused_ = fused;
+  std::unique_ptr<bool, void (*)(bool*)> fused_off(&verify_fused_, [](bool* f) { *f = false; });
   if (graph && !(cascade && !any_tree && !graph_verify)) {
     std::vector<int> ks(n);  // each sequence's top K, and whether it is a tree (a full one: its rows are fixed)
     for (int i = 0; i < n; ++i) ks[i] = 2 * plans[i].K + (plans[i].tree ? 1 : 0);
@@ -1394,6 +1424,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   } else {
     verify_batch_launch(plans, V);
   }
+  fused_off.reset();
   check(cudaStreamSynchronize(stream_), "verify");
   for (size_t i = 0; i < plans.size(); ++i) {
     StepPlan& sp = plans[i];

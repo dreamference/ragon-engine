@@ -1472,6 +1472,40 @@ bool test_batched_state_kernels() {
     ok &= rec;
     std::printf("gdn_recurrent over two sequences in one launch identical to per sequence (states unwritten): %s\n",
                 rec ? "yes ok" : "NO FAIL");
+    // RAGON_MK_GDN_FUSED: the previous step's pending rows replayed inside the verify's recurrence, against the
+    // commit's launch and then the verify's; the second sequence with pending rows and without.
+    for (const int pn1 : {2, 0}) {
+      const int p0[2] = {4, 14}, pn[2] = {3, pn1};
+      float *ra0 = upload(r0), *ra1 = upload(r1), *rb0 = upload(r0), *rb1 = upload(r1), *o3, *o4, *po1, *po2;
+      for (float** q : {&o3, &o4, &po1, &po2}) cudaMalloc(q, size_t(M) * HV * 128 * 4);
+      cudaMemset(po1, 0, size_t(M) * HV * 128 * 4), cudaMemset(po2, 0, size_t(M) * HV * 128 * 4);
+      k::SeqBatch pb;
+      pb.n = 2;
+      for (int s = 0; s < 2; ++s) pb.row0[s] = p0[s], pb.row1[s] = p0[s] + pn[s];
+      pb.row0[2] = pb.row1[1];
+      k::SeqPtrs<float> sa, sbp;
+      sa.p[0] = ra0, sa.p[1] = ra1, sbp.p[0] = rb0, sbp.p[1] = rb1;
+      k::gdn_recurrent_commit_seqs(m2, dg, db, sa, po1, pb, H, HV, nullptr);
+      k::SeqPtrs<const float> sac;
+      sac.p[0] = ra0, sac.p[1] = ra1;
+      k::gdn_recurrent_seqs(m1, dg, db, sac, o3, sb, H, HV, nullptr);
+      std::vector<int> pend(2 * k::kMaxSeqs, 0);
+      for (int s = 0; s < 2; ++s) pend[s] = p0[s], pend[k::kMaxSeqs + s] = pn[s];
+      int* dpend = upload(pend);
+      k::gdn_recurrent_fused_seqs(m1, dg, db, sbp, o4, sb, H, HV, m2, dg, db, dpend, po2, nullptr);
+      const size_t O = size_t(M) * HV * 128;
+      const bool fz = same(download(o3, O).data(), download(o4, O).data(), O * 4) &&
+                      same(download(po1, O).data(), download(po2, O).data(), O * 4) &&
+                      same(download(ra0, SS).data(), download(rb0, SS).data(), SS * 4) &&
+                      same(download(ra1, SS).data(), download(rb1, SS).data(), SS * 4) &&
+                      (pn1 > 0 || same(download(rb1, SS).data(), r1.data(), SS * 4));
+      ok &= fz;
+      std::printf("gdn_recurrent_fused_seqs identical to the commit then the verify (second sequence %d pending): %s\n",
+                  pn1, fz ? "yes ok" : "NO FAIL");
+      for (void* q : {(void*)ra0, (void*)ra1, (void*)rb0, (void*)rb1, (void*)o3, (void*)o4, (void*)po1, (void*)po2,
+                      (void*)dpend})
+        cudaFree(q);
+    }
     for (void* p : {(void*)m1, (void*)m2, (void*)w, (void*)st0, (void*)st1, (void*)tmp, (void*)dg, (void*)db, (void*)rs0,
                     (void*)rs1, (void*)out1, (void*)out2})
       cudaFree(p);
