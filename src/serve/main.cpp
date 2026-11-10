@@ -145,6 +145,9 @@
 #include "serve/kv_policy.hpp"
 #include "serve/pairing.hpp"
 #include "serve/step_trace.hpp"
+#ifdef RAGON_HAS_GRAMMAR
+#include "serve/structured.hpp"
+#endif
 
 namespace ragon::serve {
 namespace {
@@ -308,6 +311,14 @@ struct ServerContext {
   // The token ids that end the thinking span: `</think>`, then the blank line the template puts after it
   // ("\n\n" as one token, or "\n" twice). -1 when the tokenizer has no such single token.
   int think_end = -1, newline = -1, blank_line = -1;
+  // Structured output (stages 2-4; on in a build with RAGON_GRAMMAR unless RAGON_STRUCTURED=0): every route constrains
+  // what the request asks for with a grammar (serve/structured.hpp). Off: those fields are not enforced and no path
+  // changes.
+  bool structured = false;
+#ifdef RAGON_HAS_GRAMMAR
+  std::unique_ptr<grammar::Vocab> grammar_vocab;
+  std::unique_ptr<grammar::Compiler> grammar_compiler;
+#endif
   // How often a streamed request that has produced no token yet is sent a keep-alive (0: never).
   int keepalive_ms = 15000;
   // The repetition stop rule's default (--repetition-detection), and whether /v1/responses reports its stop as a
@@ -366,7 +377,9 @@ struct Job {
   bool lora_upload = false;
   // BATCHING P4d, a request's other choices (`n`): each starts as a fork of this job's session when its prompt is done.
   std::vector<Job> forks;
-  bool fork = false;  // one of those: never continues a session (the identical prompt would wait for its parent)
+  bool fork = false;
+  // Structured output: makes the request's matcher (each choice its own); empty when it asks for no constraint.
+  std::function<std::shared_ptr<TokenConstraint>()> constraint;  // one of those: never continues a session (the identical prompt would wait for its parent)
 };
 
 // P4b (--kv-pages): a prompt whose KV pages (with the two of growth it is admitted with) exceed the whole page pool
@@ -831,6 +844,7 @@ class Scheduler {
       for (Running* e : ended) {
         if (e->side_flight) ctx_.engine->side_abandon();  // its chunk's pass finishes before the session is reused
         ctx_.engine->touch_session(e->job.session);  // the session's clock restarts however the request ended
+        if (ctx_.structured) ctx_.engine->set_constraint(e->job.session, nullptr);  // the matcher ends with it
         release_lora(e->job);
         running_.erase(std::find_if(running_.begin(), running_.end(), [&](const auto& p) { return p.get() == e; }));
       }
@@ -982,6 +996,9 @@ class Scheduler {
   // Whether r's next decode step can join the batch of the kind it would take alone.
   bool batchable_now(const Running& r) const {
     if (r.prefilling) return false;
+    // A constrained speculative turn joins as a drafting sequence (its rows carry their masks); as a rider it steps
+    // alone (riders sample unmasked on the device).
+    if (ctx_.structured && rider(r) && ctx_.engine->constrained(r.job.session)) return false;
     return spec_step(r) ? batchable(r) : ctx_.engine->can_step_batch(r.job.session);
   }
   // The requests that step with r (r first, then the others in running order) while their rows fit one pass;
@@ -1440,6 +1457,9 @@ class Scheduler {
     if (j.req.repetition.on()) r.repeat.emplace(j.req.repetition);
     r.in_think = j.req.reasoning;  // the prompt ends inside <think>
     r.logits = eng.logits();
+    // Structured output: the request's matcher from here to its end, armed after `</think>` when it thinks.
+    if (ctx_.structured)
+      eng.set_constraint(j.session, j.constraint ? j.constraint() : nullptr, j.req.reasoning ? ctx_.think_end : -1);
     // `pending` holds chosen tokens not yet emitted: the first from the prefill's logits, then a
     // speculative step's accepted drafts and its next token, or a plain step's sample.
     r.pending = {eng.sample(r.logits, j.req.sampling, eng.history())};
@@ -1908,6 +1928,12 @@ class Handler : public proxygen::RequestHandler {
           if (t < 0 || t >= ctx_.engine->config().vocab)
             throw std::invalid_argument("prompt token " + std::to_string(t) + " is outside the vocabulary");
       attach_images(job);
+#ifdef RAGON_HAS_GRAMMAR
+      constrain(job);
+    } catch (const grammar::Error& e) {  // the schema or the tools outside the subset: stage 1's code and text
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
+#endif
     } catch (const ImageError& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
       return;
@@ -2163,6 +2189,18 @@ class Handler : public proxygen::RequestHandler {
     scheduler_.submit(std::move(job));
   }
 
+#ifdef RAGON_HAS_GRAMMAR
+  // The request's grammar as the job's constraint (serve/structured.hpp), on every route, when structured output is
+  // on; nothing for a request that asks for none. Throws grammar::Error and std::invalid_argument (both a 400).
+  void constrain(Job& job) {
+    if (!ctx_.structured) return;
+    if (std::optional<grammar::Grammar> g = request_grammar(*ctx_.grammar_compiler, job.req)) {
+      const int words = ctx_.grammar_vocab->words();
+      job.constraint = [g = *g, words] { return std::make_shared<GrammarConstraint>(g, words); };
+    }
+  }
+#endif
+
   // The Responses API, streamed as the event sequence Ragon's agent parses: response.created, then
   // per output item output_item.added, its text deltas and output_item.done, then response.completed.
   void generate_responses() {
@@ -2181,6 +2219,12 @@ class Handler : public proxygen::RequestHandler {
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
       job.prompt = ctx_.tok->encode(job.req.prompt_text);
       attach_images(job);
+#ifdef RAGON_HAS_GRAMMAR
+      constrain(job);
+    } catch (const grammar::Error& e) {  // as on the chat route: stage 1's code and text
+      send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
+      return;
+#endif
     } catch (const ImageError& e) {
       send_json(downstream_, 400, error_body(e.what(), "invalid_request_error", e.code));
       return;
@@ -2724,6 +2768,21 @@ int main(int argc, char** argv) try {
     std::cerr << "repetition stop: blocks of " << ctx.repetition.min_pattern_size << "-" << ctx.repetition.max_pattern_size
               << " tokens repeated " << ctx.repetition.min_count << " times, runs of " << ctx.repetition.max_run << "\n";
   ctx.think_end = tok.token_id("</think>");
+  // Structured output is on by default in a build with RAGON_GRAMMAR (stage 4); RAGON_STRUCTURED=0 turns it off.
+  if (const char* e = std::getenv("RAGON_STRUCTURED"); !(e && std::string(e) == "0")) {
+#ifdef RAGON_HAS_GRAMMAR
+    ctx.grammar_vocab = std::make_unique<ragon::grammar::Vocab>(tok, engine.config().vocab);
+    ctx.grammar_compiler = std::make_unique<ragon::grammar::Compiler>(*ctx.grammar_vocab);
+    ctx.structured = true;
+    std::cerr << "structured output on: response_format, text.format, tool_choice, parallel_tool_calls and custom-tool "
+                 "grammars are enforced (RAGON_STRUCTURED=0 turns it off)\n";
+#else
+    if (e && std::string(e) == "1")
+      std::cerr << "RAGON_STRUCTURED=1 ignored: this build has no grammar library (RAGON_GRAMMAR)\n";
+#endif
+  } else {
+    std::cerr << "structured output off (RAGON_STRUCTURED=0): those fields are read and not enforced\n";
+  }
   {
     const std::vector<int> one = tok.encode("\n"), two = tok.encode("\n\n");
     ctx.newline = one.size() == 1 ? one[0] : -1;

@@ -152,7 +152,7 @@ std::vector<int> accept_tree_greedy(const DraftTree& t, const int* argmax, int& 
     const int x = argmax[u];
     int child = -1;
     for (int c : t.children[u])
-      if (t.token[c] == x) {
+      if (t.token[c] == x && t.live(c)) {
         child = c;
         break;
       }
@@ -172,7 +172,7 @@ std::vector<int> accept_tree_sampled(const DraftTree& t, const std::vector<Dist>
   int u = 0;
   for (;;) {
     int x;
-    if (u < t.E && t.parent[u + 1] == u) {  // a chain row below its end: the chain's next row is its child u + 1
+    if (u < t.E && t.parent[u + 1] == u && t.live(u + 1)) {  // a chain row below its end: its child u + 1
       const int tok = t.token[u + 1];
       double pd = 0;
       for (const auto& [tk, pr] : P[u])
@@ -203,7 +203,7 @@ std::vector<int> accept_tree_sampled(const DraftTree& t, const std::vector<Dist>
     }
     int child = -1;
     for (int c : t.children[u])
-      if (t.token[c] == x && !(u < t.E && c == u + 1)) {
+      if (t.token[c] == x && !(u < t.E && c == u + 1) && t.live(c)) {
         child = c;
         break;
       }

@@ -575,8 +575,8 @@ def test_responses_custom_tool_call_stream(server):
     assert len(finished) == 1 and finished[0]["type"] == "custom_tool_call" and finished[0]["status"] == "completed"
     text = finished[0]["input"]
     assert text == deltas[0]["delta"] == dones[0]["input"] and text.strip()
-    # Free text, not JSON. The dialect is the model's to choose: the grammar is rendered, not enforced
-    # (API §4); which one it wrote is recorded in reports/api-compat-checklist.md, not asserted here.
+    # Free text, not JSON. The grammar is enforced unless RAGON_STRUCTURED=0 (API §4, checked in
+    # test_structured.py); with it off the dialect is the model's to choose, so it is not asserted here.
     assert "hello" in text and not text.lstrip().startswith("{"), text
     assert names.index("response.custom_tool_call_input.delta") < names.index("response.custom_tool_call_input.done")
     completed = evs[-1]["data"]["response"]["output"]
@@ -902,7 +902,7 @@ def test_n_is_honoured_or_refused(server):
     assert status == 400 or len(out["choices"]) == 2
 
 
-@pytest.mark.xfail(reason="response_format is ignored (no structured output)", strict=False)
+@pytest.mark.xfail(reason="response_format is ignored with RAGON_STRUCTURED=0", strict=False)
 def test_response_format_is_honoured_or_refused(server):
     """vllm#38696, vllm#39929: when built, a json_schema must still allow tool calls and must not allow
     unbounded whitespace."""
@@ -919,7 +919,7 @@ def test_response_format_is_honoured_or_refused(server):
         assert status == 400
 
 
-@pytest.mark.xfail(reason="tool_choice 'required' is not enforced", strict=False)
+@pytest.mark.xfail(reason="tool_choice 'required' is not enforced with RAGON_STRUCTURED=0", strict=False)
 def test_tool_choice_required_yields_a_call(server):
     """vllm#38106, sglang#27336: with tool_choice 'required' the answer must be a tool call (and, when a
     grammar enforces it, string values must never contain a stray </parameter)."""

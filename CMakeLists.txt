@@ -181,3 +181,51 @@ add_test(NAME api COMMAND ragon-api-tests)
 add_executable(ragon-admission-tests tests/admission_tests.cpp)
 target_link_libraries(ragon-admission-tests PRIVATE ragon_api)
 add_test(NAME admission COMMAND ragon-admission-tests)
+
+# Structured output, stage 1 (BACKLOG §19.17): the grammar library on the CPU, against the XGrammar prebuilt that
+# scripts/build_xgrammar.sh installs. OFF by default; OFF leaves the build as it was.
+option(RAGON_GRAMMAR "Build the grammar library (structured output) against the XGrammar prebuilt" OFF)
+set(RAGON_XGRAMMAR_PREFIX "$ENV{HOME}/ragon-deps/xgrammar" CACHE PATH "Install prefix of the XGrammar prebuilt")
+if(RAGON_GRAMMAR)
+  if(NOT EXISTS "${RAGON_XGRAMMAR_PREFIX}/lib/libxgrammar.a")
+    message(FATAL_ERROR "RAGON_GRAMMAR: no XGrammar under ${RAGON_XGRAMMAR_PREFIX}; run scripts/build_xgrammar.sh")
+  endif()
+  add_library(xgrammar::xgrammar STATIC IMPORTED)
+  set_target_properties(xgrammar::xgrammar PROPERTIES
+    IMPORTED_LOCATION "${RAGON_XGRAMMAR_PREFIX}/lib/libxgrammar.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${RAGON_XGRAMMAR_PREFIX}/include"
+    INTERFACE_LINK_LIBRARIES Threads::Threads)
+  add_library(ragon_grammar STATIC src/grammar/grammar.cpp src/grammar/json_schema.cpp src/grammar/lark.cpp
+                                   src/grammar/tool_calls.cpp)
+  target_link_libraries(ragon_grammar PUBLIC ragon_tokenizer PRIVATE xgrammar::xgrammar)
+  # ragon-grammar-tests: the tokenizer from RAGON_TOKENIZER_JSON, else the model snapshot in the Hugging Face cache.
+  add_executable(ragon-grammar-tests tests/grammar_tests.cpp)
+  target_link_libraries(ragon-grammar-tests PRIVATE ragon_grammar)
+  add_test(NAME grammar COMMAND ragon-grammar-tests)
+  set_tests_properties(grammar PROPERTIES SKIP_RETURN_CODE 77)
+  # ragon-structured-tests: stage 2's request grammar and constraint (serve/structured.hpp), same tokenizer.
+  add_executable(ragon-structured-tests tests/structured_tests.cpp)
+  target_link_libraries(ragon-structured-tests PRIVATE ragon_grammar ragon_api)
+  add_test(NAME structured COMMAND ragon-structured-tests)
+  set_tests_properties(structured PROPERTIES SKIP_RETURN_CODE 77)
+  # Structured output, stage 2: ragon-serve (RAGON_STRUCTURED=1) and ragon-run constrain decoding with it.
+  foreach(t ragon-serve ragon-run)
+    if(TARGET ${t})
+      target_link_libraries(${t} PRIVATE ragon_grammar)
+      target_compile_definitions(${t} PRIVATE RAGON_HAS_GRAMMAR=1)
+    endif()
+  endforeach()
+  # ragon-grammar-bench: mask cost at the model's vocabulary (not a test).
+  add_executable(ragon-grammar-bench bench/grammar_bench.cpp)
+  target_link_libraries(ragon-grammar-bench PRIVATE ragon_grammar Threads::Threads)
+  # ragon-grammar-fuzz: libFuzzer over the compile front ends and the routes' request bodies, under RAGON_SANITIZE with Clang
+  # (scripts/fuzz_grammar.sh configures and runs it).
+  if(RAGON_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_executable(ragon-grammar-fuzz tests/grammar_fuzz.cpp)
+    target_compile_options(ragon-grammar-fuzz PRIVATE -fsanitize=fuzzer)
+    target_link_options(ragon-grammar-fuzz PRIVATE -fsanitize=fuzzer)
+    target_link_libraries(ragon-grammar-fuzz PRIVATE ragon_grammar ragon_api)
+    target_compile_options(ragon_grammar PRIVATE -fsanitize=fuzzer-no-link)  # coverage for the fuzzer
+    target_compile_options(ragon_api PRIVATE -fsanitize=fuzzer-no-link)
+  endif()
+endif()

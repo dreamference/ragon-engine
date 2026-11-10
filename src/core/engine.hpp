@@ -31,6 +31,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "core/constraint.hpp"
 #include "core/draft_guard.hpp"
 #include "core/drafter.hpp"
 #include "core/kernels.cuh"
@@ -332,6 +333,14 @@ class Engine {
   // i.e. the request's output, as production does (never the prompt's own tokens). Throws
   // NonFiniteLogits if any logit is NaN or inf.
   int sample(const std::vector<float>& logits, const SamplingParams& p, const std::vector<int>& history);
+
+  // Structured output (SPECULATION "Structured output, stage 2"): session i's tokens follow `c` from now on, or
+  // from the first committed `arm_token` (the thinking span's end) when arm_token >= 0; nullptr drops it. While armed,
+  // every sampled token is drawn over the ids `c` allows (sample(), step_batch, speculate()) and every committed token
+  // is accepted into `c`; logprobs still come from the raw logits. A constrained session never joins a speculative
+  // batch (can_batch) and never verifies a tree or a lookup chain. Call between steps, never during one.
+  void set_constraint(int i, std::shared_ptr<TokenConstraint> c, int arm_token = -1);
+  bool constrained(int i) const { return sessions_.at(i).constraint != nullptr; }
 
   // Speculation. `anchor` is the next token, chosen but not yet processed (what step() would take).
   // One step drafts block - 1 tokens, verifies anchor + drafts in one pass, and keeps the anchor and the
@@ -742,7 +751,14 @@ class Engine {
   // The three parts of a speculative step as launch sequences with no host synchronization inside, so
   // each can be captured into a CUDA graph. Their inputs and outputs on the host side are pin_'s buffers.
   void draft_launch(int B, bool sparse = false);  // pin_->draft_ids -> pin_->cand, pin_->scores
-  void verify_launch(int V, int K, bool tree = false);  // pin_->rows -> each row's top K in pin_->topk_vals / topk_ids
+  void verify_launch(int V, int K, bool tree = false, bool masked = false);  // pin_->rows -> each row's top K in
+                                                    // pin_->topk_vals / topk_ids (masked: under mask_pin_'s rows)
+  // Structured output: whether session s's next sampled token is constrained, the masked draw from a full row, and
+  // the commit of a chosen token (arms the constraint at the arm token, else accepts into it; ConstraintError when
+  // the grammar refuses it).
+  bool constraint_armed(const Session& s) const;
+  int sample_constrained(Session& s, std::span<const float> logits, const SamplingParams& p, std::span<const int> output);
+  void constraint_advance(Session& s, int token);
   void commit_launch(int row0, int n);  // the anchor and n - 1 accepted drafts into the recurrent state and drafter KV
   // One sequence's part of a speculative step on the host (speculate.cpp): its proposal, the drafted rows and
   // the draft's distribution, then the accept.
@@ -754,6 +770,8 @@ class Engine {
   // BACKLOG 26: the chain and its tree (scores: this sequence's), when the step takes one and it is full and worth its
   // rows; desc gets its description.
   void plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc);
+  void plan_fixed(StepPlan& sp);
+  void plan_mask_rows(StepPlan& sp, int row0, int rows);  // a batch's constrained sequence: its mask rows  // structured output: a lookup chain's masks and cut (after its padding)
   void plan_accept(StepPlan& sp, const float* vals, const int* ids);  // rows' top K -> accepted, next
   void plan_gather(StepPlan& sp);                                     // a tree's accepted path to the first rows
   void plan_count(StepPlan& sp);                               // the session's counters and shadow records
@@ -817,6 +835,12 @@ class Engine {
     int lora_slot[kernels::kMaxSeqs];          // the step's sequences' adapter slots (-1: the base), for lora_seq_dev_
   };
   StepPinned* pin_ = nullptr;
+  // Structured output: page-locked mask rows for a verify [kMaxStreamRows][mask_words_] (a graph's memcpy node reads
+  // them), their device copy, and one row for the host draws. Allocated by the first set_constraint, kept after.
+  int32_t* mask_pin_ = nullptr;
+  int32_t* mask_dev_ = nullptr;
+  int mask_words_ = 0;
+  std::vector<int32_t> mask_host_;
 
   // ---- LoRA (LORA §3). ----
   // The pool: per slot one device buffer of lora_slot_bytes_ for the adapter's A and B, and the descriptor table
@@ -1072,6 +1096,13 @@ class Engine {
     double sh_acc_ema = -1;
     std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
     std::map<int, cudaGraphExec_t> tree_verify_graphs;  // a tree verify's, by top-K
+    // Structured output: a verify under token masks, by 2 x top-K + 1 for a tree.
+    std::map<int, cudaGraphExec_t> masked_verify_graphs;
+    // Structured output (set_constraint): the request's constraint, the token that arms it (-1: armed from the
+    // start) and whether it is armed.
+    std::shared_ptr<TokenConstraint> constraint;
+    int arm_token = -1;
+    bool armed = false;
     kernels::GatherBuf* gather = nullptr;  // the buffers a tree's accepted path is gathered in (device)
     int ngather = 0;
     std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1

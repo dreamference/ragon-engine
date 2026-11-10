@@ -42,7 +42,11 @@ struct DraftTree {
   std::vector<int> parent, depth, token, pick;  // per row; pick: the node's candidate index at its position
   std::vector<std::vector<int>> children;       // per row, in row order
   double extra_mass = 0;                        // the extra nodes' path probabilities, summed (their expected tokens)
+  // Structured output (walk_tree): per row, a node the grammar refuses or one after the grammar's end; the accept
+  // rules never enter it. Empty: none (an unconstrained tree).
+  std::vector<char> dead;
   int rows() const { return static_cast<int>(parent.size()); }
+  bool live(int r) const { return dead.empty() || !dead[r]; }
 };
 
 // The chain (chain_tokens[e], chain_picks[e] for e < E), then shape.nodes extra nodes. cand [E][K16] and scores

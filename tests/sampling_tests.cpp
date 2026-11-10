@@ -143,6 +143,91 @@ int main() {
     const std::vector<int> three = {3};
     EXPECT(ragon::sample_logits(neg, rep, three, rng) == 4);
   }
+  // Structured output's host path (sample_logits_masked): never an id the mask refuses; all ones is sample_logits
+  // draw for draw; greedy ties go to the lower allowed id; a mask allowing nothing throws ConstraintError; and the
+  // masked top-K check counts the empty tail.
+  {
+    const int V = 1000, W = (V + 31) / 32;
+    std::mt19937_64 gen(77);
+    std::normal_distribution<float> n(0.f, 2.f);
+    std::vector<int32_t> ones(W, -1);
+    for (int trial = 0; trial < 300; ++trial) {
+      std::vector<float> l(V);
+      for (float& x : l) x = std::round(n(gen) * 8.f) / 8.f;  // ties
+      std::vector<int32_t> mask(W, 0);
+      const int allowed = 1 + trial % 40;
+      std::vector<int> ids;
+      for (int i = 0; i < allowed; ++i) {
+        const int id = int(gen() % V);
+        mask[id >> 5] |= int32_t(1u << (id & 31));
+      }
+      for (int id = 0; id < V; ++id)
+        if (ragon::mask_allows(mask.data(), id)) ids.push_back(id);
+      SamplingParams p;
+      p.temperature = trial % 3 == 0 ? 0.f : 0.8f;
+      p.top_k = trial % 2 ? 20 : 0;
+      p.top_p = trial % 5 == 0 ? 0.9f : 1.f;
+      p.presence_penalty = trial % 7 == 0 ? 1.f : 0.f;
+      const std::vector<int> out = {ids[0], 3, 5};
+      std::mt19937_64 r1(trial), r2(trial + 1000);
+      for (int draw = 0; draw < 20; ++draw) {
+        const int t = ragon::sample_logits_masked(l, p, out, r1, mask.data());
+        EXPECT(ragon::mask_allows(mask.data(), t));
+      }
+      if (p.temperature == 0.f && p.presence_penalty == 0.f) {
+        int best = ids[0];
+        for (int id : ids)
+          if (l[id] > l[best]) best = id;
+        EXPECT(ragon::sample_logits_masked(l, p, out, r1, mask.data()) == best);
+      }
+      std::mt19937_64 r3(trial + 1000);
+      for (int draw = 0; draw < 5; ++draw)
+        EXPECT(ragon::sample_logits_masked(l, p, out, r2, ones.data()) == ragon::sample_logits(l, p, out, r3));
+    }
+    std::vector<float> l(V, 1.f);
+    std::vector<int32_t> none(W, 0);
+    SamplingParams g;
+    bool threw = false;
+    try {
+      ragon::sample_logits_masked(l, g, {}, gen, none.data());
+    } catch (const ragon::ConstraintError&) {
+      threw = true;
+    }
+    EXPECT(threw);
+    // A disallowed NaN still trips the finiteness guard: the logits are checked before the mask.
+    l[7] = std::numeric_limits<float>::quiet_NaN();
+    std::vector<int32_t> only0(W, 0);
+    only0[0] = 1;
+    threw = false;
+    try {
+      ragon::sample_logits_masked(l, g, {}, gen, only0.data());
+    } catch (const NonFiniteLogits&) {
+      threw = true;
+    }
+    EXPECT(threw);
+    // topk_rows_masked's row: valid entries, then (-FLT_MAX, 0x7fffffff) padding.
+    const std::vector<float> v3 = {2.f, 1.f, -FLT_MAX, -FLT_MAX};
+    const std::vector<int> i3 = {4, 9, 0x7fffffff, 0x7fffffff};
+    EXPECT(ragon::require_finite_topk_masked(v3, i3, V) == 2);
+    const std::vector<float> pad = {-FLT_MAX, -FLT_MAX};
+    const std::vector<int> padi = {0x7fffffff, 0x7fffffff};
+    threw = false;
+    try {
+      ragon::require_finite_topk_masked(pad, padi, V);
+    } catch (const NonFiniteLogits&) {
+      threw = true;
+    }
+    EXPECT(threw);
+    const std::vector<float> gap = {2.f, -FLT_MAX, 1.f};
+    const std::vector<int> gapi = {4, 0x7fffffff, 9};
+    threw = false;
+    try {
+      ragon::require_finite_topk_masked(gap, gapi, V);
+    } catch (const NonFiniteLogits&) {
+      threw = true;
+    }
+    EXPECT(threw);
+  }
   std::printf(failures ? "%d SAMPLING TEST FAILURES\n" : "all sampling tests passed\n", failures);
   return failures ? 1 : 0;
 }

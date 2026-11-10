@@ -69,10 +69,19 @@ json production_messages(const json& messages) {
 // tool_choice keeps only that tool. Only `function` tools are offered on this route: any other type (a
 // Responses `custom` tool sent to chat completions) is dropped, as the vLLM-compatible surface has no
 // other kind (the Responses route converts custom tools before reaching here).
+// The tool a named `tool_choice` fixes: chat's `{"type": "function", "function": {"name"}}`, or the Responses
+// shape `{"type": "function" | "custom", "name"}`; empty for "auto", "required", "none" and anything else.
+std::string named_tool(const json& tool_choice) {
+  if (!tool_choice.is_object()) return {};
+  if (tool_choice.contains("function") && tool_choice["function"].is_object() &&
+      tool_choice["function"].contains("name") && tool_choice["function"]["name"].is_string())
+    return tool_choice["function"]["name"].get<std::string>();
+  if (tool_choice.contains("name") && tool_choice["name"].is_string()) return tool_choice["name"].get<std::string>();
+  return {};
+}
+
 json canonical_tools(const json& tools, const json& tool_choice) {
-  std::string only;
-  if (tool_choice.is_object() && tool_choice.contains("function") && tool_choice["function"].is_object())
-    only = tool_choice["function"].value("name", "");
+  const std::string only = named_tool(tool_choice);
   json out = json::array();
   for (const json& t : tools) {
     if (!t.is_object()) continue;
@@ -90,6 +99,14 @@ json canonical_tools(const json& tools, const json& tool_choice) {
     out.push_back(json{{"type", "function"}, {"function", fn}, {"defer_loading", defer}});
   }
   return out;
+}
+
+// `response_format` when it asks for JSON (type json_object or json_schema); any other type (`text`) leaves none.
+void read_response_format(const json& body, Request& r) {
+  if (!body.contains("response_format") || !body["response_format"].is_object()) return;
+  const json& rf = body["response_format"];
+  const json type = rf.contains("type") ? rf["type"] : json();
+  if (type == "json_object" || type == "json_schema") r.response_format = rf;
 }
 
 }  // namespace
@@ -286,6 +303,12 @@ Request parse_request(const json& body, bool chat, bool vision) {
     }
     if (body.contains("tools") && body["tools"].is_array() && body.value("tool_choice", json("auto")) != "none")
       r.tools = canonical_tools(body["tools"], body.contains("tool_choice") ? body["tool_choice"] : json("auto"));
+    read_response_format(body, r);
+    const json tool_choice = body.contains("tool_choice") ? body["tool_choice"] : json("auto");
+    r.tool_choice_required = tool_choice == "required";
+    r.tool_choice_named = named_tool(tool_choice);
+    if (body.contains("parallel_tool_calls") && body["parallel_tool_calls"].is_boolean())
+      r.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
     if (vision) opts.images = &r.image_urls;
     r.prompt_text = render_chat(production_messages(body["messages"]), r.tools, opts);
     r.reasoning = !opts.enable_thinking.has_value() || *opts.enable_thinking;
@@ -297,6 +320,7 @@ Request parse_request(const json& body, bool chat, bool vision) {
     else if (p.is_array() && p.size() == 1 && p[0].is_string()) r.prompt_text = p[0];
     else throw std::invalid_argument("prompt must be a string or a list of token ids");
     r.reasoning = false;
+    read_response_format(body, r);
   }
   if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
     r.session_key = body["prompt_cache_key"].get<std::string>();
@@ -829,16 +853,18 @@ Request parse_responses_request(const json& body, bool vision) {
   chat["messages"] = final_messages;
   json tools = json::array();
   std::vector<std::string> custom;
+  std::vector<Request::CustomFormat> formats;
   if (body.contains("tools") && body["tools"].is_array()) {
-    for (const json& t : body["tools"]) {
+    for (std::size_t i = 0; i < body["tools"].size(); ++i) {
+      const json& t = body["tools"][i];
       if (!t.is_object()) continue;
       const std::string type = t.value("type", "");
       if (type == "custom") {
         // A custom (freeform) tool, as Codex offers apply_patch under some model families: the model has
         // no freeform format, so it is offered as a function with the one string parameter `input`. Its
         // description is rendered with the grammar from `format` appended (without it the model wrote a
-        // unified diff where apply_patch's syntax was wanted, 2026-11-01); the grammar is not enforced
-        // (API §4).
+        // unified diff where apply_patch's syntax was wanted, 2026-11-01). A `grammar` format (Lark or regex) is
+        // also enforced on the input (serve/structured.hpp, API §4).
         json fn = {{"name", t.value("name", "")}};
         std::string description = t.contains("description") && t["description"].is_string() ? t["description"] : "";
         if (t.contains("format") && t["format"].is_object() && t["format"].value("type", "") == "grammar" &&
@@ -847,6 +873,12 @@ Request parse_responses_request(const json& body, bool vision) {
           description += (description.empty() ? "" : "\n\n") + std::string("The input must follow this ") +
                          (syntax.empty() ? "" : syntax + " ") + "grammar:\n" + t["format"]["definition"].get<std::string>();
         }
+        if (t.contains("format") && t["format"].is_object() && t["format"].value("type", "") == "grammar")
+          formats.push_back({t.value("name", ""), t["format"].contains("syntax") && t["format"]["syntax"].is_string()
+                                                      ? t["format"]["syntax"].get<std::string>() : std::string(),
+                             t["format"].contains("definition") && t["format"]["definition"].is_string()
+                                 ? t["format"]["definition"].get<std::string>() : std::string(),
+                             static_cast<int>(i)});
         fn["description"] = description.empty() ? json() : json(description);
         json prop = json::object();
         prop["type"] = "string";
@@ -871,8 +903,10 @@ Request parse_responses_request(const json& body, bool vision) {
     }
   }
   if (!tools.empty() && body.value("tool_choice", json("auto")) != "none") chat["tools"] = tools;
+  // tool_choice in either shape (named_tool reads both) and parallel_tool_calls as chat reads them.
   for (const char* k : {"model", "stream", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
-                        "repetition_penalty", "seed", "stop", "chat_template_kwargs", "repetition_detection"})
+                        "repetition_penalty", "seed", "stop", "chat_template_kwargs", "repetition_detection",
+                        "tool_choice", "parallel_tool_calls"})
     if (body.contains(k)) chat[k] = body[k];
   if (body.contains("max_output_tokens") && body["max_output_tokens"].is_number()) chat["max_tokens"] = body["max_output_tokens"];
   if (body.contains("reasoning") && body["reasoning"].is_object() && body["reasoning"].contains("effort") &&
@@ -888,6 +922,23 @@ Request parse_responses_request(const json& body, bool vision) {
   Request r = parse_request(chat, true, vision);
   r.workload = workload_of(body);  // both carriers sit on the Responses body, which `chat` does not copy
   r.custom_tools = std::move(custom);
+  if (!r.tools.empty()) r.custom_formats = std::move(formats);
+  // `text.format` (json_schema with a flat `schema`, json_object; `text` asks for nothing) as a response_format.
+  if (body.contains("text") && body["text"].is_object() && body["text"].contains("format") &&
+      body["text"]["format"].is_object()) {
+    const json& f = body["text"]["format"];
+    const std::string type = f.contains("type") && f["type"].is_string() ? f["type"].get<std::string>() : "";
+    if (type == "json_object") {
+      r.response_format = json{{"type", "json_object"}};
+    } else if (type == "json_schema") {
+      json js = json::object();
+      if (f.contains("schema")) js["schema"] = f["schema"];
+      if (f.contains("name")) js["name"] = f["name"];
+      if (f.contains("strict")) js["strict"] = f["strict"];
+      r.response_format = json{{"type", "json_schema"}, {"json_schema", js}};
+    }
+    r.response_format_param = "text.format.schema";
+  }
   if (body.contains("prompt_cache_key") && body["prompt_cache_key"].is_string())
     r.session_key = body["prompt_cache_key"].get<std::string>();
   return r;
