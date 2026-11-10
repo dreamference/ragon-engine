@@ -176,12 +176,13 @@ struct EngineOptions {
   int tree_max_depth = 1000;
   int tree_chain = 8;        // the chain's length within the block (the block's later positions hold tree nodes)
   double tree_min_mass = 0;  // a step whose extra nodes' summed path probability is below this verifies the chain alone
-  // Wider and batched trees (BACKLOG 26, BATCHING 5.1), both off by default. tree_rows > 0: a one-stream step (and a
-  // batch with one drafting sequence) verifies a tree of this many rows in place of the chain + tree_nodes default
-  // (RAGON_TREE_ROWS). tree_batch_rows[n - 2] > 0: a batch of n drafting sequences (2 to 4) gives each a tree of this
+  // Wider and batched trees (BACKLOG 26, BATCHING 5.1). tree_rows > 0: a one-stream step (and a batch with one
+  // drafting sequence) verifies a tree of this many rows in place of the chain + tree_nodes default (RAGON_TREE_ROWS;
+  // 24 by default since the 2026-11-10 integration, 0 restores the 16-row default). tree_batch_rows[n - 2] > 0 (off by
+  // default): a batch of n drafting sequences (2 to 4) gives each a tree of this
   // many rows, wherever it fits the tier, independent of the one-stream shape (RAGON_TREE_BATCH=R2,R3,R4, or 1 for
   // 24,16,16). 0: as tree_nodes.
-  int tree_rows = 0;
+  int tree_rows = 24;
   int tree_batch_rows[3] = {0, 0, 0};
   // BACKLOG 19: the drafter's context-aware sparse head. "full": the target's whole LM head. "sparse" (the default):
   // per step the drafter scores the fixed list, the session's context vocabulary (the token ids of its prompt and
