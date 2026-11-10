@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -1083,6 +1084,21 @@ size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
 // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
 // 16-key tiles with 3-5 stages were no faster.
 constexpr int kAttnRows = 96, kAttnTk = 32, kAttnNs = 2;
+// RAGON_ATTN_SHARED_RETILE=1: the cascade's shared phase (attention_shared_kernel) with 128 query rows per block, 8 warps,
+// not 96 and 6. 64 verify rows of 6 heads are then 3 row blocks per (KV head, key range), not 4: 96 blocks, two full
+// waves on 48 SMs, where 128 left a third wave two thirds full, and 8 warps fill the 4 sub-partitions evenly (6 put two
+// on two of them, one on the others). Each warp keeps its 16 rows, the tile grid and the key order: the same floats.
+// A third cp.async stage on top (99 KB, the most a block can have) was 0.2 ms a pass slower (2026-11-10).
+constexpr int kAttnSharedRetileRows = 128;
+bool attention_shared_retile() {
+  static const bool on = [] {
+    const char* e = std::getenv("RAGON_ATTN_SHARED_RETILE");
+    const bool v = e && std::atoi(e) != 0;
+    if (v) std::fprintf(stderr, "attention shared retile: %d query rows per block\n", kAttnSharedRetileRows);
+    return v;
+  }();
+  return on;
+}
 
 void prepare_kernels() {
   static bool configured = false;
@@ -1103,6 +1119,12 @@ void prepare_kernels() {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
   check(cudaFuncSetAttribute(attention_shared_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_shared_kernel<kAttnSharedRetileRows, kAttnTk, kAttnNs, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_shared_kernel<kAttnSharedRetileRows, kAttnTk, kAttnNs, true>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
   check(cudaFuncSetAttribute(attention_suffix_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
@@ -1295,6 +1317,8 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
   const int splits = attention_rows_splits(ctx);
   // The first phase: for each group, its rows as one staircase over the ranges below its cut; a range past a smaller
   // group's cut writes an empty partial, which the second phase overwrites.
+  const bool retile = attention_shared_retile() && !q8.on();  // the 128-row kernel has no FP8 KV build: q8 keeps 96
+  const int srows = retile ? kAttnSharedRetileRows : rows;
   AttnGroups gr{};
   gr.g = groups;
   AttnCuts cuts{};
@@ -1308,7 +1332,7 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
       cuts.cut[i] = cut;
       r += b.row0[i + 1] - b.row0[i];
     }
-    gr.blk0[g + 1] = gr.blk0[g] + (r * 6 + rows - 1) / rows;
+    gr.blk0[g + 1] = gr.blk0[g] + (r * 6 + srows - 1) / srows;
     zshared = std::max(zshared, (cut + chunk - 1) / chunk);
   }
   // The second: each sequence's rows over the ranges from the lowest cut's on.
@@ -1319,11 +1343,13 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
     cuts.zbase = std::min(cuts.zbase, cuts.cut[i] / chunk);
   }
   prepare_kernels();
+  constexpr int rr = kAttnSharedRetileRows;
   launch_kernel_pdl(pdl_attention_enabled(), "attention_shared",
-                    q8.on()       ? attention_shared_kernel<rows, tk, ns, false, true>
+                    retile ? (g_attn_bulk ? attention_shared_kernel<rr, tk, ns, true> : attention_shared_kernel<rr, tk, ns, false>)
+                    : q8.on()     ? attention_shared_kernel<rows, tk, ns, false, true>
                     : g_attn_bulk ? attention_shared_kernel<rows, tk, ns, true>
                                   : attention_shared_kernel<rows, tk, ns, false>,
-                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
+                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(srows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
                     splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_suffix",
                     q8.on()       ? attention_suffix_kernel<rows, tk, ns, false, true>

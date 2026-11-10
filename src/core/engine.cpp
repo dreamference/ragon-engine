@@ -707,6 +707,9 @@ Engine::~Engine() {
     std::fprintf(stderr, "commit draft batch: mode %d, %ld passes, %ld rows, %ld per-sequence fallbacks, %ld checked\n",
                  commit_draft_batch_, commit_draft_passes_, commit_draft_rows_, commit_draft_fallbacks_,
                  commit_draft_checked_);
+  if (topk_batch_)
+    std::fprintf(stderr, "topk batch: %ld shared launches covering %ld sequences\n", topk_batch_launches_,
+                 topk_batch_seqs_);
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
   if (pend_free_) cudaEventDestroy(pend_free_);
