@@ -435,6 +435,26 @@ Greedy outputs are sha-identical to the base at every width and rep. At 4 forks 
 
 **Stage 12, the stream GEMM at 33-64 rows: two blocks per tile, four tiles** (2026-11-08). Why the bandwidth falls past 32 rows: every block reads all of x for its rows, M / (4 x tiles) activation bytes from L2 per weight byte, 4 at 32 rows with two tiles and 8 at 64 with P1's two groups; that L2 traffic, not DRAM or the tensor cores (mma.sync m16n8k16 f16 -> f32 peaks at 125.8 TFLOPS here, the old tier used about 44), caps the weight stream. Four tiles halve it, but their warp-reduction buffer (67.5 KB at NT 4) passes the 48 KB of static shared memory, so `stream_gemm_pair_kernel` runs two neighbouring blocks per tile, one per token half (the second weight read hits L2), each with the one-group body and a dynamic reduction buffer, one chunk in flight. Bits are those of the one-group body: same chunk order, same warp reduction. `RAGON_SG64=0` brings back P1's two groups, `RAGON_SG64_PF=2` two chunks in flight. Step GEMMs (17.56 GB, `--bench-groups`) at 32 / 48 / 64 rows: 81.9 / 82.8 / 90.4 ms against 81.5-81.7 / 88.0-88.7 / 101.9-104.1; at 64 rows ffn down 182 GB/s (154-162), lm head 199 (183-186), gate+up 190 (166-173). 32 forks x 2 rows with the flags above, warm rep, ABBA: span / wall 237.4-238.7 / 205.1-205.9 tok/s against 233.5-233.7 / 202.1-202.4, verify 160 ms a step against 164.7, step period 239-240 ms against 244; outputs and step counts identical, the gates held (ctest, `--batch-check paged`, `--fanout-check 32` with the drafter, agentlong 16/16 sha-identical). Rejected on the bench: split-K (changes bits and is slower), more chunks in flight (PF 3 and 4 slower), x a quarter chunk at a time (no gain at 64), pairs with two tiles (no gain), sequential halves (the weights come from DRAM twice).
 
+**Stage 13, the 32-fork step outside DeltaNet, and the drafter commit in one pass** (2026-11-10). With `RAGON_MK_GDN_FUSED=1`, 32 forks x 2 rows with the flags above, the warm span was 256-258 tok/s against SGLang's 294. Where a step goes (RAGON_PROFILE, three runs within 1%, and nsys at exactly 64 verify rows; exclusive ms under PDL):
+
+| stage | ms a step | note |
+|---|---|---|
+| verify, MLP gate/up + down (`stream_gemm_pair`, 64 rows) | 63.5 | ~150-160 GB/s of weights |
+| verify, DeltaNet recurrence (`gdn_recurrent_fused_seqs`) | 46.8 | at its floor |
+| verify, in_proj / o-proj / attention qkv GEMMs | 37.7 | ~93-107 GB/s |
+| verify, cascade shared-prefix attention (`attention_shared`, 16 layers) | 17.6 | 1.1 ms a layer, ~116 GB/s, floor ~0.58 |
+| verify, elementwise (a/b proj, residual add, norms, to-half, gating) | ~13 | |
+| verify, suffix attention and combine; DeltaNet conv; lm head | ~4.5 | |
+| verify pass, total | ~180 | RAGON_PROFILE 179.5-180.4 |
+| sampling: 32 serial per-fork top-k launches | 4.4 | |
+| drafter commit: `draft_materialize` once per fork, each re-reading the fc weight (~65 MB) | 17 | 736 kernels |
+| drafter forward | 17 | |
+| host gap; DeltaNet conv commit (overlapped) | ~2 | |
+
+Exact levers, ranked: (1) the drafter commit as one pass over every fork's accepted rows, ~15 ms, one round; (2) a retile of `attention_shared` (each KV chunk is read by four x-blocks), up to ~8 ms, exact only with the split and reduction order kept (`RAGON_ATTN_CHUNK` changes them), several rounds; (3) one top-k launch over all forks' rows, ~4 ms, one round. The rest (elementwise fusions at 1-3 ms each; the 64-row GEMMs' ~35 ms above the weight floor) is small or several rounds.
+
+Lever 1 is `RAGON_COMMIT_DRAFT_BATCH` (off by default; the [CLI](./DREAMFERENCE_RAGON_ENGINE_CLI.md) table): after the batched state commit, `speculate_batch` gathers the accepted rows' captures of all sequences into one buffer and runs `draft_materialize_rows` (fc, norm, one k/v GEMM per drafter layer, the `_seqs` rope and store, positions per sequence) instead of 32 per-fork commits. Gates: knob off, ctest 20/20, `--spec-check`, `--batch-check`, `--fanout-check 32`; check mode (`2`, the per-fork commit rerun and the ring slots byte-compared) clean at 8, 16 and 32 forks (16, 32, 64 verify rows; 58 + 59 + 61 passes checked) and under `--batch-check` (498 passes); per-fork shas and step, draft and accept counts identical to the base at 8, 16 and 32 forks (one fork runs the base's path and is identical too). agentlong (16/16 sha-identical) and `--fanout-check` (`step_batch` without speculation) passed with the knob on but took no batched pass, so they do not test the lever. Three interleaved runs at 32 forks, off against on: verify pass unchanged (179.5-180.0 against 178.9-179.9 ms), span under the profiler 212.0-212.7 against 222.5-223.9 tok/s, unprofiled warm span 256.8-258.5 against 275.2-275.6 tok/s (12.25-12.34 s against 11.50-11.51 s, about 14 ms a step over 56 steps; the cold rep 12.6 ms over 61), outputs identical. SGLang: 294. The next levers are (3), one round, and then (2).
+
 ## 6. Phases
 
 Each phase merges into main once its exactness gate passes and nothing regresses (one stream's agentlong tokens/s within noise of main, every earlier gate still green). Expected gains are from §3.1's model and are measured, not assumed, at each gate.

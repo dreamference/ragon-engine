@@ -180,6 +180,11 @@ void Engine::alloc_drafter() {
   }
   cap_stride_ = nfeat * H;
   cap_ = alloc<__nv_bfloat16>(size_t(R) * cap_stride_);
+  if (const char* e = std::getenv("RAGON_COMMIT_DRAFT_BATCH")) commit_draft_batch_ = std::atoi(e);
+  if (commit_draft_batch_ && cap_gather_stride_ < cap_stride_) {  // draft_materialize_rows' gathered rows
+    cap_gather_ = alloc<__nv_bfloat16>(size_t(kernels::kMaxStreamRows) * cap_stride_);
+    cap_gather_stride_ = cap_stride_;
+  }
   // Each session's context KV is a ring (M4 §1): the window, kRingSlack positions of slack, and a commit's rows.
   constexpr int kRingSlack = 6144;
   ring_ = d.sliding_window + kRingSlack + kernels::kMaxSeqRows;
@@ -541,8 +546,9 @@ void Engine::commit(int row0, int n, cudaStream_t st, float* out) {
   }
 }
 
-void Engine::draft_context(int rows, int cap_row0) {
+void Engine::draft_context(int rows, int cap_row0, const __nv_bfloat16* src) {
   const DraftConfig& d = draft_->config();
+  const __nv_bfloat16* x = src ? src : cap_ + size_t(cap_row0) * cap_stride_;  // src: rows gathered elsewhere
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
   // A prefill's rows (quantized_) always take the BF16 GEMM, as the target's projections take the prefill path
@@ -550,13 +556,13 @@ void Engine::draft_context(int rows, int cap_row0) {
   // chunk gives them, or the speculative continuation depends on the chunking (--chunk-check).
   const Fp4Weight& fc4 = draft_->fc4();
   if (!quantized(rows) && fc4.w) {  // BACKLOG 33: the NVFP4 copy on the rows path
-    kernels::bf16_to_half_rows(cap_ + size_t(cap_row0) * cap_stride_, rows, fc4.K, xh_fc_, xinv_, stream_);
+    kernels::bf16_to_half_rows(x, rows, fc4.K, xh_fc_, xinv_, stream_);
     kernels::stream_gemm_nvfp4(xh_fc_, xinv_, rows, fc4.w, fc4.table, fc4.scale2, dctx_, fc4.N, fc4.K, stream_);
   } else if (!quantized(rows))
-    kernels::bf16_rows_bf16in(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
+    kernels::bf16_rows_bf16in(x, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                               stream_);
   else
-    kernels::gemm_bf16(cap_ + size_t(cap_row0) * cap_stride_, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
+    kernels::gemm_bf16(x, rows, draft_->fc().w, dctx_, d.hidden, cap_stride_,
                        stream_);
   kernels::rmsnorm(dctx_, draft_->hidden_norm(), dctx_, rows, d.hidden, d.eps, false, stream_);
 }
@@ -616,6 +622,105 @@ void Engine::draft_materialize_seqs(std::span<Session* const> seqs) {
     }
     kernels::draft_store_kv_seqs(dk_, dv_, dkv, kc, vc, ring_, sb, stream_);
   }
+}
+
+bool Engine::draft_materialize_rows(std::span<Session* const> seqs, std::span<const int> row0,
+                                    std::span<const int> rows) {
+  const int n = static_cast<int>(seqs.size());
+  if (n == 0 || n > kernels::kMaxSeqs || !cap_gather_) return false;
+  int K = 0;
+  for (int i = 0; i < n; ++i) {
+    if (rows[i] < 1) return false;
+    K += rows[i];
+  }
+  // One pass: the rows path (<= 64 rows, never quantized) and one drafter's rings (MULTI_DRAFTER §2.3).
+  if (K > kernels::kMaxStreamRows) return false;
+  for (const Session* s : seqs)
+    if (s->drafter != seqs[0]->drafter) return false;
+  bind_session(seqs[0]);
+  if (cap_gather_stride_ < cap_stride_) return false;
+  NvtxRange range("commit");
+  quantized_ = false;
+  const DraftConfig& d = draft_->config();
+  const int dkv = d.kv_heads * d.head_dim;
+  kernels::SeqBatch sb;
+  sb.n = n;
+  for (int i = 0, at = 0; i < n; at += rows[i], ++i) {
+    sb.row0[i] = at;
+    sb.pos[i] = seqs[static_cast<size_t>(i)]->pos;
+    sb.rdelta[i] = seqs[static_cast<size_t>(i)]->rope_delta;
+    sb.row0[i + 1] = at + rows[i];
+  }
+  // Sequence i's accepted rows (cap_ rows row0[i] ..) become the rows sb.row0[i] .. of one contiguous block; runs that
+  // are already adjacent in cap_ go as one copy.
+  for (int i = 0; i < n;) {
+    int j = i + 1;
+    while (j < n && row0[j] == row0[j - 1] + rows[j - 1]) ++j;
+    check(cudaMemcpyAsync(cap_gather_ + size_t(sb.row0[i]) * cap_stride_, cap_ + size_t(row0[i]) * cap_stride_,
+                          size_t(sb.row0[j] - sb.row0[i]) * cap_stride_ * sizeof(__nv_bfloat16),
+                          cudaMemcpyDeviceToDevice, stream_),
+          "commit gather");
+    i = j;
+  }
+  // Every step of the rows path is row-invariant (as in draft_materialize_seqs), so the ring slots come out as each
+  // sequence's draft_materialize(rows[i], pos_i, row0[i]) leaves them (RAGON_COMMIT_DRAFT_BATCH=2 compares them).
+  draft_context(K, 0, cap_gather_);
+  const kernels::LoraRows lrows = lora_draft_rows(seqs, rows);
+  kernels::LoraOuts kv;
+  kv.y[1] = dk_;
+  kv.y[2] = dv_;
+  kv.ld[1] = kv.ld[2] = dkv;
+  for (int l = 0; l < d.layers; ++l) {
+    const DraftLayer& L = draft_->layers()[l];
+    linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, K);
+    lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, K, kv);
+    kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
+    kernels::SeqPtrs<__nv_bfloat16> kc, vc;
+    for (int i = 0; i < n; ++i) {
+      kc.p[i] = seqs[static_cast<size_t>(i)]->dkc[l];
+      vc.p[i] = seqs[static_cast<size_t>(i)]->dvc[l];
+    }
+    kernels::draft_store_kv_seqs(dk_, dv_, dkv, kc, vc, ring_, sb, stream_);
+  }
+  commit_draft_passes_ += 1;
+  commit_draft_rows_ += K;
+  if (commit_draft_batch_ < 2) return true;
+  // RAGON_COMMIT_DRAFT_BATCH=2: the ring slots just written, then each sequence's own commit over them; they must match
+  // byte for byte.
+  const size_t slot_bytes = size_t(dkv) * sizeof(__nv_bfloat16);
+  auto ring_rows = [&](std::vector<unsigned char>& out) {
+    out.resize(size_t(K) * d.layers * 2 * slot_bytes);
+    size_t o = 0;
+    for (int i = 0; i < n; ++i)
+      for (int l = 0; l < d.layers; ++l)
+        for (int r = 0; r < rows[i]; ++r) {
+          const size_t slot = size_t((sb.pos[i] + r) % ring_) * dkv;
+          check(cudaMemcpyAsync(out.data() + o, seqs[static_cast<size_t>(i)]->dkc[l] + slot, slot_bytes,
+                                cudaMemcpyDeviceToHost, stream_), "commit check");
+          check(cudaMemcpyAsync(out.data() + o + slot_bytes, seqs[static_cast<size_t>(i)]->dvc[l] + slot, slot_bytes,
+                                cudaMemcpyDeviceToHost, stream_), "commit check");
+          o += 2 * slot_bytes;
+        }
+    check(cudaStreamSynchronize(stream_), "commit check");
+  };
+  std::vector<unsigned char> batched, own;
+  ring_rows(batched);
+  for (int i = 0; i < n; ++i) {
+    bind_session(seqs[static_cast<size_t>(i)]);
+    quantized_ = false;
+    draft_materialize(rows[i], kernels::DevPos(sb.pos[i]).with_rope(sb.rdelta[i], nullptr), row0[i]);
+  }
+  ring_rows(own);
+  if (batched != own) {
+    size_t at = 0;
+    while (batched[at] == own[at]) ++at;
+    throw std::runtime_error("RAGON_COMMIT_DRAFT_BATCH=2: the batched drafter commit differs from the per-sequence one "
+                             "(" + std::to_string(n) + " sequences, " + std::to_string(K) + " rows, first byte " +
+                             std::to_string(at) + ")");
+  }
+  commit_draft_checked_ += 1;
+  bind_session(seqs[0]);
+  return true;
 }
 
 void Engine::linear_draft_kproj(const Bf16Weight& w, const Fp4Weight& w4, const float* x, int M, float* y) {
@@ -1475,13 +1580,31 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     state_batched = !ss.empty() && ss.size() <= size_t(kernels::kMaxSeqs);
     if (state_batched) commit_state_seqs(ss, r0, kk);
   }
+  // RAGON_COMMIT_DRAFT_BATCH (default off): every sequence's drafter context KV in one pass (one fc GEMM and one k/v
+  // GEMM per drafter layer over all the accepted rows) instead of one commit per sequence, each re-reading the fc
+  // weight (eng-fanout-verify-levers lever 1: ~17 ms of a 32-wide step). Falls back when the rows do not fit one pass.
+  bool draft_batched = false;
+  if (commit_draft_batch_ && commit_overlap_) {
+    std::vector<Session*> ss;
+    std::vector<int> r0, kk;
+    for (const StepPlan& sp : plans) {
+      if (sp.failed) continue;
+      ss.push_back(sp.s);
+      r0.push_back(sp.row0);
+      kk.push_back(sp.accepted + 1);
+    }
+    draft_batched = draft_materialize_rows(ss, r0, kk);
+    if (!draft_batched && !ss.empty()) commit_draft_fallbacks_ += 1;
+  }
   for (int i = 0; i < n; ++i) {
     StepPlan& sp = plans[i];
     if (sp.failed) continue;
     const int k = sp.accepted + 1;
     bind_session(sp.s);
     if (commit_overlap_ && !state_batched) commit_state_async(sp.row0, k, graph);
-    if (graph) {
+    if (draft_batched) {
+      // the drafter's context KV is in place (draft_materialize_rows)
+    } else if (graph) {
       // Slot i's commit reads its position from pos_dev_[i] and its rows from row0 (which depends on whether the
       // sequences before it took trees); slot 0's is the one-row step's own commit graph (the same rows, the same
       // position slot).
