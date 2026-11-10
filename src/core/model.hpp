@@ -18,14 +18,14 @@ struct TensorView;
 const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, int N, int K, size_t* bytes);
 // An NVFP4 matrix with its scales as 6-bit codes when they take at most 64 values (B26, kernels.cuh): the coded
 // blob, its 64-byte table and the raw scales for the prefill path, each a device buffer appended to `owned`; else
-// (or with RAGON_SCALE_CODES=0) the raw blob of upload_tiled and no table or scales.
+// (or with RAGON_SCALE_CODES=0, or allow_codes false) the raw blob of upload_tiled and no table or scales.
 struct Fp4Upload {
   const uint8_t* w = nullptr;
   const uint8_t* table = nullptr;
   const uint8_t* scales = nullptr;
 };
 Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N, int K, size_t* bytes,
-                       std::vector<void*>& owned);
+                       std::vector<void*>& owned, bool allow_codes = true);
 
 // BACKLOG 33: a BF16 matrix [N][K] (K a multiple of 16, on the host) rounded to NVFP4 in the checkpoints' layout,
 // bit for bit as bench/quant/drafter_variants.py's nvfp4_codes: the global scale g = amax / (448 * 6), each block of
@@ -75,12 +75,18 @@ struct Fp4Weight {
   int N = 0, K = 0;
 };
 
-// FP8 E4M3 with one FP32 per-tensor scale; `w` is tiled (kernels::retile_fp8).
+// A projection of the attention and DeltaNet mixers. FP8 E4M3 with one FP32 per-tensor scale; `w` is tiled
+// (kernels::retile_fp8). LOWBIT §8 a1: with a checkpoint that stores the projection in NVFP4, fp4 is set and the
+// fields are Fp4Weight's: `w` the tiled NVFP4 blob, table and scales as there, `scale` the global scale (scale2) and
+// in_scale the activations' global scale (the prefill path quantizes them to NVFP4 with dynamic block scales).
 struct Fp8Weight {
   const uint8_t* w = nullptr;
   float scale = 0.f;
   float in_scale = 1.f;  // the activations' static per-tensor scale (input_scale), for the prefill GEMM
   int N = 0, K = 0;
+  bool fp4 = false;
+  const uint8_t* table = nullptr;   // fp4: as Fp4Weight::table
+  const uint8_t* scales = nullptr;  // fp4: as Fp4Weight::scales
 };
 
 struct Bf16Weight {
@@ -125,11 +131,13 @@ class Model {
  private:
   const void* upload(const Checkpoint& ck, const std::string& name, const std::string& dtype);
   float scalar(const Checkpoint& ck, const std::string& name);
-  Fp4Weight fp4(const Checkpoint& ck, const std::string& prefix);
-  Fp8Weight fp8(const Checkpoint& ck, const std::string& prefix);
+  Fp4Weight fp4(const Checkpoint& ck, const std::string& prefix, bool codes = true);
+  Fp8Weight fp8(const Checkpoint& ck, const std::string& prefix, bool codes = true);
   Bf16Weight bf16(const Checkpoint& ck, const std::string& name);
+  Bf16Weight bf16_linear(const Checkpoint& ck, const std::string& prefix);
 
   std::string dir_;
+  std::string prefix_;  // "model.language_model." (the served checkpoint) or "model." (a text-only one)
   ModelConfig cfg_;
   std::vector<LayerWeights> layers_;
   const __nv_bfloat16* embed_ = nullptr;

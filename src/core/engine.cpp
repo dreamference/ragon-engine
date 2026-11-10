@@ -1457,8 +1457,21 @@ void Engine::linear_fp4_multi(std::initializer_list<std::pair<const Fp4Weight*, 
 
 void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, float*>> ws, const float* x, int M,
                               bool x_ready, const kernels::LoraGemm* lora) {
+  const bool fp4 = ws.begin()->first->fp4;  // LOWBIT §8 a1: the checkpoint's projections in NVFP4
+  for (const auto& [w, y] : ws)
+    if (w->fp4 != fp4) throw std::runtime_error("one stream GEMM over FP8 and NVFP4 projections");
+  if (fp4 && lora) throw std::runtime_error("LoRA on NVFP4 projections");
   if (quantized(M)) {
     for (const auto& [w, y] : ws) {
+      if (fp4) {
+        if (!(x_ready && xq_is(w->in_scale, true)))
+          kernels::quant_act_nvfp4(x, M, w->K, w->in_scale, xq_, xsf_, stream_);
+        set_xq(w->in_scale, true);
+        x_ready = true;
+        kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w->w, w->in_scale * w->scale, y, w->N, w->N, w->K, false, stream_,
+                                    w->scales);
+        continue;
+      }
       if (!(x_ready && xq_is(w->in_scale, false))) kernels::quant_act_fp8(x, M, w->K, w->in_scale, xq_, stream_);
       set_xq(w->in_scale, false);
       x_ready = true;
@@ -1472,11 +1485,11 @@ void Engine::linear_fp8_multi(std::initializer_list<std::pair<const Fp8Weight*, 
   kernels::StreamTarget t[4];
   int n = 0, K = 0;
   for (const auto& [w, y] : ws) {
-    t[n++] = {w->w, nullptr, w->scale, y, w->N};
+    t[n++] = {w->w, w->table, w->scale, y, w->N};
     K = w->K;
   }
   if (!x_ready) kernels::to_half_rows(x, M, K, xh_, xinv_, stream_);
-  kernels::stream_gemm_multi(false, xh_, xinv_, M, t, n, K, stream_);
+  kernels::stream_gemm_multi(fp4, xh_, xinv_, M, t, n, K, stream_);
 }
 
 void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool x_ready, const kernels::LoraGemm* lora) {
@@ -1484,6 +1497,13 @@ void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool
   if (!quantized(M)) {
     linear_fp8(w, x, M, t1_);
     kernels::add_inplace(h_, t1_, M * H, stream_);
+    return;
+  }
+  if (w.fp4) {
+    if (lora) throw std::runtime_error("LoRA on NVFP4 projections");
+    if (!(x_ready && xq_is(w.in_scale, true))) kernels::quant_act_nvfp4(x, M, w.K, w.in_scale, xq_, xsf_, stream_);
+    set_xq(w.in_scale, true);
+    kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w.w, w.in_scale * w.scale, h_, H, w.N, w.K, true, stream_, w.scales);
     return;
   }
   if (!(x_ready && xq_is(w.in_scale, false))) kernels::quant_act_fp8(x, M, w.K, w.in_scale, xq_, stream_);
@@ -1530,7 +1550,14 @@ void Engine::linear_bf16_drafter(const Bf16Weight& w, const float* x, int M, flo
 void Engine::linear_fp8(const Fp8Weight& w, const float* x, int M, float* y, bool x_ready) {
   if (!quantized(M)) {
     if (!x_ready) kernels::to_half_rows(x, M, w.K, xh_, xinv_, stream_);
-    kernels::stream_gemm_fp8(xh_, xinv_, M, w.w, w.scale, y, w.N, w.K, stream_);
+    if (w.fp4) kernels::stream_gemm_nvfp4(xh_, xinv_, M, w.w, w.table, w.scale, y, w.N, w.K, stream_);
+    else kernels::stream_gemm_fp8(xh_, xinv_, M, w.w, w.scale, y, w.N, w.K, stream_);
+    return;
+  }
+  if (w.fp4) {
+    kernels::quant_act_nvfp4(x, M, w.K, w.in_scale, xq_, xsf_, stream_);
+    set_xq(w.in_scale, true);
+    kernels::prefill_gemm_nvfp4(xq_, xsf_, M, w.w, w.in_scale * w.scale, y, w.N, w.N, w.K, false, stream_, w.scales);
     return;
   }
   kernels::quant_act_fp8(x, M, w.K, w.in_scale, xq_, stream_);
@@ -1655,16 +1682,16 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     bool post_normed = false;
     bool span_done = false, pre_normed_next = false;  // stage 4 (RAGON_MK_SPAN): this layer's mixer and FFN in one launch
     // --prefill-bf16 (B34): a DeltaNet layer of a prefill takes the BF16 branch below, which runs its own norm.
-    const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_ && !lora_on;
+    const bool bf16_gdn = !L.full && quantized_ && prefill_bf16_ && !lora_on && !L.in_qkv.fp4;
     // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
     // projections (BF16) also read it in FP32.
     // (FP32 too wherever the projections' input scales differ, so the others can quantize it themselves.)
     const bool xn_half =
         pre_normed ? true
         : bf16_gdn ? false
-        : L.full   ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, false,
+        : L.full   ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, L.q.fp4,
                                lora_on || L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
-                   : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
+                   : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, L.in_qkv.fp4, true);
     pre_normed = false;
     // The megakernel's stage 3 (RAGON_MK_ATTN): the whole attention layer of one chain verify as one persistent kernel.
     bool mk_attn = L.full && mk_attn_ > 0 && kv_q8_.empty() && !lora_on && verify && !multi && !quantized_ && xn_half && L.q.K == H &&
@@ -1676,10 +1703,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       p.xinv = xinv_;
       p.M = M;
       p.K = H;
-      p.q = {L.q.w, nullptr, L.q.scale, q_gate_, L.q.N};
-      p.k = {L.k.w, nullptr, L.k.scale, k_, L.k.N};
-      p.v = {L.v.w, nullptr, L.v.scale, v_, L.v.N};
-      p.o = {L.o.w, nullptr, L.o.scale, t1_, L.o.N};
+      p.q = {L.q.w, L.q.table, L.q.scale, q_gate_, L.q.N};
+      p.k = {L.k.w, L.k.table, L.k.scale, k_, L.k.N};
+      p.v = {L.v.w, L.v.table, L.v.scale, v_, L.v.N};
+      p.o = {L.o.w, L.o.table, L.o.scale, t1_, L.o.N};
+      p.fp4 = L.q.fp4;
       p.Hq = c.heads;
       p.Hkv = c.kv_heads;
       p.D = c.head_dim;
@@ -1726,7 +1754,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         lora_site(lrows, li, LoraSite::Qkv, xn_, H, M, outs);
         mark("lora");
       }
-      if (!quantized_) kernels::l2_prefetch_weights(L.o.w, false, false, L.o.N, L.o.K, hint_attn, stream_);
+      if (!quantized_)
+        kernels::l2_prefetch_weights(L.o.w, L.o.fp4, L.o.table != nullptr, L.o.N, L.o.K, hint_attn, stream_);
       mark("attn_proj");
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
       // attention over it.
@@ -1776,7 +1805,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
                                   use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages, kv_q8_of(slot));
         }
       }
-      if (quantized_) {
+      if (quantized_ && !L.o.fp4) {
         kernels::sigmoid_mul_fp8(attn_, gate_, size_t(M) * qsize, L.o.in_scale, xq_, stream_);
         set_xq(L.o.in_scale, false);
         if (lora_on) kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);  // the O site's FP32 input
@@ -1784,7 +1813,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::sigmoid_mul(attn_, gate_, M * qsize, stream_);
       }
       mark("attn_core");
-      linear_fp8_residual(L.o, attn_, M, quantized_, prefill_site(LoraSite::O, attn_, qsize, "attn_proj"));
+      // An NVFP4 o_proj (LOWBIT §8 a1) quantizes the FP32 product itself.
+      linear_fp8_residual(L.o, attn_, M, quantized_ && !L.o.fp4, prefill_site(LoraSite::O, attn_, qsize, "attn_proj"));
       if (lora_on && !quantized_) {
         mark("attn_proj");
         kernels::LoraOuts outs;
@@ -1845,7 +1875,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // verify (BACKLOG 26) too, with the tree conv and the per-path recurrence (on by default since 2026-11-03:
       // -2.2 to -2.6 ms per step with trees at 24K and 59K; RAGON_MK_GDN_TREE=0 gives a tree the graph path's mixer).
       static const bool gdn_tree = !std::getenv("RAGON_MK_GDN_TREE") || std::atoi(std::getenv("RAGON_MK_GDN_TREE")) != 0;
-      bool mk_gdn = mk_gdn_ > 0 && (!lora_on || lora_mk_) && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
+      bool mk_gdn = mk_gdn_ > 0 && (!lora_on || (lora_mk_ && !L.in_qkv.fp4)) && verify && (!tree_ || gdn_tree) && !multi && !quantized_ && xn_half && L.in_a.N == L.in_b.N &&
                     L.in_a.N == c.lin_v_heads;
       if (mk_gdn) {
         const Seg& sg = segs[0];
@@ -1855,9 +1885,10 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         p.xn = xn_;
         p.M = M;
         p.K = H;
-        p.in_qkv = {L.in_qkv.w, nullptr, L.in_qkv.scale, v_pre_[slot], L.in_qkv.N};
-        p.in_z = {L.in_z.w, nullptr, L.in_z.scale, z_, L.in_z.N};
-        p.out = {L.out.w, nullptr, L.out.scale, t1_, L.out.N};
+        p.in_qkv = {L.in_qkv.w, L.in_qkv.table, L.in_qkv.scale, v_pre_[slot], L.in_qkv.N};
+        p.in_z = {L.in_z.w, L.in_z.table, L.in_z.scale, z_, L.in_z.N};
+        p.out = {L.out.w, L.out.table, L.out.scale, t1_, L.out.N};
+        p.fp4 = L.in_qkv.fp4;
         p.wa = L.in_a.w;
         p.wb = L.in_b.w;
         p.a = a_;
@@ -1938,7 +1969,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         linear_fp8_multi({{&L.in_qkv, v_pre_[slot]}}, xn_, M, xn_half);
         check(cudaEventRecord(fork_qkv_, stream_), "fork");
         linear_fp8_multi({{&L.in_z, z_}}, xn_, M, true);
-        kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
+        kernels::l2_prefetch_weights(L.out.w, L.out.fp4, L.out.table != nullptr, L.out.N, L.out.K, hint_gdn, stream_);
         check(cudaStreamWaitEvent(fs, fork_qkv_), "fork");
         check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, fs),
               "verify inputs");
@@ -1967,7 +1998,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         lora_site(lrows, li, LoraSite::Gdn, xn_, H, M, outs);
         mark("lora");
       }
-      if (!quantized_) kernels::l2_prefetch_weights(L.out.w, false, false, L.out.N, L.out.K, hint_gdn, stream_);
+      if (!quantized_)
+        kernels::l2_prefetch_weights(L.out.w, L.out.fp4, L.out.table != nullptr, L.out.N, L.out.K, hint_gdn,
+                                     stream_);
       if (quantized_) {  // tensor cores, row-invariant for any M
         kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
       } else if (L.in_a.N == L.in_b.N) {  // both in one launch
@@ -2055,7 +2088,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
                                  c.lin_v_heads, stream_);
         }
       mark("gdn_recurrent");
-      if (quantized_) {
+      if (quantized_ && !L.out.fp4) {
         kernels::gated_rmsnorm_fp8(core_, z_, L.lin_norm, M * c.lin_v_heads, c.lin_v_dim, c.eps, L.out.in_scale, xq_,
                                    stream_);
         set_xq(L.out.in_scale, false);
@@ -2064,7 +2097,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       } else {
         kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
       }
-      linear_fp8_residual(L.out, normed_, M, quantized_, prefill_site(LoraSite::Out, normed_, Vs, "gdn_proj"));
+      // An NVFP4 out_proj (LOWBIT §8 a1) quantizes the FP32 norm itself.
+      linear_fp8_residual(L.out, normed_, M, quantized_ && !L.out.fp4,
+                          prefill_site(LoraSite::Out, normed_, Vs, "gdn_proj"));
       if (lora_on && !quantized_) {
         mark("gdn_proj");
         kernels::LoraOuts outs;

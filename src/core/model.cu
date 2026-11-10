@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <stdexcept>
 #include <thread>
 
@@ -20,10 +22,32 @@
 namespace ragon {
 namespace {
 
-const std::string kPrefix = "model.language_model.";
+// LOWBIT §8 a1: the activations' global scale of an LM head the checkpoint leaves in BF16 (compressed-tensors'
+// ignore list), which the engine rounds to NVFP4 at load: the served checkpoint's lm_head.input_scale, a calibration of
+// the same final norm's activations. Only the prefill GEMM reads it (the row path takes FP16 activations), and the
+// dynamic E4M3 block scales cover the range around it.
+constexpr float kHeadInScale = 0.02167038805782795f;
+
+float e4m3_value(uint8_t c) {
+  __nv_fp8_e4m3 v;
+  v.__x = c;
+  return static_cast<float>(v);
+}
 
 void check(cudaError_t e, const std::string& what) {
   if (e != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(e));
+}
+
+// A megakernel stage reads one kind of NVFP4 tiles (LOWBIT §8 a1): false when any of a group's NVFP4 projections has
+// more distinct scales than the code table holds, so the whole group uploads raw tiles. FP8 projections do not count.
+bool codable(const Checkpoint& ck, std::initializer_list<std::string> prefixes) {
+  uint8_t table[kernels::kScaleCodes], code_of[256];
+  for (const std::string& p : prefixes) {
+    if (!ck.has(p + ".weight_packed") && ck.get(p + ".weight").dtype != "U8") continue;
+    const TensorView& s = ck.get(p + ".weight_scale");
+    if (!kernels::scale_code_table(s.data, s.bytes, table, code_of)) return false;
+  }
+  return true;
 }
 
 }  // namespace
@@ -68,11 +92,14 @@ ModelConfig ModelConfig::from_file(const std::string& path) {
 Model::Model(const std::string& dir) : dir_(dir) {
   cfg_ = ModelConfig::from_file(dir + "/config.json");
   Checkpoint ck(dir);
-  embed_ = static_cast<const __nv_bfloat16*>(upload(ck, kPrefix + "embed_tokens.weight", "BF16"));
-  final_norm_ = static_cast<const __nv_bfloat16*>(upload(ck, kPrefix + "norm.weight", "BF16"));
+  // The served checkpoint nests the text model under model.language_model.; a text-only one (the all-NVFP4
+  // checkpoint of LOWBIT §8 a1) has it under model.
+  prefix_ = ck.has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
+  embed_ = static_cast<const __nv_bfloat16*>(upload(ck, prefix_ + "embed_tokens.weight", "BF16"));
+  final_norm_ = static_cast<const __nv_bfloat16*>(upload(ck, prefix_ + "norm.weight", "BF16"));
   lm_head_ = fp4(ck, "lm_head");
   for (int i = 0; i < cfg_.layers; ++i) {
-    const std::string p = kPrefix + "layers." + std::to_string(i) + ".";
+    const std::string p = prefix_ + "layers." + std::to_string(i) + ".";
     LayerWeights L;
     L.full = cfg_.full_attention[i];
     L.input_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "input_layernorm.weight", "BF16"));
@@ -81,19 +108,21 @@ Model::Model(const std::string& dir) : dir_(dir) {
     L.up = fp4(ck, p + "mlp.up_proj");
     L.down = fp4(ck, p + "mlp.down_proj");
     if (L.full) {
-      L.q = fp8(ck, p + "self_attn.q_proj");
-      L.k = fp8(ck, p + "self_attn.k_proj");
-      L.v = fp8(ck, p + "self_attn.v_proj");
-      L.o = fp8(ck, p + "self_attn.o_proj");
+      const bool c = codable(ck, {p + "self_attn.q_proj", p + "self_attn.k_proj", p + "self_attn.v_proj", p + "self_attn.o_proj"});
+      L.q = fp8(ck, p + "self_attn.q_proj", c);
+      L.k = fp8(ck, p + "self_attn.k_proj", c);
+      L.v = fp8(ck, p + "self_attn.v_proj", c);
+      L.o = fp8(ck, p + "self_attn.o_proj", c);
       L.q_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "self_attn.q_norm.weight", "BF16"));
       L.k_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "self_attn.k_norm.weight", "BF16"));
     } else {
       const std::string a = p + "linear_attn.";
-      L.in_qkv = fp8(ck, a + "in_proj_qkv");
-      L.in_z = fp8(ck, a + "in_proj_z");
-      L.out = fp8(ck, a + "out_proj");
-      L.in_a = bf16(ck, a + "in_proj_a.weight");
-      L.in_b = bf16(ck, a + "in_proj_b.weight");
+      const bool c = codable(ck, {a + "in_proj_qkv", a + "in_proj_z", a + "out_proj"});
+      L.in_qkv = fp8(ck, a + "in_proj_qkv", c);
+      L.in_z = fp8(ck, a + "in_proj_z", c);
+      L.out = fp8(ck, a + "out_proj", c);
+      L.in_a = bf16_linear(ck, a + "in_proj_a");
+      L.in_b = bf16_linear(ck, a + "in_proj_b");
       L.conv = static_cast<const __nv_bfloat16*>(upload(ck, a + "conv1d.weight", "BF16"));
       L.A_log = static_cast<const __nv_bfloat16*>(upload(ck, a + "A_log", "BF16"));
       L.dt_bias = static_cast<const __nv_bfloat16*>(upload(ck, a + "dt_bias", "BF16"));
@@ -103,6 +132,13 @@ Model::Model(const std::string& dir) : dir_(dir) {
     }
     layers_.push_back(L);
   }
+  int nv = 0, np = 0, coded = 0;
+  for (const LayerWeights& L : layers_)
+    for (const Fp8Weight* w : {&L.q, &L.k, &L.v, &L.o, &L.in_qkv, &L.in_z, &L.out})
+      if (w->w) ++np, nv += w->fp4, coded += w->fp4 && w->table;
+  if (nv)
+    std::fprintf(stderr, "checkpoint: %d of %d mixer projections in NVFP4 (%d scale-coded), %.2f GB on the device\n",
+                 nv, np, coded, bytes_ / 1e9);
 }
 
 Model::~Model() {
@@ -150,14 +186,14 @@ const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, 
 }
 
 Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N, int K, size_t* bytes,
-                       std::vector<void*>& owned) {
+                       std::vector<void*>& owned, bool allow_codes) {
   static const bool codes = [] {
     const char* e = std::getenv("RAGON_SCALE_CODES");
     return !(e && std::atoi(e) == 0);
   }();
   uint8_t table[kernels::kScaleCodes], code_of[256];
   Fp4Upload u;
-  if (!codes || !kernels::scale_code_table(scales.data, scales.bytes, table, code_of)) {
+  if (!codes || !allow_codes || !kernels::scale_code_table(scales.data, scales.bytes, table, code_of)) {
     u.w = upload_tiled(values, &scales, N, K, bytes);
     owned.push_back(const_cast<uint8_t*>(u.w));
     return u;
@@ -248,22 +284,57 @@ Nvfp4Host quantize_nvfp4(const __nv_bfloat16* w, int N, int K) {
   return q;
 }
 
-Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix) {
+// NVFP4 in either naming, the same value and scale layouts (the first value of a byte in its low nibble):
+// modelopt's (.weight U8, .weight_scale, .weight_scale_2, .input_scale) and compressed-tensors' nvfp4-pack-quantized
+// (.weight_packed, .weight_scale, .weight_global_scale = 1 / scale2, .input_global_scale = 1 / the input scale). A BF16
+// .weight (an LM head left unquantized) is rounded to NVFP4 here (quantize_nvfp4).
+Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix, bool codes) {
   Fp4Weight w;
-  const TensorView& t = ck.get(prefix + ".weight");
+  const bool ct = ck.has(prefix + ".weight_packed");
+  const TensorView& t = ck.get(prefix + (ct ? ".weight_packed" : ".weight"));
+  if (!ct && t.dtype == "BF16" && t.shape.size() == 2) {
+    w.N = static_cast<int>(t.shape[0]);
+    w.K = static_cast<int>(t.shape[1]);
+    const Nvfp4Host q = quantize_nvfp4(reinterpret_cast<const __nv_bfloat16*>(t.data), w.N, w.K);
+    TensorView v, s;
+    v.dtype = "U8", v.shape = {w.N, w.K / 2}, v.data = q.values.data(), v.bytes = q.values.size();
+    s.dtype = "F8_E4M3", s.shape = {w.N, w.K / 16}, s.data = q.scales.data(), s.bytes = q.scales.size();
+    const Fp4Upload u = upload_nvfp4(v, s, w.N, w.K, &bytes_, allocations_);
+    w.w = u.w, w.table = u.table, w.scales = u.scales;
+    w.scale2 = q.scale2;
+    w.in_scale = kHeadInScale;
+    std::fprintf(stderr, "checkpoint: %s in BF16, rounded to NVFP4 at load (relative squared error %.3g)\n",
+                 prefix.c_str(), q.rel_sq_error);
+    return w;
+  }
   const TensorView& s = ck.get(prefix + ".weight_scale");
   if (t.dtype != "U8" || s.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not NVFP4");
   w.N = static_cast<int>(t.shape[0]);
   w.K = static_cast<int>(t.shape[1] * 2);
-  const Fp4Upload u = upload_nvfp4(t, s, w.N, w.K, &bytes_, allocations_);
+  const Fp4Upload u = upload_nvfp4(t, s, w.N, w.K, &bytes_, allocations_, codes);
   w.w = u.w, w.table = u.table, w.scales = u.scales;
-  w.scale2 = scalar(ck, prefix + ".weight_scale_2");
-  w.in_scale = scalar(ck, prefix + ".input_scale");
+  if (ct) {
+    w.scale2 = 1.f / scalar(ck, prefix + ".weight_global_scale");
+    w.in_scale = 1.f / scalar(ck, prefix + ".input_global_scale");
+  } else {
+    w.scale2 = scalar(ck, prefix + ".weight_scale_2");
+    w.in_scale = scalar(ck, prefix + ".input_scale");
+  }
   return w;
 }
 
-Fp8Weight Model::fp8(const Checkpoint& ck, const std::string& prefix) {
+// A mixer projection: FP8 (the served checkpoint), or NVFP4 when the checkpoint stores it so (LOWBIT §8 a1).
+Fp8Weight Model::fp8(const Checkpoint& ck, const std::string& prefix, bool codes) {
   Fp8Weight w;
+  if (ck.has(prefix + ".weight_packed") || ck.get(prefix + ".weight").dtype == "U8") {
+    const Fp4Weight f = fp4(ck, prefix, codes);
+    w.w = f.w, w.table = f.table, w.scales = f.scales;
+    w.scale = f.scale2;
+    w.in_scale = f.in_scale;
+    w.N = f.N, w.K = f.K;
+    w.fp4 = true;
+    return w;
+  }
   const TensorView& t = ck.get(prefix + ".weight");
   if (t.dtype != "F8_E4M3") throw std::runtime_error(prefix + ": not FP8");
   w.N = static_cast<int>(t.shape[0]);
@@ -272,6 +343,35 @@ Fp8Weight Model::fp8(const Checkpoint& ck, const std::string& prefix) {
   allocations_.push_back(const_cast<uint8_t*>(w.w));
   w.scale = scalar(ck, prefix + ".weight_scale");
   w.in_scale = scalar(ck, prefix + ".input_scale");
+  return w;
+}
+
+// The DeltaNet's a and b projections ([48][5120]) run in BF16: a BF16 .weight as it is, an NVFP4 one
+// (compressed-tensors) dequantized here, each value E2M1 x E4M3 scale / weight_global_scale rounded to BF16.
+Bf16Weight Model::bf16_linear(const Checkpoint& ck, const std::string& prefix) {
+  if (!ck.has(prefix + ".weight_packed")) return bf16(ck, prefix + ".weight");
+  static constexpr float kE2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                                      -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+  const TensorView& t = ck.get(prefix + ".weight_packed");
+  const TensorView& s = ck.get(prefix + ".weight_scale");
+  if (t.dtype != "U8" || s.dtype != "F8_E4M3" || t.shape.size() != 2) throw std::runtime_error(prefix + ": not NVFP4");
+  Bf16Weight w;
+  w.N = static_cast<int>(t.shape[0]);
+  w.K = static_cast<int>(t.shape[1] * 2);
+  if (s.bytes != size_t(w.N) * (w.K / 16)) throw std::runtime_error(prefix + ": unexpected scale shape");
+  const float g = scalar(ck, prefix + ".weight_global_scale");
+  std::vector<__nv_bfloat16> h(size_t(w.N) * w.K);
+  for (size_t i = 0; i < h.size(); ++i) {
+    const uint8_t b = t.data[i / 2];
+    const float v = kE2M1[i % 2 ? b >> 4 : b & 15] * e4m3_value(s.data[i / 16]);
+    h[i] = __float2bfloat16_rn(v / g);
+  }
+  void* d = nullptr;
+  check(cudaMalloc(&d, h.size() * 2), "cudaMalloc " + prefix);
+  check(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice), "upload " + prefix);
+  allocations_.push_back(d);
+  bytes_ += h.size() * 2;
+  w.w = static_cast<const __nv_bfloat16*>(d);
   return w;
 }
 

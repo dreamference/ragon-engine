@@ -285,6 +285,14 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
   - **Quality:** published as level with the served recipe on five benchmarks; perplexity is the open question.
   - **Effort:** 3–5 days of loader and kernel work plus 1–2 days for the KV.
   - **Before the engine work:** the cheap rungs (the acceptance A/B on SGLang and the KL on agent traces) run first, and SGLang can serve the checkpoint today.
+  - **Built (2026-11-09), opt-in, without FP8 KV; design in §8.1.** Medians of three runs, one stream, the drafter unchanged:
+    - **Weights:** 21.0 → 18.1 GB.
+    - **Step at 25.7K context:** 98.4 → 87.0 ms at 16 rows, 97.0 → 85.4 ms at 48 rows.
+    - **Seeded replay (M0 main set):** about 10.8% faster per step at both seeds (99.1 → 88.4 ms and 99.3 → 88.7 ms). Tokens per step fall 4.3–4.7% (5.57 → 5.31 and 5.47 → 5.23), so decode rises only 6.9% and 7.1% (55.8 → 59.7 and 54.7 → 58.6 tok/s).
+    - **Agentlong, 16 greedy turns:** 105.3 → 94.0 ms per step, 6.75 → 6.60 tokens per step, 64.2 → 70.1 tok/s (+9.3%), wall 383 → 359 s.
+    - **Prefill:** 2,249 → 2,410 tok/s at 25.7K tokens.
+    - **Agent traces (24 prompts, teacher-forced against the served checkpoint):** tool names 72/72 tokens; top-1 flips 1.6%; mean KL 0.008 nats.
+    - **Shortfall:** the ×1.16 is not reached because acceptance does not hold. The drafter was trained on the served checkpoint, so the gap is the case for retraining it on Minima.
 - **1.3× needs (a2) on top** (×1.29 with (a1), ×1.39 with (a1) and (c)). The kernel side is shown to work: the 3-bit stream runs at the bus rate. The quality side is the open risk: the literature says plain post-training 3-bit loses 4–7 points on code for 32B Qwen models, so it enters only through rung 2.
 - **1.6× is out of reach of weight formats at one stream.** It would take about 40 ms off a 106 ms step, more than 3-bit everything plus FP8 KV gives (35 ms). Batches of three and four (BACKLOG §19 item 31) and more tokens per step are the levers for the rest.
 - **No-go on 2:4 sparsity:**
@@ -309,6 +317,44 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
   - This used FP8 layers on 2048-key ranges. A kernel round that issued FP8 tiles two ahead was slower and was dropped.
 - **Memory:** the mirror sits beside the BF16 pool, so this build adds about half a page per sealed page instead of halving it. Pages stored only as FP8 are still to build.
 - **Not run:** the quality gate (flips, gaps, tool names, KL by length, the 32K needles) and the replay acceptance check, because the build stopped at step time first.
+
+### 8.1 (a1) as built: the loader and the tiler (2026-11-09)
+
+**The loader** decides per projection. A projection that carries NVFP4 tensors (compressed-tensors names `weight_packed`, `weight_scale`, `weight_global_scale`, `input_global_scale`, or ModelOpt names `weight`, `weight_scale`, `weight_scale_2`, `input_scale`) loads as NVFP4; any other loads as FP8, as before. A checkpoint without NVFP4 projections takes exactly the old path, so the served checkpoint's bits do not change and the new path is opt-in by checkpoint.
+- On Minima, all 208 mixer projections load as NVFP4: q (with its gate), k, v and o in the 16 full-attention layers, and in_qkv, in_z and out in the 48 DeltaNet layers.
+- `in_proj_a` and `in_proj_b` are dequantized to BF16, because the engine runs them in BF16.
+- The BF16 `lm_head` is rounded to NVFP4 at load, with a relative squared error of 0.009.
+
+**Decode tiles.** The projections stream through `stream_gemm`'s NVFP4 path. Weights use the tiled layout: blocks of 16 rows × 128 values, with 2 tiles per block and 2 chunks in flight per warp, the same launch shape as FP8.
+- **Row buckets:**
+  - up to 8 rows: NT 1;
+  - up to 16 rows: NT 2;
+  - 17–24 rows: NT 3;
+  - up to 32 rows: NT 4;
+  - 33–64 rows: two passes of NT 3 (up to 48 rows) or NT 4.
+- **Two blob kinds:**
+  - A **scale-coded blob** stores each block's E4M3 scales as 6-bit codes into a 64-entry table. That is 1,120 bytes per block, plus a raw copy of the scales (128 bytes per block) for prefill.
+  - A **raw blob** stores the E4M3 scales themselves: 1,152 bytes per block.
+  - The loader codes a matrix only when its scales take at most 64 distinct values.
+- `ragon-stream-tests` checks every row count from 1 to 64 for each mixer shape. Each count's rows are bit for bit the 64-row launch's, and the coded blob's output is bit for bit the raw blob's. One multi launch (q|gate, k, v, or in_qkv, in_z) gives each matrix its own single-launch output.
+
+**Megakernel stages.** The DeltaNet stage (`gdn_persistent`), the attention stage (`attn_persistent`, up to 16 rows) and the DeltaNet-plus-FFN span (`gdn_ffn_persistent`, NT 2 beside a coded FFN) each take a tile kind as a template parameter: 0 FP8, 1 coded NVFP4, 2 raw NVFP4. The stage descriptors carry the scale table, or none for raw tiles.
+- A stage runs one tile kind, and a group that mixes kinds takes the unfused path. So the loader makes each group uniform: {q, k, v, o} per attention layer and {in_qkv, in_z, out} per DeltaNet layer. A group is coded only if all its members code.
+- On Minima, 153 projections are coded and 55 raw. A first build without this rule coded 191, and its mixed groups dropped to the unfused path.
+- `ragon-mk-tests` adds raw-tile cases (attention at 8 and 16 rows, with tail at 12 and 16, and the span at 12 and 16). Each is bit for bit the unfused path's.
+- At 48 rows (`RAGON_TREE=39`), the attention projections run unfused in the 33–64 bucket, as FP8 does.
+
+**Prefill** runs through `prefill_gemm_nvfp4` on the block-scaled tensor cores.
+- **Tiles:** 128 × 256 with 3 stages, or 128 × 128 with 4 stages when the larger tile leaves fewer than two waves.
+- **Activations** are quantized to NVFP4 with the projection's input scale (`quant_act_nvfp4`).
+- **Reads:** the kernel reads the value blocks and the raw scale copy. `o_proj` and `out_proj` quantize their FP32 inputs themselves, and the BF16 DeltaNet prefill is off for NVFP4 layers.
+- **Speed:** 25,723 tokens prefill at 2,410 tokens/s, against 2,249 for the served checkpoint.
+
+**Memory freed and where it goes.**
+- **Weights:** 21.0 GB on the served checkpoint, 18.1 GB on Minima. That is 2.9 GB freed, against the 3.27 GB this study predicts for raw 4.5-bit projections.
+- **Why the gap:** the coded blobs keep the raw scale copy for prefill, which costs 4.875 bits per weight.
+- **The plan:** `plan_memory` sizes weights from the checkpoint's file bytes. `plan_kv_pool` then gives what MemAvailable leaves (after the plan, the prefix store and the reserve) to the KV page pool, up to sessions × max_context. With sessions and context given, the freed bytes stay as host headroom. Auto-sizing (`choose_size`) can turn them into more sessions or a longer context.
+- **Follow-up:** letting prefill read the codes would drop the raw scale copy, about 0.45 GB more.
 
 ## Sources
 
