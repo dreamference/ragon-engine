@@ -290,6 +290,13 @@ void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16
 // The verify's recurrence: each sequence's rows from its own state (read, not written).
 void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<const float> state, float* out,
                         const SeqBatch& b, int H, int HV, cudaStream_t s);
+// The verify's recurrence with the previous step's commit folded in (RAGON_MK_GDN_FUSED): sequence i first replays
+// its pending rows, pend[i] .. pend[i] + pend[kMaxSeqs + i] - 1 of pmixed/pg/pbeta (outputs to the scratch pout), and
+// writes the state they leave; then its verify rows from there, as gdn_recurrent_seqs. Bits are the commit's and the
+// verify's: the same per-row arithmetic in the same order. pend lives on the device (a captured graph reads it).
+void gdn_recurrent_fused_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<float> state, float* out,
+                              const SeqBatch& b, int H, int HV, const float* pmixed, const float* pg, const float* pbeta,
+                              const int* pend, float* pout, cudaStream_t s);
 // A joint commit (BATCHING P4d, Engine::step_batch): gdn_conv_seqs and gdn_recurrent_seqs that also write each
 // sequence's state, as gdn_conv and gdn_recurrent do for one. `mixed` of the conv is overwritten; `out` is scratch.
 void gdn_conv_commit_seqs(float* mixed, SeqPtrs<float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,

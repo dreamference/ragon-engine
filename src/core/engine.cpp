@@ -318,6 +318,19 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
+  if (const char* e = std::getenv("RAGON_MK_GDN_FUSED")) gdn_fused_ = commit_overlap_ && commit_state_batch_ && std::atoi(e);
+  if (gdn_fused_) {
+    pend_dev_ = alloc<int>(2 * kernels::kMaxSeqs);
+    check(cudaMemset(pend_dev_, 0, 2 * kernels::kMaxSeqs * sizeof(int)), "pending rows");
+    check(cudaEventCreateWithFlags(&pend_free_, cudaEventDisableTiming), "pending event");
+    const size_t B = kernels::kMaxStreamRows;
+    for (size_t i = 0; i < s_->gdn.size(); ++i) {  // the commit's kept rows, as v_post_, v_g_ and v_beta_
+      p_post_.push_back(alloc<float>(B * c.lin_conv_channels()));
+      p_g_.push_back(alloc<float>(B * c.lin_v_heads));
+      p_beta_.push_back(alloc<float>(B * c.lin_v_heads));
+    }
+    std::fprintf(stderr, "DeltaNet commit folded into the next verify (RAGON_MK_GDN_FUSED)\n");
+  }
   if (const char* e = std::getenv("RAGON_MK_FFN")) mk_ffn_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_GDN")) mk_gdn_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_ATTN")) mk_attn_ = std::atoi(e);
@@ -466,12 +479,35 @@ void Engine::swap_side() {
 void Engine::join_commit() {
   // A side pass belongs to another session than the step whose commit is pending: it neither reads nor writes
   // that state, so it does not wait (and the main stream's join stays pending).
-  if (!commit_pending_ || side_active_) return;
+  if ((!commit_pending_ && !gdn_deferred_) || side_active_) return;
   // A wait on an event recorded outside a capture cannot be captured: every captured body runs with nothing
   // pending (speculate joins before the verify; the draft and the drafter's context KV never join).
   if (use_dev_pos_) throw std::runtime_error("join_commit inside a step graph's capture");
-  check(cudaStreamWaitEvent(stream_, commit_done_, 0), "join commit");
+  if (commit_pending_) check(cudaStreamWaitEvent(stream_, commit_done_, 0), "join commit");
   commit_pending_ = false;
+  gdn_flush();  // RAGON_MK_GDN_FUSED: a deferred recurrence the next verify did not take
+}
+
+void Engine::gdn_flush() {
+  if (!gdn_deferred_) return;
+  gdn_deferred_ = false;
+  ++gdn_fused_flushes_;
+  const ModelConfig& c = model_->config();
+  kernels::SeqBatch sb;
+  sb.n = static_cast<int>(pend_s_.size());
+  for (int i = 0; i < sb.n; ++i) {
+    sb.row0[i] = pend_r0_[i];
+    sb.row1[i] = pend_r0_[i] + pend_n_[i];
+  }
+  sb.row0[sb.n] = sb.row1[sb.n - 1];
+  for (int li = 0; li < c.layers; ++li) {
+    if (model_->layers()[li].full) continue;
+    const int slot = layer_slot_[li];
+    kernels::SeqPtrs<float> gdn;
+    for (int i = 0; i < sb.n; ++i) gdn.p[i] = pend_s_[i]->gdn[slot];
+    kernels::gdn_recurrent_commit_seqs(p_post_[slot], p_g_[slot], p_beta_[slot], gdn, commit_core_, sb, c.lin_k_heads,
+                                       c.lin_v_heads, stream_);
+  }
 }
 
 // The timings store's summary: per kernel kind, the mean over layers of each stamp's offset from the layer's first
@@ -544,6 +580,9 @@ void Engine::mk_times_report() {
 }
 
 Engine::~Engine() {
+  if (gdn_fused_)
+    std::fprintf(stderr, "gdn fused: %lld verifies, %lld sequences replayed in them, %lld flushes\n",
+                 gdn_fused_verifies_, gdn_fused_seqs_, gdn_fused_flushes_);
   if (mk_ffn_times_ || mk_gdn_times_ || mk_attn_times_) {
     cudaDeviceSynchronize();
     mk_times_report();
@@ -572,6 +611,7 @@ Engine::~Engine() {
   }
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
+  if (pend_free_) cudaEventDestroy(pend_free_);
   for (cudaEvent_t ev : kv_release_ev_)
     if (ev) cudaEventDestroy(ev);
   if (commit_stream_) cudaStreamDestroy(commit_stream_);
@@ -1408,6 +1448,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // A batch with a tree in it (BACKLOG 26) goes sequence by sequence through the state kernels: a tree's rows read
   // their ancestors, which the joint kernels do not know. A segment's tree is its own, its rows counted from its row0.
   const bool joint = multi && verify && std::none_of(segs.begin(), segs.end(), [](const Seg& g) { return g.td; });
+  if (verify_fused_ && !joint) throw std::logic_error("forward: a fused recurrence outside a joint verify");
   auto seg_tree = [&](const Seg& g) { return !verify ? nullptr : g.td ? g.td : tree_; };
   if (segs.size() > static_cast<size_t>(kernels::kMaxSeqs)) throw std::runtime_error("forward: too many sequences");
   kernels::SeqBatch sb;
@@ -1849,6 +1890,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::SeqPtrs<float> st;
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
         kernels::gdn_recurrent_commit_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, c.lin_v_heads, stream_);
+      } else if (joint && verify_fused_) {  // RAGON_MK_GDN_FUSED: the pending commit's rows first
+        kernels::SeqPtrs<float> st;
+        for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];
+        kernels::gdn_recurrent_fused_seqs(mixed, g, beta, st, core_, sb, c.lin_k_heads, c.lin_v_heads, p_post_[slot],
+                                          p_g_[slot], p_beta_[slot], pend_dev_, commit_core_, stream_);
       } else if (joint) {  // a verify: each sequence from its own state, left unwritten
         kernels::SeqPtrs<const float> st;
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->gdn[slot];

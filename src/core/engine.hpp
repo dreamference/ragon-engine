@@ -695,6 +695,22 @@ class Engine {
   cudaEvent_t commit_done_ = nullptr;
   float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)
   void join_commit();
+  // RAGON_MK_GDN_FUSED=1 (off by default; needs the batched commit beside the draft): speculate_batch's commit runs
+  // only the conv half beside the draft and keeps the recurrence's inputs (p_post_, p_g_, p_beta_); the next joint
+  // verify replays them inside its own recurrence (kernels::gdn_recurrent_fused_seqs), so a DeltaNet layer reads each
+  // sequence's state once and writes it once per step instead of the commit's read and write and the verify's read.
+  // Anything else that reaches the state first joins, and join_commit replays the pending rows on stream_ (a flush).
+  int gdn_fused_ = 0;
+  bool gdn_defer_ = false;     // this step's verify was fused: its commit defers the recurrence to the next one
+  bool gdn_deferred_ = false;  // a recurrence is pending: pend_s_[i]'s rows pend_r0_[i] .. + pend_n_[i] - 1 of p_*
+  bool verify_fused_ = false;  // forward_rows: this joint verify runs the fused recurrence
+  std::vector<float*> p_post_, p_g_, p_beta_;
+  int* pend_dev_ = nullptr;  // the fused kernel's [kMaxSeqs] first pending row and [kMaxSeqs] pending rows per sequence
+  cudaEvent_t pend_free_ = nullptr;  // stream_ is done with p_* (the commit's copies wait for it)
+  std::vector<Session*> pend_s_;
+  std::vector<int> pend_r0_, pend_n_;
+  long long gdn_fused_verifies_ = 0, gdn_fused_seqs_ = 0, gdn_fused_flushes_ = 0;
+  void gdn_flush();  // the pending recurrence on stream_, as commit_state_seqs would have run it
   // The overlap probe (BACKLOG 28; RAGON_GDN_FORK, off by default): in a single sequence's verify, a DeltaNet layer's
   // latency-bound chain (the a/b projections, gating, conv, recurrence) runs on fork_stream_ beside the in_z
   // projection's weight stream on stream_; the same kernels on the same inputs, so the same bits. 1: a plain stream;

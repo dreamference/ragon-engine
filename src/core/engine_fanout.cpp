@@ -75,6 +75,18 @@ void Engine::commit_state_seqs(std::span<Session* const> ss, std::span<const int
     sb.row1[i] = row0[i] + rows[i];
   }
   sb.row0[sb.n] = sb.row1[sb.n - 1];
+  const bool defer = gdn_fused_ && gdn_defer_;
+  const auto t_prof = std::chrono::steady_clock::now();
+  // RAGON_MK_GDN_FUSED: the recurrence's inputs of rows lo .. hi - 1 are kept for the next verify, after stream_ has
+  // left the previous ones (a flush or a fused verify reads them).
+  int lo = sb.row0[0], hi = sb.row1[0];
+  for (int i = 1; i < sb.n; ++i) lo = std::min(lo, sb.row0[i]), hi = std::max(hi, sb.row1[i]);
+  if (defer) {
+    if (gdn_deferred_) throw std::logic_error("commit_state_seqs: a recurrence still pending");
+    check(cudaEventRecord(pend_free_, stream_), "pending event");
+    check(cudaStreamWaitEvent(commit_stream_, pend_free_, 0), "pending wait");
+  }
+  const int C = c.lin_conv_channels(), HV = c.lin_v_heads;
   for (int li = 0; li < c.layers; ++li) {
     const LayerWeights& L = model_->layers()[li];
     if (L.full) continue;  // the verify already wrote the KV
@@ -84,12 +96,34 @@ void Engine::commit_state_seqs(std::span<Session* const> ss, std::span<const int
       conv.p[i] = ss[i]->conv[slot];
       gdn.p[i] = ss[i]->gdn[slot];
     }
-    kernels::gdn_conv_commit_seqs(v_pre_[slot], conv, L.conv, sb, c.lin_conv_channels(), commit_stream_);
+    kernels::gdn_conv_commit_seqs(v_pre_[slot], conv, L.conv, sb, C, commit_stream_);
+    if (defer) {
+      const auto keep = [&](float* to, const float* from, int w) {
+        check(cudaMemcpyAsync(to + size_t(lo) * w, from + size_t(lo) * w, size_t(hi - lo) * w * sizeof(float),
+                              cudaMemcpyDeviceToDevice, commit_stream_),
+              "pending rows");
+      };
+      keep(p_post_[slot], v_post_[slot], C);
+      keep(p_g_[slot], v_g_[slot], HV);
+      keep(p_beta_[slot], v_beta_[slot], HV);
+      continue;
+    }
     kernels::gdn_recurrent_commit_seqs(v_post_[slot], v_g_[slot], v_beta_[slot], gdn, commit_core_, sb, c.lin_k_heads,
-                                       c.lin_v_heads, commit_stream_);
+                                       HV, commit_stream_);
   }
   check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
   commit_pending_ = true;
+  if (profile_) {  // RAGON_PROFILE: the commit alone (no longer beside the draft), its GPU time to the host
+    check(cudaStreamSynchronize(commit_stream_), "commit profile");
+    phase_seconds_["commit/state"] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prof).count();
+    phase_seconds_["commit/passes"] += 1;
+  }
+  if (defer) {
+    gdn_deferred_ = true;
+    pend_s_.assign(ss.begin(), ss.end());
+    pend_r0_.assign(row0.begin(), row0.end());
+    pend_n_.assign(rows.begin(), rows.end());
+  }
 }
 
 kernels::SeqGroups Engine::cascade_groups(std::span<const Seg> segs) const {

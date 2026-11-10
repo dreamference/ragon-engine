@@ -396,21 +396,14 @@ __global__ void gdn_gating_kernel(const float* a, const float* b, const __nv_bfl
 
 // kGdnDk, kGdnDv: core/attention_body.cuh.
 
-// The gated delta rule, one warp per 32 value columns of a head (4 warps per head, each its own
-// block): the q and k norms by warp shuffles, no block-wide barriers, and four times the blocks to load
-// the state. Each column's arithmetic per token is the same sequence whatever M is.
-__device__ __forceinline__ void gdn_recurrent_body(const float* __restrict__ mixed, const float* __restrict__ g,
-                                                   const float* __restrict__ beta, const float* state_in,
-                                                   float* state_out, float* __restrict__ out, int M, int H, int HV,
-                                                   int bx) {
-  __shared__ float qs[kGdnDk], ks[kGdnDk];
-  const int hv = bx / 4, part = bx % 4, lane = threadIdx.x, v = part * 32 + lane;
+// Rows 0 .. M - 1 over the warp's state columns S (value column v of head hv), each row's output to out: the
+// per-token arithmetic of every warp kernel below, shared so that a replay inside another kernel has the same bits.
+__device__ __forceinline__ void gdn_recurrent_rows(float (&S)[kGdnDk], float* qs, float* ks,
+                                                   const float* __restrict__ mixed, const float* __restrict__ g,
+                                                   const float* __restrict__ beta, float* __restrict__ out, int M,
+                                                   int H, int HV, int hv, int lane, int v) {
   const int h = hv / (HV / H);
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
-  const float* st = state_in + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
-  float S[kGdnDk];
-#pragma unroll
-  for (int k = 0; k < kGdnDk; ++k) S[k] = st[k * kGdnDv + v];
   const float scale = rsqrtf(static_cast<float>(kGdnDk));
   for (int t = 0; t < M; ++t) {
     const float* row = mixed + static_cast<size_t>(t) * C;
@@ -446,10 +439,34 @@ __device__ __forceinline__ void gdn_recurrent_body(const float* __restrict__ mix
     }
     out[static_cast<size_t>(t) * HV * kGdnDv + hv * kGdnDv + v] = o;
   }
-  if (state_out == nullptr) return;
-  float* so = state_out + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
+}
+
+__device__ __forceinline__ void gdn_state_load(float (&S)[kGdnDk], const float* state, int hv, int v) {
+  const float* st = state + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
+#pragma unroll
+  for (int k = 0; k < kGdnDk; ++k) S[k] = st[k * kGdnDv + v];
+}
+
+__device__ __forceinline__ void gdn_state_store(const float (&S)[kGdnDk], float* state, int hv, int v) {
+  float* so = state + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
 #pragma unroll
   for (int k = 0; k < kGdnDk; ++k) so[k * kGdnDv + v] = S[k];
+}
+
+// The gated delta rule, one warp per 32 value columns of a head (4 warps per head, each its own
+// block): the q and k norms by warp shuffles, no block-wide barriers, and four times the blocks to load
+// the state. Each column's arithmetic per token is the same sequence whatever M is.
+__device__ __forceinline__ void gdn_recurrent_body(const float* __restrict__ mixed, const float* __restrict__ g,
+                                                   const float* __restrict__ beta, const float* state_in,
+                                                   float* state_out, float* __restrict__ out, int M, int H, int HV,
+                                                   int bx) {
+  __shared__ float qs[kGdnDk], ks[kGdnDk];
+  const int hv = bx / 4, part = bx % 4, lane = threadIdx.x, v = part * 32 + lane;
+  float S[kGdnDk];
+  gdn_state_load(S, state_in, hv, v);
+  gdn_recurrent_rows(S, qs, ks, mixed, g, beta, out, M, H, HV, hv, lane, v);
+  if (state_out == nullptr) return;
+  gdn_state_store(S, state_out, hv, v);
 }
 
 __global__ void __launch_bounds__(32)
@@ -578,6 +595,36 @@ __global__ void __launch_bounds__(32)
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
   gdn_recurrent_body(mixed + r0 * C, g + r0 * HV, beta + r0 * HV, state.p[sq], nullptr, out + r0 * HV * kGdnDv,
                      b.row0[sq + 1] - b.row0[sq], H, HV, blockIdx.x);
+}
+
+// The verify's recurrence with the previous step's commit folded in (RAGON_MK_GDN_FUSED, BATCHING §5.8): sequence sq
+// first replays its pending rows pend[sq] .. pend[sq] + pend[kMaxSeqs + sq] - 1 of (pmixed, pg, pbeta), the commit's
+// saved inputs, writes the state they leave, and runs its verify rows on from the same registers: one read and one
+// write of the state instead of the commit's read and write and the verify's read. A sequence with no pending rows
+// reads its state and leaves it unwritten, as gdn_recurrent_seqs_kernel. The replay's outputs go to pout (scratch).
+__global__ void __launch_bounds__(32)
+    gdn_recurrent_fused_seqs_kernel(const float* __restrict__ mixed, const float* __restrict__ g,
+                                    const float* __restrict__ beta, SeqPtrs<float> state, float* __restrict__ out,
+                                    SeqBatch b, int H, int HV, const float* __restrict__ pmixed,
+                                    const float* __restrict__ pg, const float* __restrict__ pbeta,
+                                    const int* __restrict__ pend, float* __restrict__ pout) {
+  pdl_begin();  // first statement: see launch.cuh
+  __shared__ float qs[kGdnDk], ks[kGdnDk];
+  const int sq = blockIdx.y, bx = blockIdx.x;
+  const int hv = bx / 4, part = bx % 4, lane = threadIdx.x, v = part * 32 + lane;
+  const int C = 2 * H * kGdnDk + HV * kGdnDv;
+  float S[kGdnDk];
+  gdn_state_load(S, state.p[sq], hv, v);
+  const int pn = pend[kMaxSeqs + sq];
+  if (pn > 0) {
+    const size_t p0 = pend[sq];
+    gdn_recurrent_rows(S, qs, ks, pmixed + p0 * C, pg + p0 * HV, pbeta + p0 * HV, pout + p0 * HV * kGdnDv, pn, H, HV,
+                       hv, lane, v);
+    gdn_state_store(S, state.p[sq], hv, v);
+  }
+  const size_t r0 = b.row0[sq];
+  gdn_recurrent_rows(S, qs, ks, mixed + r0 * C, g + r0 * HV, beta + r0 * HV, out + r0 * HV * kGdnDv,
+                     b.row0[sq + 1] - b.row0[sq], H, HV, hv, lane, v);
 }
 
 __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ z,
@@ -951,6 +998,13 @@ void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, S
                         const SeqBatch& b, int H, int HV, cudaStream_t s) {
   launch_kernel("gdn_recurrent_seqs", gdn_recurrent_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed, g, beta,
                 state, out, b, H, HV);
+}
+
+void gdn_recurrent_fused_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<float> state, float* out,
+                              const SeqBatch& b, int H, int HV, const float* pmixed, const float* pg, const float* pbeta,
+                              const int* pend, float* pout, cudaStream_t s) {
+  launch_kernel("gdn_recurrent_fused_seqs", gdn_recurrent_fused_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed,
+                g, beta, state, out, b, H, HV, pmixed, pg, pbeta, pend, pout);
 }
 
 void gdn_conv_commit_seqs(float* mixed, SeqPtrs<float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
