@@ -131,6 +131,14 @@ struct EngineOptions {
   // under MILESTONES §14's exactness policy until its KL and agreement checks pass (bench/prefill_bf16_check.sh).
   // The decode and verify rows path is untouched either way. RAGON_PREFILL_BF16=0/1 overrides.
   bool prefill_bf16 = false;
+  // LOWBIT §8 (B41): the full-attention KV read as FP8 E4M3 with a calibrated scale per layer, K and V apart. A key
+  // a row reads below the 32-position unit its own position falls in is read as bf16(e4m3(v / s) * s); every other
+  // key, and the first and last full-attention layers, as stored. The rule depends on positions only, so the spec
+  // and prefix checks stay exact with it on; it changes the numerics, so it is off by default (MILESTONES §14).
+  // kv_fp8_scales: the scales' sidecar (bench/quant/kv_calib.py); the checkpoint carries none. RAGON_KV_FP8=0/1 and
+  // RAGON_KV_FP8_SCALES override; RAGON_KV_CALIB=path records the per-layer K/V absolute maxima there instead.
+  bool kv_fp8 = false;
+  std::string kv_fp8_scales;
   // P4 (BATCHING §5.3): the full-attention KV in 64-position pages of one pool, each session reading and writing its
   // positions through a page table, instead of a flat slot per session. Only addresses change, so every result is the
   // flat layout's bit for bit. P4b: a session maps pages lazily, as its passes reach them, and gives back the ones past
@@ -649,6 +657,21 @@ class Engine {
   // Runs a prefix KV store call that may drop page references, recording the release when it did.
   void kv_store_dropped(const std::function<void()>& op);
   bool prefill_bf16_ = false;             // opts_.prefill_bf16 or RAGON_PREFILL_BF16: BF16 DeltaNet intermediates
+  std::vector<kernels::KvQ8> kv_q8_;      // per full-attention slot: the FP8 read scales (empty: knob off)
+  kernels::KvQ8 kv_q8_of(int slot) const { return slot < static_cast<int>(kv_q8_.size()) ? kv_q8_[slot] : kernels::KvQ8{}; }
+  void load_kv_fp8_scales(const std::string& path, int n_full);
+  // M2 (paged pool only): an E4M3 mirror of the pool, one byte per element at the pool's offsets, and a flag per page
+  // (kv_sealed_, device; kv_sealed_host_ a superset of the set ones). kv_ensure seals the full pages below its start,
+  // and the attention tiles every row reads as R(v) come from a sealed page's mirror. A write clears the flag.
+  uint8_t* kv_mirror_ = nullptr;
+  uint8_t* kv_sealed_ = nullptr;
+  std::vector<uint8_t> kv_sealed_host_;
+  std::vector<float> kv_q8_kinv_, kv_q8_vinv_;
+  void kv_seal_pages(Session& s, int from, cudaStream_t st);
+  std::string kv_calib_path_;             // RAGON_KV_CALIB: where the destructor merges the K/V maxima
+  float* kv_amax_ = nullptr;              // [n_full][2] absolute maxima (float bits, atomicMax), calibration only
+  int kv_amax_slots_ = 0;
+  void dump_kv_calib();
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
   // NVFP4 or FP8), and `out` only when `f32`.

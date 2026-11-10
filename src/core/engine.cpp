@@ -8,9 +8,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <fstream>
 #include <stdexcept>
 
 #include "core/kernels.cuh"
+
+#include <nlohmann/json.hpp>
 
 namespace ragon {
 namespace {
@@ -303,6 +306,47 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   prefill_bf16_ = opts_.prefill_bf16;
   if (const char* e = std::getenv("RAGON_PREFILL_BF16")) prefill_bf16_ = std::atoi(e) != 0;
   if (prefill_bf16_) std::fprintf(stderr, "prefill: BF16 DeltaNet intermediates (not the exact path)\n");
+  {  // LOWBIT §8 (B41): the FP8 KV read rule (not exact; off by default, MILESTONES §14).
+    bool fp8 = opts_.kv_fp8;
+    if (const char* e = std::getenv("RAGON_KV_FP8")) fp8 = std::atoi(e) != 0;
+    std::string scales = opts_.kv_fp8_scales;
+    if (const char* e = std::getenv("RAGON_KV_FP8_SCALES")) scales = e;
+    int n_full = 0;
+    for (int i = 0; i < c.layers; ++i) n_full += c.full_attention[i] ? 1 : 0;
+    if (fp8) {
+      if (scales.empty()) throw std::runtime_error("kv-fp8: no scales (--kv-fp8-scales / RAGON_KV_FP8_SCALES)");
+      if (bulk) throw std::runtime_error("kv-fp8: not with bulk-copy attention tiles (RAGON_ATTN_BULK)");
+      if (kernels::attention_chunk() % 32) throw std::runtime_error("kv-fp8: the attention chunk is off the 32 grid");
+      load_kv_fp8_scales(scales, n_full);
+      const char* me = std::getenv("RAGON_KV_FP8_MIRROR");  // 0: M1 only (every read rounded on chip)
+      if (kv_pool_ != nullptr && (me == nullptr || std::atoi(me) != 0)) {
+        const size_t pages = size_t(kv_book_->capacity()) + 1;  // ids 1..capacity (page 0 reserved)
+        kv_mirror_ = alloc<uint8_t>(kv_page_elems_ * pages);
+        kv_sealed_ = alloc<uint8_t>(pages);
+        check(cudaMemset(kv_sealed_, 0, pages), "KV seal flags");
+        kv_sealed_host_.assign(pages, 0);
+        const size_t lkv = size_t(c.kv_heads) * kv_head_stride_;
+        for (int i = 0; i < n_full; ++i) {
+          kv_q8_kinv_.push_back(kv_q8_[i].kinv);
+          kv_q8_vinv_.push_back(kv_q8_[i].vinv);
+          if (!kv_q8_[i].on()) continue;
+          kv_q8_[i].k8 = kv_mirror_ + size_t(i) * 2 * lkv;
+          kv_q8_[i].v8 = kv_mirror_ + (size_t(i) * 2 + 1) * lkv;
+          kv_q8_[i].sealed = kv_sealed_;
+          kv_q8_[i].unit = kv_page_unit_;
+        }
+        std::fprintf(stderr, "kv-fp8: E4M3 page mirror, %.2f GB (full pages below a pass read from it)\n",
+                     kv_page_elems_ * double(pages) / 1e9);
+      }
+    }
+    if (const char* e = std::getenv("RAGON_KV_CALIB"); e && *e) {
+      kv_calib_path_ = e;
+      kv_amax_slots_ = n_full;
+      kv_amax_ = alloc<float>(size_t(n_full) * 2);
+      check(cudaMemset(kv_amax_, 0, size_t(n_full) * 2 * sizeof(float)), "KV calibration");
+      std::fprintf(stderr, "kv-calib: recording the per-layer K/V maxima into %s\n", e);
+    }
+  }
   branch_checkpoints_ = opts_.branch_checkpoints;
   if (const char* e = std::getenv("RAGON_BRANCH_CKPT")) branch_checkpoints_ = std::atoi(e) != 0;
   inpass_ = opts_.inpass_checkpoints;
@@ -579,6 +623,54 @@ void Engine::mk_times_report() {
   }
 }
 
+// LOWBIT §8 (B41): the sidecar of bench/quant/kv_calib.py, {"source", "layers": [the full-attention layers' ids],
+// "k_scale": [...], "v_scale": [...]} one entry per full-attention layer in model order. The first and last
+// full-attention layers are read as stored whatever the file says.
+void Engine::load_kv_fp8_scales(const std::string& path, int n_full) {
+  std::ifstream f(path);
+  if (!f) throw std::runtime_error("kv-fp8: cannot open the scales " + path);
+  const nlohmann::json j = nlohmann::json::parse(f);
+  const auto& ks = j.at("k_scale");
+  const auto& vs = j.at("v_scale");
+  if (static_cast<int>(ks.size()) != n_full || static_cast<int>(vs.size()) != n_full)
+    throw std::runtime_error("kv-fp8: the scales do not have one entry per full-attention layer");
+  kv_q8_.assign(n_full, kernels::KvQ8{});
+  int on = 0;
+  for (int i = 1; i + 1 < n_full; ++i) {
+    const float k = ks[i].get<float>(), v = vs[i].get<float>();
+    if (!(k > 0.f) || !(v > 0.f) || !std::isfinite(k) || !std::isfinite(v))
+      throw std::runtime_error("kv-fp8: a scale is not positive and finite");
+    kv_q8_[i] = kernels::KvQ8{k, v, 1.f / k, 1.f / v};
+    ++on;
+  }
+  std::fprintf(stderr, "kv-fp8: E4M3 reads in %d of %d full-attention layers, scales from %s (source: %s; the "
+               "checkpoint carries none)\n", on, n_full, path.c_str(), j.value("source", std::string("?")).c_str());
+}
+
+void Engine::dump_kv_calib() {
+  std::vector<float> a(size_t(kv_amax_slots_) * 2);
+  if (cudaMemcpy(a.data(), kv_amax_, a.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+  // Merged with what the file holds (one run per prompt): the maxima over every run.
+  nlohmann::json j;
+  if (std::ifstream in(kv_calib_path_); in) {
+    try { j = nlohmann::json::parse(in); } catch (...) { j = nlohmann::json(); }
+  }
+  std::vector<float> k(kv_amax_slots_, 0.f), v(kv_amax_slots_, 0.f);
+  if (j.contains("k_amax") && static_cast<int>(j["k_amax"].size()) == kv_amax_slots_)
+    for (int i = 0; i < kv_amax_slots_; ++i) {
+      k[i] = j["k_amax"][i].get<float>();
+      v[i] = j["v_amax"][i].get<float>();
+    }
+  for (int i = 0; i < kv_amax_slots_; ++i) {
+    k[i] = std::max(k[i], a[2 * i]);
+    v[i] = std::max(v[i], a[2 * i + 1]);
+  }
+  j["k_amax"] = k;
+  j["v_amax"] = v;
+  j["runs"] = j.value("runs", 0) + 1;
+  std::ofstream(kv_calib_path_) << j.dump(1) << "\n";
+}
+
 Engine::~Engine() {
   if (gdn_fused_)
     std::fprintf(stderr, "gdn fused: %lld verifies, %lld sequences replayed in them, %lld flushes\n",
@@ -589,6 +681,7 @@ Engine::~Engine() {
   }
   if (commit_stream_) cudaStreamSynchronize(commit_stream_);
   if (stream_) cudaStreamSynchronize(stream_);
+  if (kv_amax_) dump_kv_calib();
   kv_tree_.reset();
   if (kv_arena_base_) cudaFree(kv_arena_base_);
   for (auto& e : emb_) cudaFreeAsync(e.second.p, stream_);
@@ -957,8 +1050,36 @@ void Engine::kv_table_sync(Session& s, cudaStream_t st) {
   if (!idx.empty()) kernels::kv_table_set(s.pages, idx.data(), val.data(), static_cast<int>(idx.size()), st);
 }
 
+// M2: the session's pages from from's page on lose their flags (host first: a device flag is never set without the
+// host bit), and every full page below from without one is encoded into the mirror and flagged, in stream order.
+void Engine::kv_seal_pages(Session& s, int from, cudaStream_t st) {
+  if (kv_mirror_ == nullptr || use_dev_pos_) return;
+  std::vector<int> clear, seal;
+  const int first_open = std::max(from, 0) / kernels::kKvPageTokens;
+  for (size_t i = 0; i < s.kv_ids.size(); ++i) {
+    const int id = s.kv_ids[i];
+    if (id <= 0) continue;
+    if (static_cast<int>(i) >= first_open) {
+      if (kv_sealed_host_[id]) {
+        kv_sealed_host_[id] = 0;
+        clear.push_back(id);
+      }
+    } else if (!kv_sealed_host_[id]) {
+      kv_sealed_host_[id] = 1;
+      seal.push_back(id);
+    }
+  }
+  const ModelConfig& c = model_->config();
+  if (!clear.empty()) kernels::kv_unseal(kv_sealed_, clear.data(), static_cast<int>(clear.size()), st);
+  if (!seal.empty())
+    kernels::kv_seal(kv_pool_, kv_mirror_, kv_sealed_, seal.data(), static_cast<int>(seal.size()), 1,
+                     static_cast<int>(kv_q8_.size()) - 1, c.kv_heads, c.head_dim, kv_page_unit_, kv_q8_kinv_.data(),
+                     kv_q8_vinv_.data(), st);
+}
+
 void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
   if (!kv_book_) return;
+  kv_seal_pages(s, from, st);
   to = std::min(to, opts_.max_context);
   if (to <= from) return;
   int need = kv_book_->needed(s.kv_ids, from, to);
@@ -984,6 +1105,7 @@ void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
                             pitch, unit_bytes, runs, cudaMemcpyDeviceToDevice, st),
           "KV page copy");
   kv_table_sync(s, st);
+  kv_seal_pages(s, from, st);  // the pages just mapped (a copy's destination among them) start unsealed
   if (kv_book_->pending_pages() > pending) kv_record_release();  // a copied page this holder let go of
 }
 
@@ -1199,6 +1321,15 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
   const size_t buf_pitch = size_t(buf_len) * row, width = size_t(to - from) * row;
   auto* b = static_cast<__nv_bfloat16*>(buf);
   if (kv_pages_) {  // P4: one launch over the positions, through the page table
+    if (!to_buf && kv_mirror_ != nullptr && to > from) {  // M2: the pages written lose their flags
+      std::vector<int> ids;
+      for (int i = from / kernels::kKvPageTokens; i <= (to - 1) / kernels::kKvPageTokens && i < static_cast<int>(s_->kv_ids.size()); ++i)
+        if (const int id = s_->kv_ids[i]; id > 0 && kv_sealed_host_[id]) {
+          kv_sealed_host_[id] = 0;
+          ids.push_back(id);
+        }
+      if (!ids.empty()) kernels::kv_unseal(kv_sealed_, ids.data(), static_cast<int>(ids.size()), stream_);
+    }
     kernels::kv_pages_copy(kv_pool_, s_->pages, static_cast<int>(s_->kcache.size()) * 2, c.kv_heads, c.head_dim, b,
                            buf_start, buf_len, from, to, to_buf, stream_);
     return;
@@ -1536,7 +1667,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
                    : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, false, true);
     pre_normed = false;
     // The megakernel's stage 3 (RAGON_MK_ATTN): the whole attention layer of one chain verify as one persistent kernel.
-    bool mk_attn = L.full && mk_attn_ > 0 && !lora_on && verify && !multi && !quantized_ && xn_half && L.q.K == H &&
+    bool mk_attn = L.full && mk_attn_ > 0 && kv_q8_.empty() && !lora_on && verify && !multi && !quantized_ && xn_half && L.q.K == H &&
                    L.k.K == H && L.v.K == H && L.o.K == qsize && L.o.N == H;
     if (mk_attn) {
       const Seg& g = segs[0];
@@ -1610,27 +1741,39 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           pg.p[i] = segs[i].s->pages;
         }
         kernels::attn_prepare_seqs(q_gate_, k_, v_, L.q_norm, L.k_norm, sb, c.heads, c.kv_heads, c.head_dim, c.rotary_dim,
-                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg);
+                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg, kv_sealed_, kv_page_unit_);
         if (groups.n > 0)
           kernels::attention_rows_cascade(q_, kcr, vcr, sb, groups, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_,
-                                          stream_, pg);
+                                          stream_, pg, kv_q8_of(slot));
         else
           kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
-                                       use_dev_pos_ ? opts_.max_context : 0, pg);
+                                       use_dev_pos_ ? opts_.max_context : 0, pg, kv_q8_of(slot));
       }
+      // RAGON_KV_CALIB: the K and V the eager passes cached, by layer (tree rows and captured passes skipped).
+      auto calib = [&](const Seg& g) {
+        if (!kv_amax_ || seg_tree(g)) return;
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        check(cudaStreamIsCapturing(stream_, &cs), "capture status");
+        if (cs == cudaStreamCaptureStatusNone)
+          kernels::kv_absmax(g.s->kcache[slot], g.s->vcache[slot], g.s->pages, g.s->pos, g.rows, c.kv_heads,
+                             c.head_dim, kv_amax_ + 2 * slot, stream_);
+      };
+      if (joint)
+        for (const Seg& g : segs) calib(g);
       for (const Seg& g : joint ? std::span<const Seg>() : segs) {
         const size_t r0 = g.row0;
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
                               q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_,
-                              seg_tree(g), mrope, g.s->pages);
+                              seg_tree(g), mrope, g.s->pages, kv_sealed_, kv_page_unit_);
+        calib(g);
         // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
         // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
         for (int q0 = 0; q0 < g.rows; q0 += kAttnSlice) {
           const int n = std::min(kAttnSlice, g.rows - q0);
           kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
                                   c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
-                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages);
+                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages, kv_q8_of(slot));
         }
       }
       if (quantized_) {

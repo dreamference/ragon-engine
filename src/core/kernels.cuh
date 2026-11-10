@@ -149,6 +149,28 @@ struct TreeDesc {
   int gdn_step[kMaxTreeVariants][2 * kMaxSeqRows] = {};
   static constexpr int kLeaf = 1 << 8, kWrite = 1 << 9;
 };
+// The FP8 KV cache's read domain for one layer (--kv-fp8, LOWBIT §8; attention_body.cuh, kv_q8_*): the K and V scales
+// and their reciprocals. ks == 0: the layer reads its KV as stored (BF16), the default path.
+// k8/v8 (M2): the layer's FP8 mirror of the pool, E4M3 codes at the pool's element offsets (one byte each), valid for
+// the pages whose sealed[id] is set (id: the page table's entry / unit); a sealed tile every row of the block reads as R(v)
+// is loaded from it and decoded on chip (the same values as rounding the BF16 tile). Null: every tile from the pool.
+struct KvQ8 {
+  float ks = 0.f, vs = 0.f, kinv = 0.f, vinv = 0.f;
+  const uint8_t* k8 = nullptr;
+  const uint8_t* v8 = nullptr;
+  const uint8_t* sealed = nullptr;
+  unsigned long long unit = 0;
+  bool on() const { return ks > 0.f; }
+};
+// M2 (LOWBIT §8): the FP8 mirror of the pages ids[0 .. n) (host list, copied as parameters, kKvSealMax a launch) for the
+// full-attention slots [l0, l1): mirror = e4m3(pool * inv) with each slot's K and V reciprocal scales (kinv, vinv: device
+// arrays per slot); then sealed[id] = 1 in a second launch, so a reader that sees the flag sees the whole mirror.
+constexpr int kKvSealMax = 64;
+constexpr int kMaxKvQ8Slots = 32;  // full-attention layers kv_seal takes
+void kv_seal(const __nv_bfloat16* pool, uint8_t* mirror, uint8_t* sealed, const int* ids, int n, int l0, int l1,
+             int Hkv, int D, size_t page_unit, const float* kinv, const float* vinv, cudaStream_t s);
+// sealed[ids[i]] = 0 (host list): the pages' BF16 is about to change (a write, a copy into them, a new owner).
+void kv_unseal(uint8_t* sealed, const int* ids, int n, cudaStream_t s);
 // The verify's conv over a tree: post[m] from pre[m] and its ancestors' pre rows (or the window `state`, unwritten).
 void gdn_conv_tree(const float* pre, float* post, const float* state, const __nv_bfloat16* w, int M, int C,
                    const TreeDesc* td, cudaStream_t s);
@@ -272,18 +294,19 @@ void gated_rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* z, cons
 void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
                        const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
                        float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                       cudaStream_t s, SeqPtrs<const uint64_t> pages = {});
+                       cudaStream_t s, SeqPtrs<const uint64_t> pages = {}, uint8_t* sealed = nullptr,
+                       unsigned long long unit = 0);
 // attention_rows over every row of b (q and out [rows][Hq][D]), each sequence over its own caches.
 void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                          const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
-                         int fixed_ctx = 0, SeqPtrs<const uint64_t> pages = {});
+                         int fixed_ctx = 0, SeqPtrs<const uint64_t> pages = {}, KvQ8 q8 = {});
 // The cascade (BATCHING §5.3): attention_rows_seqs with the keys below a group's cut computed once for every row of the
 // group, whose sequences (a run of the batch) hold those keys on the same pages; cut on the tile grid, at or below each
 // sequence's position. Every sequence's own keys follow from its group's cut, so each row's result is bit for bit its own
 // launch's. Eager only: a captured graph's launches cannot follow which pages are shared.
 void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                             const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out,
-                            cudaStream_t s, SeqPtrs<const uint64_t> pages);
+                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8 = {});
 // The verify's conv: each sequence's rows of mixed from its own window (read, not written).
 void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
                    cudaStream_t s);
@@ -523,6 +546,10 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 // is interleaved [pos][head][dim]; the engine sets head-major [head][pos][dim], so one head's keys are
 // one contiguous stream for the attention kernels.
 void set_kv_layout(size_t head_stride, size_t pos_stride);
+// RAGON_KV_CALIB (LOWBIT §8): folds the largest |K| and |V| of positions [p0, p0 + n) of one layer's cache (pages:
+// its page table, or nullptr for a flat slot) into amax[0] and amax[1].
+void kv_absmax(const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, const uint64_t* pages, int p0, int n,
+               int Hkv, int D, float* amax, cudaStream_t s);
 
 // Full attention: q_gate [M][Hq*2*D] (per head: q then gate), k/v [M][Hkv*D]. Applies the Gemma-style
 // q/k norms and NeoX RoPE on the first `rot` dims, writes q [M][Hq][D] and gate [M][Hq][D], and appends
@@ -531,7 +558,7 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
                   const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
                   float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
                   cudaStream_t s, const TreeDesc* td = nullptr, const int* mrope = nullptr,
-                  const uint64_t* pages = nullptr);
+                  const uint64_t* pages = nullptr, uint8_t* sealed = nullptr, unsigned long long unit = 0);
 // mrope (a prefill chunk of a prompt with images): row m's RoPE positions are mrope[3m .. 3m + 2], (temporal, height,
 // width), each frequency taking its component as the interleaved M-RoPE sections say (attention_body.cuh); null: the
 // row's position is its slot plus pos0's rope delta for all three.
@@ -544,7 +571,7 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0,
-                    const TreeDesc* td = nullptr, const uint64_t* pages = nullptr);
+                    const TreeDesc* td = nullptr, const uint64_t* pages = nullptr, KvQ8 q8 = {});
 // P4: kcache/vcache are a layer's K and V bases in the pool and `pages` the session's page table (null: flat).
 // Sets the kernels' shared-memory attributes once, outside any graph capture.
 void prepare_kernels();

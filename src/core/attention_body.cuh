@@ -5,8 +5,10 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cmath>
 #include <cstdint>
 
@@ -110,6 +112,9 @@ constexpr int kMmaKS = kMmaD + 8;  // padded row stride (bf16) of the K and V ti
 // One K tile and one V tile per stage; `ns` stages in a ring.
 constexpr size_t mma_stage(int tk) { return size_t(2) * tk * kMmaKS * sizeof(__nv_bfloat16); }
 constexpr size_t mma_smem(int tk, int ns) { return ns * mma_stage(tk); }
+// --kv-fp8 (M2): the Q8 instantiations' ring plus one tile's FP8 codes (K then V, tk keys of kMmaD bytes each).
+constexpr size_t mma_raw8(int tk) { return size_t(2) * tk * kMmaD; }
+constexpr size_t mma_smem_q8(int tk, int ns) { return mma_smem(tk, ns) + mma_raw8(tk); }
 
 __device__ __forceinline__ void mma_bf16_16816(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                                uint32_t b0, uint32_t b1) {
@@ -194,6 +199,77 @@ __device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const 
   asm volatile("cp.async.commit_group;");
 }
 
+// ---- The FP8 KV cache (--kv-fp8, LOWBIT §8). ----
+// A value v of a layer whose scale is s (inv = 1 / s, rounded to float on the host) is stored as the E4M3 code
+// e = e4m3_satfinite(v * inv) and read back as R(v) = bf16(float(e) * s). R is idempotent (an E4M3 code times s, rounded
+// to BF16 and divided again, rounds back to the same code: ragon-kvq8-tests checks all 256 codes), so a value read back,
+// written to BF16 and quantized again keeps its bits. The read rule, a function of positions only: the row at position p
+// reads the keys of 32-key unit u (key / 32) as R(v) iff u < p / 32, and as stored (BF16) otherwise. Every launch, chunk and
+// resume point (multiples of 32: kResumeAlign) sees the same values for the same (row, key), so --spec-check and
+// --prefix-check stay bit-exact within the mode.
+__device__ __forceinline__ __nv_fp8x2_storage_t kv_q8_encode2(float2 x, float inv) {
+  return __nv_cvt_float2_to_fp8x2(make_float2(__fmul_rn(x.x, inv), __fmul_rn(x.y, inv)), __NV_SATFINITE, __NV_E4M3);
+}
+__device__ __forceinline__ __nv_bfloat162 kv_q8_decode2(__nv_fp8x2_storage_t e, float s) {
+  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(e, __NV_E4M3);
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+  return __floats2bfloat162_rn(__fmul_rn(f.x, s), __fmul_rn(f.y, s));
+}
+__device__ __forceinline__ __nv_bfloat162 kv_q8_round2(__nv_bfloat162 v, float s, float inv) {
+  return kv_q8_decode2(kv_q8_encode2(__bfloat1622float2(v), inv), s);
+}
+
+// A staged tile (K rows, then V rows) replaced by R of its values, in place; every thread of the block takes part.
+template <int TK>
+__device__ __forceinline__ void attn_round_stage(__nv_bfloat16* stage, const KvQ8& q8) {
+  constexpr int D = kMmaD, KS = kMmaKS;
+  for (int i = threadIdx.x; i < 2 * TK * (D / 8); i += blockDim.x) {
+    const int r = i / (D / 8), c = i % (D / 8);
+    const float s = r < TK ? q8.ks : q8.vs, inv = r < TK ? q8.kinv : q8.vinv;
+    uint4* p = reinterpret_cast<uint4*>(stage + r * KS + 8 * c);
+    uint4 w = *p;
+    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&w);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) h[j] = kv_q8_round2(h[j], s, inv);
+    *p = w;
+  }
+}
+
+// M2: a sealed tile's FP8 codes (keys [k0, k0 + TK), every one below khi) from the layer's mirror into raw: K rows, then
+// V rows, kMmaD bytes each. The mirror holds a code at each pool element's offset, so the addresses are the BF16 tile's.
+template <int TK>
+__device__ __forceinline__ void attn_load_tile_f8(uint8_t* raw, const KvQ8& q8, int k0, int kvh, size_t hs, size_t ps,
+                                                  const uint64_t* __restrict__ pages) {
+  constexpr int D = kMmaD;
+  const size_t base = kv_off(pages, kvh, k0, hs, ps);
+  for (int i = threadIdx.x; i < TK * (D / 16); i += blockDim.x) {
+    const int j = i / (D / 16), c = i % (D / 16);
+    const size_t off = base + static_cast<size_t>(j) * ps + 16 * c;
+    cp_async16(raw + j * D + 16 * c, q8.k8 + off, true);
+    cp_async16(raw + (TK + j) * D + 16 * c, q8.v8 + off, true);
+  }
+  asm volatile("cp.async.commit_group;");
+}
+
+// M2: the staged codes decoded into a stage (K rows, then V rows): kv_q8_decode2, the values attn_round_stage leaves.
+template <int TK>
+__device__ __forceinline__ void attn_decode_stage(__nv_bfloat16* stage, const uint8_t* raw, const KvQ8& q8) {
+  constexpr int D = kMmaD, KS = kMmaKS;
+  for (int i = threadIdx.x; i < 2 * TK * (D / 16); i += blockDim.x) {
+    const int r = i / (D / 16), c = i % (D / 16);
+    const float s = r < TK ? q8.ks : q8.vs;
+    const uint4 w = *reinterpret_cast<const uint4*>(raw + r * D + 16 * c);
+    const __nv_fp8x2_storage_t* e = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w);
+    uint4 o[2];
+    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) h[j] = kv_q8_decode2(e[j], s);
+    uint4* dst = reinterpret_cast<uint4*>(stage + r * KS + 16 * c);
+    dst[0] = o[0];
+    dst[1] = o[1];
+  }
+}
+
 // ---- The same tiles through the bulk-copy (TMA) engine (M3, set_attention_bulk). ----
 // One key's 256 values of one KV head are 512 contiguous bytes in both KV layouts, so a tile is TK bulk
 // copies for K and TK for V, one per lane of one warp, each into its padded shared-memory row: the layout
@@ -262,15 +338,17 @@ __device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_
 // CASC, the cascade (BATCHING §5.3): 1 runs only keys below kcut, every row seeing them all (pos0 == kcut), for the rows of
 // sequences that share those pages; 2 runs only keys from kcut on, starting a range that holds kcut from the partial
 // state the first phase left in `scratch`. Same tile grid, same order of keys, so the same floats as CASC 0.
-template <int ROWS, int TK, int NS, bool BULK, bool CQ = false, int CASC = 0>
+template <int ROWS, int TK, int NS, bool BULK, bool CQ = false, int CASC = 0, bool Q8 = false>
 __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                                                    const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq,
                                                    int Hkv, int splits, int chunk, float* __restrict__ scratch, size_t hs,
                                                    size_t ps, int pf, int bx, int kvh, int split,
                                                    const TreeDesc* __restrict__ td = nullptr,
-                                                   const uint64_t* __restrict__ pages = nullptr, int kcut = 0) {
+                                                   const uint64_t* __restrict__ pages = nullptr, int kcut = 0,
+                                                   KvQ8 q8 = {}) {
   constexpr int D = kMmaD, G = 6, KS = kMmaKS;
   static_assert(kKvPageTokens % TK == 0, "a tile inside one KV page (P4)");
+  static_assert(!Q8 || (TK == 32 && !BULK && NS == 2), "Q8: one 32-key unit per tile, cp.async tiles, one tile in flight");
   extern __shared__ __align__(16) unsigned char smem[];
   auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
@@ -296,6 +374,22 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // A tree's row sees the keys up to its depth's position (its path's, from the tail tiles on).
   const int pa = pos0 + (td ? (va ? td->depth[ra / G] : 0) : ra / G);
   const int pb = pos0 + (td ? (vb ? td->depth[rb / G] : 0) : rb / G);
+  // Q8: the first key of each row's unit (keys below it are read as R(v)), and the lowest and highest over the block's rows.
+  const int Pa = pa & ~31, Pb = pb & ~31;
+  int minP = 0, maxP = 0;
+  if constexpr (Q8) {
+    if (td) {
+      minP = INT_MAX;
+      for (int m = r0 / G; m <= last_m; ++m) {
+        const int P = (pos0 + td->depth[m]) & ~31;
+        minP = min(minP, P);
+        maxP = max(maxP, P);
+      }
+    } else {
+      minP = (pos0 + r0 / G) & ~31;
+      maxP = (pos0 + last_m) & ~31;
+    }
+  }
   const float* qa = q + (static_cast<size_t>(ra / G) * Hq + kvh * G + ra % G) * D;
   const float* qb = q + (static_cast<size_t>(rb / G) * Hq + kvh * G + rb % G) * D;
   uint32_t qf[D / 16][4];
@@ -453,12 +547,60 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       }
     }
   };
+  // M2 (Q8 with a mirror): a tile of a sealed page that every row of the block reads as R(v) (its unit below all their
+  // units) comes from the FP8 mirror, half the bytes, and is decoded on chip; f8 bit i % NS: stage i holds such a tile.
+  // Block-uniform (one flag per page, the same for every thread). The values are the rounded BF16 tile's, bit for bit.
+  [[maybe_unused]] uint8_t* raw8 = smem + mma_smem(TK, NS);
+  [[maybe_unused]] unsigned f8 = 0;
+  auto sealed_tile = [&](int k0) {
+    if constexpr (!Q8) return false;
+    else return q8.k8 != nullptr && pages != nullptr && k0 + TK <= minP && k0 + TK <= kctx &&
+                q8.sealed[pages[k0 / kKvPageTokens] / q8.unit] != 0;
+  };
+  auto load_tile = [&](int i, int k0) {
+    if constexpr (Q8) {
+      if (sealed_tile(k0)) {
+        attn_load_tile_f8<TK>(raw8, q8, k0, kvh, hs, ps, pages);
+        f8 |= 1u << (i % NS);
+        return;
+      }
+      f8 &= ~(1u << (i % NS));
+    }
+    attn_load_tile<TK>(stage(i), kcache, vcache, k0, khi, kvh, hs, ps, pages);
+  };
+  auto prefetch_tile = [&](int k0) {
+    if constexpr (Q8) {
+      if (sealed_tile(k0)) {  // the codes into L2: TK * D bytes each of K and V
+        const size_t off = kv_off(pages, kvh, k0, hs, ps);
+        const uint32_t bytes = static_cast<uint32_t>(TK) * kMmaD;
+        if (threadIdx.x == 0)
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(q8.k8 + off), "r"(bytes) : "memory");
+        else if (threadIdx.x == 32)
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(q8.v8 + off), "r"(bytes) : "memory");
+        return;
+      }
+    }
+    attn_prefetch_tile<TK>(kcache, vcache, k0, khi, kvh, hs, ps, pages);
+  };
+  // Q8: a tile in the rows' two domains. Rows whose unit is not past the tile's (P <= k0) take it as stored; then it is
+  // rounded in place (R) and the rows past it take it. A row that does not take a pass keeps its state bit for bit, so
+  // each row's result is a single pass in its own domain. Block-uniform branches (every thread meets the barriers).
+  auto tile_q8 = [&](__nv_bfloat16* st, int k0, bool ca, bool cb) {
+    const bool raw = k0 >= minP, rnd = k0 < maxP;
+    if (raw && active) tile_compute(st, k0, ca && Pa <= k0, cb && Pb <= k0);
+    if (rnd) {
+      if (raw) __syncthreads();
+      attn_round_stage<TK>(st, q8);
+      __syncthreads();
+      if (active) tile_compute(st, k0, ca && Pa > k0, cb && Pb > k0);
+    }
+  };
 #pragma unroll
   for (int p = 0; p < NS - 1; ++p) {
     if constexpr (BULK) {
       if (warp == 0 && p < ntiles) attn_bulk_tile<TK>(stage(p), kcache, vcache, kfirst + p * TK, khi, kvh, hs, ps, pages, &bar[p]);
     } else {
-      if (p < ntiles) attn_load_tile<TK>(stage(p), kcache, vcache, kfirst + p * TK, khi, kvh, hs, ps, pages);
+      if (p < ntiles) load_tile(p, kfirst + p * TK);
       else asm volatile("cp.async.commit_group;");
     }
   }
@@ -467,23 +609,37 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     if constexpr (BULK) mbar_wait(&bar[it % NS], (it / NS) & 1);
     else asm volatile("cp.async.wait_group %0;" ::"n"(NS - 2));
     __syncthreads();  // tile it is visible to all, and stage (it - 1) % NS is free again
+    if constexpr (Q8) {
+      if ((f8 >> (it % NS)) & 1) {  // a sealed tile: its codes decoded into its stage, and the raw buffer free again
+        attn_decode_stage<TK>(stage(it), raw8, q8);
+        __syncthreads();
+      }
+    }
     if constexpr (BULK) {
       if (warp == 0 && it + NS - 1 < ntiles)
         attn_bulk_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps, pages,
                            &bar[(it + NS - 1) % NS]);
     } else {
-      if (it + NS - 1 < ntiles) attn_load_tile<TK>(stage(it + NS - 1), kcache, vcache, k0 + (NS - 1) * TK, khi, kvh, hs, ps, pages);
+      if (it + NS - 1 < ntiles) load_tile(it + NS - 1, k0 + (NS - 1) * TK);
       else asm volatile("cp.async.commit_group;");
       // Tiles it + NS .. it + NS + pf - 1 on their way into L2 (the first iteration starts the whole window).
       if (pf > 0 && ps == static_cast<size_t>(D)) {
         if (it == 0)
           for (int p = NS; p < NS + pf - 1; ++p)
-            if (p < ntiles) attn_prefetch_tile<TK>(kcache, vcache, kfirst + p * TK, khi, kvh, hs, ps, pages);
-        if (it + NS + pf - 1 < ntiles) attn_prefetch_tile<TK>(kcache, vcache, k0 + (NS + pf - 1) * TK, khi, kvh, hs, ps, pages);
+            if (p < ntiles) prefetch_tile(kfirst + p * TK);
+        if (it + NS + pf - 1 < ntiles) prefetch_tile(k0 + (NS + pf - 1) * TK);
       }
     }
-    const __nv_bfloat16* ks = stage(it);
-    if (active) tile_compute(ks, k0, true, true);
+    if constexpr (Q8) {
+      if ((f8 >> (it % NS)) & 1) {
+        if (active) tile_compute(stage(it), k0, Pa > k0, Pb > k0);  // every row of the block is past the tile's unit
+      } else {
+        tile_q8(stage(it), k0, true, true);
+      }
+    } else {
+      const __nv_bfloat16* ks = stage(it);
+      if (active) tile_compute(ks, k0, true, true);
+    }
   }
   // The tail of a tree: per variant present in this block, its tile, committed by that variant's rows only. (Trees
   // take the cp.async tiles: the bulk-copy instantiation has no tail, and attention_rows refuses a tree with it.)
@@ -498,7 +654,8 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         attn_load_tile_tree<TK>(stage(0), kcache, vcache, k0, khi, kvh, hs, ps, pages, pos0, td->path[v]);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
-        if (active) tile_compute(stage(0), k0, va && td->var[ra / G] == v, vb && td->var[rb / G] == v);
+        if constexpr (Q8) tile_q8(stage(0), k0, va && td->var[ra / G] == v, vb && td->var[rb / G] == v);
+        else if (active) tile_compute(stage(0), k0, va && td->var[ra / G] == v, vb && td->var[rb / G] == v);
       }
     }
   }

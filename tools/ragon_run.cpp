@@ -4,7 +4,7 @@
 //   ragon-run --model DIR [--text "..." | --chat "..." | --ids 1,2,3] [--max-tokens N] [--temperature T]
 //            [--prompts-file F] [--ids-out] [--prompt-ids-out] [--max-context N]
 //            [--draft DIR [--block N] [--spec] [--spec-check] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]]
-//            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--graph-check] [--seed N]
+//            [--graphs] [--pdl] [--attn-bulk] [--attn-prefetch N] [--prefill-bf16] [--kv-fp8 --kv-fp8-scales F] [--graph-check] [--seed N]
 //            [--prefix-check [--sessions N]] [--chunk-check N] [--interleave-check [--prefill-chunk-contended N]]
 //            [--drafter ID=DIR ...] [--switch-check]
 //            [--batch-check] [--side-prefill N] [--draft-bf16] [--kv-pool-mb N | --kv-flat]
@@ -16,7 +16,9 @@
 // the rows path's kernels with programmatic dependent launch (M3); --attn-bulk loads the rows path's attention
 // tiles with bulk copies (M3); --attn-prefetch N sets how many KV tiles ahead its attention prefetches into L2
 // (default 2, 0 off; M3); --prefill-bf16 keeps the prefill's DeltaNet intermediates in BF16 as production does
-// (B34; not exact, off by default: MILESTONES §14); --draft-bf16 reads the drafter's fc and conv kernel projections
+// (B34; not exact, off by default: MILESTONES §14); --kv-fp8 reads the full-attention KV below a row's 32-position
+// unit as FP8 E4M3 with the per-layer scales of --kv-fp8-scales F (LOWBIT §8, B41; not exact, off by default);
+// --draft-bf16 reads the drafter's fc and conv kernel projections
 // in BF16 instead of the NVFP4 copies rounded at load (BACKLOG 33, the default; RAGON_DRAFT_NVFP4=0/1 overrides).
 // The full-attention KV is kept in 64-position pages behind a page table per session (BATCHING §5.3, P4; the default
 // since P4e; exact: only addresses change); --kv-flat (or --no-kv-pages) keeps the flat slots, --kv-pages is accepted
@@ -352,6 +354,8 @@ int main(int argc, char** argv) {
   float temperature = 0.f;
   bool ids_out = false, prompt_ids_out = false, spec = false, spec_check = false, prefix_check = false;
   bool graphs = false, pdl = false, attn_bulk = false, graph_check = false, prefill_bf16 = false;
+  bool kv_fp8 = false;
+  std::string kv_fp8_scales;
   bool kv_pages = true;  // the page pool by default (P4e); --kv-flat the flat slots
   long kv_pool_mb = -1;
   uint64_t seed = 0;
@@ -409,6 +413,8 @@ int main(int argc, char** argv) {
     else if (a == "--attn-bulk") attn_bulk = true;
     else if (a == "--attn-prefetch") attn_prefetch = std::stoi(next());
     else if (a == "--prefill-bf16") prefill_bf16 = true;
+    else if (a == "--kv-fp8") kv_fp8 = true;
+    else if (a == "--kv-fp8-scales") kv_fp8_scales = next();
     else if (a == "--kv-pages") kv_pages = true;  // the default since P4e
     else if (a == "--kv-flat" || a == "--no-kv-pages") kv_pages = false;
     else if (a == "--kv-pool-mb") kv_pool_mb = std::stol(next());
@@ -539,6 +545,8 @@ int main(int argc, char** argv) {
     opts.attention_bulk = attn_bulk;
     opts.attention_prefetch = attn_prefetch;
     opts.prefill_bf16 = prefill_bf16;
+    opts.kv_fp8 = kv_fp8;
+    opts.kv_fp8_scales = kv_fp8_scales;
     opts.kv_pages = kv_pages;
     if (kv_pool_mb >= 0) {  // P4b: pages of the model's page size (64 positions of every full-attention layer's K and V)
       const size_t page = ragon::serve::kv_page_bytes(ragon::ModelConfig::from_file(model + "/config.json"));
