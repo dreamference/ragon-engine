@@ -33,8 +33,8 @@ C=(--model "$MODEL" --draft "$DRAFT" --prompts-file "$PROMPTS" --max-tokens 400)
 RAGON_TREE_ROWS=0 "$RUN" "${C[@]}" --batch-check --sessions 2 --seed 7 --graphs --pdl --kv-pages > "$OUT/batch-check.log" 2>&1 || rc=1
 for c in spec graph batch; do echo "$c-check: $(tail -n 1 "$OUT/$c-check.log" | cut -c1-200)"; done
 
-# serve DRAFTER-ENV-AND-FLAGS...: a ragon-serve on PORT at production's flags plus the arguments; waits for health and
-# checks the head line.
+# serve [VAR=VALUE...]: a ragon-serve on PORT at production's flags plus extra[@], with those variables set; waits
+# for health and checks the head line.
 serve() {
   env "$@" "$SERVE" --model "$MODEL" --draft "$DRAFT" "${head_args[@]}" --port "$PORT" --served-model-name "$NAME" \
     --max-context 65536 --draft-block 12 --graphs --pdl --sessions 2 "${extra[@]}" > "$OUT/serve-$tag.log" 2>&1 8>&- \
@@ -55,7 +55,7 @@ agentlong() {
 }
 
 # 2a + 3: production's flags (tree verification): tokens per step per context bucket, and the agreement gate.
-tag=prod; extra=(); serve RAGON_RUNG2=1
+tag=prod; extra=(); serve
 agentlong
 python3 -I "$HERE/rung2.py" turns "$OUT/agentlong-prod.jsonl" > "$OUT/turns.json" || rc=1
 python3 -I "$HERE/rung2.py" agree "http://127.0.0.1:$PORT" "$AGR_DIR" "$MODEL/tokenizer.json" "$OUT/agree.jsonl" \
@@ -65,7 +65,7 @@ kill $srv; tail --pid=$srv -f /dev/null
 
 # 2b: the chain alone (--tree 0; RAGON_DUMP_STEPS records chain steps only): acceptance at each draft depth.
 rm -f "$OUT/steps.bin"
-tag=chain; extra=(--tree 0); serve RAGON_DUMP_STEPS="$OUT/steps.bin"
+tag=chain; extra=(--tree 0); serve RAGON_TREE_ROWS=0 RAGON_DUMP_STEPS="$OUT/steps.bin"
 agentlong
 kill $srv; tail --pid=$srv -f /dev/null
 python3 -I "$HERE/rung2.py" steps "$OUT/steps.bin" > "$OUT/steps.json" || rc=1
