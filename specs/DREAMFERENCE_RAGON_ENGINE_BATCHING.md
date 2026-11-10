@@ -455,6 +455,33 @@ Exact levers, ranked: (1) the drafter commit as one pass over every fork's accep
 
 Lever 1 is `RAGON_COMMIT_DRAFT_BATCH` (off by default; the [CLI](./DREAMFERENCE_RAGON_ENGINE_CLI.md) table): after the batched state commit, `speculate_batch` gathers the accepted rows' captures of all sequences into one buffer and runs `draft_materialize_rows` (fc, norm, one k/v GEMM per drafter layer, the `_seqs` rope and store, positions per sequence) instead of 32 per-fork commits. Gates: knob off, ctest 20/20, `--spec-check`, `--batch-check`, `--fanout-check 32`; check mode (`2`, the per-fork commit rerun and the ring slots byte-compared) clean at 8, 16 and 32 forks (16, 32, 64 verify rows; 58 + 59 + 61 passes checked) and under `--batch-check` (498 passes); per-fork shas and step, draft and accept counts identical to the base at 8, 16 and 32 forks (one fork runs the base's path and is identical too). agentlong (16/16 sha-identical) and `--fanout-check` (`step_batch` without speculation) passed with the knob on but took no batched pass, so they do not test the lever. Three interleaved runs at 32 forks, off against on: verify pass unchanged (179.5-180.0 against 178.9-179.9 ms), span under the profiler 212.0-212.7 against 222.5-223.9 tok/s, unprofiled warm span 256.8-258.5 against 275.2-275.6 tok/s (12.25-12.34 s against 11.50-11.51 s, about 14 ms a step over 56 steps; the cold rep 12.6 ms over 61), outputs identical. SGLang: 294. The next levers are (3), one round, and then (2).
 
+**Stage 14, measured and not landed: the 64-row MLP GEMM's bandwidth** (2026-11-10). On stage 13's build with both knobs on, 32 forks x 2 rows. The weights are coded NVFP4 as served, so each 64-row MLP launch is `stream_gemm_pair_kernel<4,4,true,1,coded>`: 252 registers, no spill, 1 block of 8 warps per SM (17% occupancy). Gate|up runs 1088 blocks over 48 SMs (22.67 waves, the last two thirds full); down runs 160 (3.33 waves, the last one third full). 128 rows are two 64-row launches (`kMaxStreamRows` 64), so they run at the same GB/s.
+
+Isolated `--bench-groups` (cold L2, best of 3), gate|up / down, GB/s:
+
+| rows | raw NVFP4 | coded NVFP4 |
+|---|---|---|
+| 32 | 215-230 / 207-218 | 211-224 / 198-211 |
+| 48 | 212-213 / 200 | 203 / 204 |
+| 64 | 183-192 / 181-194 | 166-173 / 164-173 |
+
+The coded kernel at 64 rows scales almost linearly with SMs: 75/88 at 16 SMs, 134/152 at 32, 166/172 at 48. It is bound by the SMs, not by DRAM. In the pass (nsys), gate|up takes 585-613 us (the isolated time) and down 308 us (283 us isolated plus about 18 us of PDL early start). That is 39.2 + 19.7 ms a pass over 64 layers; the rest of RAGON_PROFILE's 60.6 ms MLP line is `silu_mul` and the down prefetch (not split). The GPU clock held 2.40-2.48 GHz with no throttle reason. So stage 13's 150-160 GB/s is the coded kernel's own speed, and a pass costs it nothing extra.
+
+The coded scale decode is the gap to raw: +8% SASS, about 10% of the time at 64 rows. Two ablations each recover about 5%, and their gains do not add: skipping the table lookup (176-179 GB/s) and skipping the code loads (175-183). A shared-memory table built in the reduction buffer is exact but slower, likely from bank conflicts: a word table runs 155-164 GB/s and a 4096-entry pair table 159-169.
+
+Levers, with ms a pass at 32 forks (RAGON_PROFILE, three interleaved runs of 53 wide passes):
+
+1. **Raw scales at 33-64 rows: -3.7 ms.** `upload_nvfp4` already keeps every coded weight's raw scales resident, in the raw blob's byte layout. A pair launch can read the values from the coded blob and those scales beside them, which is the raw kernel's decode at no extra memory. The result is bitwise the raw kernel's. Measured:
+   - MLP: 60.5-60.7 against 56.6-57.1 ms;
+   - verify pass: 178.5-179.6 against 174.8-175.5 ms;
+   - one-rep span (unprofiled, 32 forks x 100 tokens): 14.09-14.16 against 13.83-13.86 s, 223.7-224.8 against 228.6-229.1 tok/s (+2.0%), about 4.5 ms a step over 61.
+
+   All 32 forks' outputs were identical in every run, off and on, `--fanout-check 32` passed both ways, and the stream tests passed with the knob on. The fan-out check took plain steps (no verify pass), so it does not test the pair path. Everything raw (`RAGON_SCALE_CODES=0`) gives -4.6 ms on the MLP line, but it adds 2.9% to the bytes at one stream.
+2. **ROWF on the pair kernel: about -2 ms on coded,** inferred from the ablation pair, not measured directly. It sits on another branch. Raw scales and ROWF together reach 192-203 GB/s isolated, about -8 ms by the isolated ratio; that figure is not measured in the pass.
+3. **The tail wave and PDL on down: under 1 ms.**
+
+No lever reaches 5 ms in one round, so none lands. The raw-scale path is kept off-branch, behind a knob that is off by default.
+
 ## 6. Phases
 
 Each phase merges into main once its exactness gate passes and nothing regresses (one stream's agentlong tokens/s within noise of main, every earlier gate still green). Expected gains are from §3.1's model and are measured, not assumed, at each gate.
