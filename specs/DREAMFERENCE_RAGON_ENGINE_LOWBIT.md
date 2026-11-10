@@ -285,6 +285,14 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
   - **Quality:** published as level with the served recipe on five benchmarks; perplexity is the open question.
   - **Effort:** 3–5 days of loader and kernel work plus 1–2 days for the KV.
   - **Before the engine work:** the cheap rungs (the acceptance A/B on SGLang and the KL on agent traces) run first, and SGLang can serve the checkpoint today.
+  - **Built (2026-11-09), opt-in, without FP8 KV; design in §8.1.** Medians of three runs, one stream, the drafter unchanged:
+    - **Weights:** 21.0 → 18.1 GB.
+    - **Step at 25.7K context:** 98.4 → 87.0 ms at 16 rows, 97.0 → 85.4 ms at 48 rows.
+    - **Seeded replay (M0 main set):** about 10.8% faster per step at both seeds (99.1 → 88.4 ms and 99.3 → 88.7 ms). Tokens per step fall 4.3–4.7% (5.57 → 5.31 and 5.47 → 5.23), so decode rises only 6.9% and 7.1% (55.8 → 59.7 and 54.7 → 58.6 tok/s).
+    - **Agentlong, 16 greedy turns:** 105.3 → 94.0 ms per step, 6.75 → 6.60 tokens per step, 64.2 → 70.1 tok/s (+9.3%), wall 383 → 359 s.
+    - **Prefill:** 2,249 → 2,410 tok/s at 25.7K tokens.
+    - **Agent traces (24 prompts, teacher-forced against the served checkpoint):** tool names 72/72 tokens; top-1 flips 1.6%; mean KL 0.008 nats.
+    - **Shortfall:** the ×1.16 is not reached because acceptance does not hold. The drafter was trained on the served checkpoint, so the gap is the case for retraining it on Minima.
 - **1.3× needs (a2) on top** (×1.29 with (a1), ×1.39 with (a1) and (c)). The kernel side is shown to work: the 3-bit stream runs at the bus rate. The quality side is the open risk: the literature says plain post-training 3-bit loses 4–7 points on code for 32B Qwen models, so it enters only through rung 2.
 - **1.6× is out of reach of weight formats at one stream.** It would take about 40 ms off a 106 ms step, more than 3-bit everything plus FP8 KV gives (35 ms). Batches of three and four (BACKLOG §19 item 31) and more tokens per step are the levers for the rest.
 - **No-go on 2:4 sparsity:**
