@@ -225,6 +225,21 @@ void Engine::alloc_drafter() {
   if (const char* e = std::getenv("RAGON_TREE_DEPTH")) opts_.tree_max_depth = std::atoi(e);
   if (const char* e = std::getenv("RAGON_TREE_CHAIN")) opts_.tree_chain = std::atoi(e);
   if (const char* e = std::getenv("RAGON_TREE_MIN")) opts_.tree_min_mass = std::atof(e);
+  if (const char* e = std::getenv("RAGON_TREE_ROWS")) opts_.tree_rows = std::atoi(e);
+  if (const char* e = std::getenv("RAGON_TREE_BATCH")) {
+    const std::string v = e;
+    if (v == "1") {
+      opts_.tree_batch_rows[0] = 24, opts_.tree_batch_rows[1] = 16, opts_.tree_batch_rows[2] = 16;
+    } else if (v != "0" && !v.empty()) {
+      size_t at = 0;
+      for (int i = 0; i < 3 && at <= v.size(); ++i) {
+        const size_t c = v.find(',', at);
+        opts_.tree_batch_rows[i] = std::atoi(v.substr(at, c == std::string::npos ? std::string::npos : c - at).c_str());
+        if (c == std::string::npos) break;
+        at = c + 1;
+      }
+    }
+  }
   // The drafter-off guard (BACKLOG 10; core/draft_guard.hpp).
   if (const char* e = std::getenv("RAGON_DRAFT_OFF_BELOW")) opts_.draft_off_below = std::atof(e);
   if (const char* e = std::getenv("RAGON_DRAFT_ON_MARGIN")) opts_.draft_on_margin = std::atof(e);
@@ -232,7 +247,11 @@ void Engine::alloc_drafter() {
   set_draft_guard(opts_.draft_off_below, opts_.draft_on_margin);
   tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(kernels::kMaxSeqs * sizeof(kernels::TreeDesc)));
   gather_rows_dev_ = alloc<int>(kernels::kMaxStreamRows);
-  tree_grid_ = std::min(kernels::kMaxTreeVariants, 1 + std::max(0, opts_.tree_nodes));
+  {
+    int most = opts_.tree_nodes;  // the widest tree any batch size takes (the gdn paths launched)
+    for (int nd = 1; nd <= 4; ++nd) most = std::max(most, tree_nodes_for(nd, opts_.draft_block));
+    tree_grid_ = std::min(kernels::kMaxTreeVariants, 1 + std::max(0, most));
+  }
   // Each session's buffers a tree's accepted path is gathered in: every full-attention layer's K and V per KV head
   // (head-major, slot pos + row), and the verify's DeltaNet inputs and target features (row).
   const size_t D = c.head_dim;
@@ -264,6 +283,12 @@ void Engine::alloc_drafter() {
   if (opts_.tree_nodes > 0)
     std::fprintf(stderr, "tree verification: %d nodes beyond the chain (chain %d), temperature %.2f, width %d, depth %d\n",
                  opts_.tree_nodes, opts_.tree_chain, opts_.tree_temp, opts_.tree_width, opts_.tree_max_depth);
+  if (opts_.tree_nodes > 0 && opts_.tree_rows > 0)
+    std::fprintf(stderr, "tree verification: one stream %d rows (RAGON_TREE_ROWS)\n",
+                 std::min(opts_.draft_block, opts_.tree_chain + 1) + tree_nodes_for(1, opts_.draft_block));
+  if (opts_.tree_nodes > 0 && (opts_.tree_batch_rows[0] > 0 || opts_.tree_batch_rows[1] > 0 || opts_.tree_batch_rows[2] > 0))
+    std::fprintf(stderr, "tree verification: batch shares %d,%d,%d rows for 2,3,4 sequences (RAGON_TREE_BATCH)\n",
+                 opts_.tree_batch_rows[0], opts_.tree_batch_rows[1], opts_.tree_batch_rows[2]);
 }
 
 void Engine::alloc_sparse_head() {
@@ -441,10 +466,17 @@ void Engine::draft_head(int n, int E, const uint8_t* const* masks) {
   kernels::draft_head_rows(b, dh_, n, E, masks, K16, dunary_, dcand_, stream_);
 }
 
-bool Engine::tree_step(const Session& s, bool use_lookup, bool want_logits, int B) const {
-  const int rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
+int Engine::tree_nodes_for(int nd, int B) const {
+  if (opts_.tree_nodes <= 0) return 0;  // the tree is off: the knobs below do not turn it on
+  const int chain = std::min(B, opts_.tree_chain + 1);
+  const int rows = nd <= 1 ? opts_.tree_rows : nd <= 4 ? opts_.tree_batch_rows[nd - 2] : 0;
+  return rows > chain ? rows - chain : opts_.tree_nodes;
+}
+
+bool Engine::tree_step(const Session& s, bool use_lookup, bool want_logits, int B, int nodes) const {
+  const int rows = std::min(B, opts_.tree_chain + 1) + nodes;
   // A constrained session (structured output) takes its tree too: walk_tree masks every node's row.
-  return opts_.tree_nodes > 0 && !use_lookup && !want_logits && B == opts_.draft_block &&
+  return nodes > 0 && !use_lookup && !want_logits && B == opts_.draft_block &&
          rows <= kernels::kMaxSeqRows && s.pos + rows <= opts_.max_context;
 }
 
@@ -939,17 +971,18 @@ void Engine::plan_walk(StepPlan& sp, int B, const int* cand, const float* scores
   sp.masked = w.masked;
 }
 
-void Engine::plan_tree(StepPlan& sp, int B, const float* scores, bool want_logits, kernels::TreeDesc& desc) {
-  if (!tree_step(*sp.s, sp.use_lookup, want_logits, B)) return;
+void Engine::plan_tree(StepPlan& sp, int B, int nodes, const float* scores, bool want_logits,
+                       kernels::TreeDesc& desc) {
+  if (!tree_step(*sp.s, sp.use_lookup, want_logits, B, nodes)) return;
   TreeShape shape;
-  shape.nodes = opts_.tree_nodes;
+  shape.nodes = nodes;
   shape.temp = opts_.tree_temp;
   shape.width = opts_.tree_width;
   shape.max_depth = opts_.tree_max_depth;
   shape.chain = opts_.tree_chain;
   sp.tr = build_tree(sp.anchor, sp.cand.data(), scores, sp.E, draft_->config().selector_top_k,
                      std::vector<int>(sp.rows.begin() + 1, sp.rows.end()), sp.picks, shape);
-  if (sp.tr.rows() == std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes &&  // a full tree (the graph's shape),
+  if (sp.tr.rows() == std::min(B, opts_.tree_chain + 1) + nodes &&  // a full tree (the graph's shape),
       sp.tr.extra_mass >= opts_.tree_min_mass) {                              // worth its rows
     describe_tree(sp.tr, desc);
     sp.tree = true;
@@ -1203,7 +1236,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     }
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
-  plan_tree(sp, B, pin_->scores, row_logits != nullptr, pin_->tree[0]);
+  plan_tree(sp, B, tree_nodes_for(1, B), pin_->scores, row_logits != nullptr, pin_->tree[0]);
   const int V = sp.V, K = sp.K;  // rows verified, top K per row
   kv_ensure(*s_, s_->pos, s_->pos + V, stream_);  // P4b: mapped above (kv_step_rows bounds V); a no-op check
   auto t1 = std::chrono::steady_clock::now();
@@ -1457,8 +1490,10 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     }
     check(cudaStreamSynchronize(stream_), "draft");
     // BACKLOG 26: each sequence's tree, as it takes one alone, while the rows left hold the sequences after it. At the
-    // default shape two trees fit the tier (2 x 16 rows); a batch with a lookup chain verifies chains.
-    const int tree_rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
+    // default shape two trees fit the tier (2 x 16 rows); a batch with a lookup chain verifies chains. RAGON_TREE_BATCH
+    // sets the share per batch size (tree_nodes_for).
+    const int tree_nodes = tree_nodes_for(nd, B);
+    const int tree_rows = std::min(B, opts_.tree_chain + 1) + tree_nodes;
     int used = n - nd;  // the riders' rows
     int at = 0;         // the sequence's first row (its row0), where its masks go (structured output)
     for (int i = 0; i < nd; ++i) {
@@ -1466,7 +1501,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       plan_mask_rows(plans[i], at, std::max(B, tree_rows));
       plan_walk(plans[i], B, pin_->cand + size_t(i) * E * K16, scores);
       if (trees && used + tree_rows + (nd - 1 - i) * B <= kernels::kMaxStreamRows)
-        plan_tree(plans[i], B, scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
+        plan_tree(plans[i], B, tree_nodes, scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
       used += plans[i].V;
       at += plans[i].V;
     }
@@ -1474,7 +1509,8 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     // Per sequence, eagerly: a lookup chain's rows replace the drafter's, or the sequences use different drafters. With
     // no lookup each takes its tree as above; each pass leaves its results in the first sequence's place. Riders do not
     // draft.
-    const int tree_rows = std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes;
+    const int tree_nodes = tree_nodes_for(nd, B);
+    const int tree_rows = std::min(B, opts_.tree_chain + 1) + tree_nodes;
     int used = n - nd;  // the riders' rows
     int at = 0;         // as above
     for (int i = 0; i < nd; ++i) {
@@ -1488,7 +1524,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       bind_session(sp.s);
       plan_draft(sp, B, false);
       if (!any_lookup && trees && used + tree_rows + (nd - 1 - i) * B <= kernels::kMaxStreamRows)
-        plan_tree(sp, B, pin_->scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
+        plan_tree(sp, B, tree_nodes, pin_->scores, seqs[i].row_logits != nullptr, pin_->tree[i]);
       used += sp.V;
       at += sp.V;
     }

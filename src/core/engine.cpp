@@ -808,7 +808,9 @@ int Engine::kv_step_rows(const Session& s, bool spec) const {
   if (!spec || !draft_ || B < 2) return std::max(0, std::min(1, room));
   // A tree verify's rows (speculate(): the chain's first tree_chain drafts and the anchor, then tree_nodes nodes), or
   // the block; never more than the rows path takes.
-  const int tree = opts_.tree_nodes > 0 ? std::min(B, opts_.tree_chain + 1) + opts_.tree_nodes : 0;
+  int nodes = opts_.tree_nodes;  // the widest share (RAGON_TREE_ROWS, RAGON_TREE_BATCH)
+  for (int nd = 1; nd <= 4; ++nd) nodes = std::max(nodes, tree_nodes_for(nd, B));
+  const int tree = opts_.tree_nodes > 0 ? std::min(B, opts_.tree_chain + 1) + nodes : 0;
   return std::min({std::max(B, tree), int(kernels::kMaxSeqRows), room});
 }
 
