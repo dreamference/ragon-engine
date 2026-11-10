@@ -2369,7 +2369,7 @@ int main(int argc, char** argv) try {
   std::string repetition_arg, repetition_report = "incomplete";
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
-  std::string vision = "on", jpeg = "gpu";  // images (VISION §20.3)
+  std::string vision = "auto", jpeg = "gpu";  // images (VISION §20.3)
   long vision_max_pixels = 16777216;
   int vision_cache_mb = 512;
   // LoRA adapters (LORA §4): the library, the adapters loaded at start (name=dir, each dir one name in the library),
@@ -2454,7 +2454,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision auto|on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2560,8 +2560,9 @@ int main(int argc, char** argv) try {
   opts.sparse_head_dir = sparse_head_dir;
   opts.sparse_head_dynamic = sparse_head_dynamic;
   opts.side_prefill = side_prefill;
-  if (vision != "on" && vision != "off") {
-    std::cerr << "--vision is on or off\n";
+  ragon::serve::VisionMode vision_mode;
+  if (!ragon::serve::parse_vision_mode(vision, vision_mode)) {
+    std::cerr << "--vision is auto, on or off\n";
     return 2;
   }
   if (jpeg != "gpu" && jpeg != "cpu") {
@@ -2569,7 +2570,12 @@ int main(int argc, char** argv) try {
     return 2;
   }
   ragon::serve::set_jpeg_decoder(jpeg == "gpu" ? ragon::serve::JpegDecoder::Gpu : ragon::serve::JpegDecoder::Cpu);
-  opts.vision = vision == "on";
+  // Auto: the tower when the checkpoint has one, decided before the memory plan below counts it (VISION §20.3).
+  const bool has_tower =
+      vision_mode == ragon::serve::VisionMode::Auto && ragon::serve::checkpoint_has_vision_tower(model_dir);
+  const ragon::serve::VisionChoice vision_choice = ragon::serve::choose_vision(vision_mode, has_tower);
+  if (vision_choice.note) std::cerr << vision_choice.note << "\n";
+  opts.vision = vision_choice.on;
   opts.vision_max_pixels = vision_max_pixels;
   if (!lora_library.empty() && (max_loras_per_batch < 2 || max_loras_per_batch > 9 || max_loaded_loras < 1)) {
     std::cerr << "--max-loras-per-batch is 2 to 9 (the base counts as one), --max-loaded-loras at least 1\n";

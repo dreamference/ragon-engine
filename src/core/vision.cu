@@ -422,12 +422,14 @@ const __nv_bfloat16* VisionTower::upload(const Checkpoint& ck, const std::string
   return static_cast<const __nv_bfloat16*>(p);
 }
 
+bool VisionTower::in_checkpoint(const Checkpoint& ck) { return ck.has("model.visual.patch_embed.proj.weight"); }
+
 VisionTower::VisionTower(const std::string& model_dir, int max_patches) : max_patches_(max_patches) {
   if (max_patches < 4 || max_patches % 4 != 0) throw std::runtime_error("vision: max_patches must be a multiple of 4");
   Checkpoint ck(model_dir);
   const VisionConfig& c = cfg_;
   const std::string v = "model.visual.";
-  if (!ck.has(v + "patch_embed.proj.weight")) throw std::runtime_error("vision: the checkpoint has no vision tower");
+  if (!in_checkpoint(ck)) throw std::runtime_error("vision: the checkpoint has no vision tower");
   patch_w_ = upload(ck, v + "patch_embed.proj.weight", {c.hidden, c.patch_dim()});
   patch_b_ = upload(ck, v + "patch_embed.proj.bias", {c.hidden});
   pos_ = upload(ck, v + "pos_embed.weight", {c.pos_side * c.pos_side, c.hidden});

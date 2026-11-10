@@ -51,6 +51,25 @@ def test_model_info_says_images(server):
     assert status2 == 200 and info2.get("has_image_understanding") == info["has_image_understanding"]
 
 
+
+@pytest.fixture
+def text_only(server):
+    status, info = server.request("/model_info")
+    if status != 200 or not isinstance(info, dict) or info.get("has_image_understanding") is not False:
+        pytest.skip("the server reads images")
+    return server
+
+
+def test_text_only_server_answers(text_only):
+    """A checkpoint without a vision tower under the default --vision auto starts with the tower off (§20.3) and
+    serves text; an image part renders as the placeholder `[image]`, a few tokens, not 64 plus the two markers."""
+    status, a = chat(text_only, [{"type": "text", "text": "Say ok."}], max_tokens=4)
+    assert status == 200 and a["usage"]["completion_tokens"] > 0, a
+    status, b = chat(text_only, [{"type": "image_url", "image_url": {"url": RED}}, {"type": "text", "text": "Say ok."}],
+                     max_tokens=4)
+    assert status == 200 and b["usage"]["completion_tokens"] > 0, b
+    assert 0 < b["usage"]["prompt_tokens"] - a["usage"]["prompt_tokens"] < 64 + 2
+
 def test_image_tokens_are_counted(vision):
     """A 256 x 256 image is 64 tokens plus <|vision_start|> and <|vision_end|> (§20.1)."""
     status, a = chat(vision, [{"type": "text", "text": "Say ok."}], max_tokens=1)

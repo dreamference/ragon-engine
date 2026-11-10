@@ -13,6 +13,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -383,6 +385,47 @@ void test_rope_rows() {
   expect(ragon::Engine::rope_delta_after(cur) == -3, "the delta after the prompt");
 }
 
+// A one-tensor safetensors file `dir/model.safetensors` holding `name` (BF16, one element).
+void write_checkpoint(const std::string& dir, const std::string& name) {
+  const std::string header = json{{name, {{"dtype", "BF16"}, {"shape", {1}}, {"data_offsets", {0, 2}}}}}.dump();
+  std::ofstream f(dir + "/model.safetensors", std::ios::binary);
+  const uint64_t len = header.size();
+  f.write(reinterpret_cast<const char*>(&len), 8);
+  f << header;
+  f.write("\0\0", 2);
+}
+
+void test_vision_mode() {
+  VisionMode m = VisionMode::Off;
+  expect(parse_vision_mode("auto", m) && m == VisionMode::Auto, "--vision auto");
+  expect(parse_vision_mode("on", m) && m == VisionMode::On, "--vision on");
+  expect(parse_vision_mode("off", m) && m == VisionMode::Off, "--vision off");
+  expect(!parse_vision_mode("yes", m) && !parse_vision_mode("", m), "--vision yes is refused");
+  // Auto follows the checkpoint and says so when it turns the tower off; on and off do as told (on without a tower
+  // fails at the start, in VisionTower, as before).
+  VisionChoice c = choose_vision(VisionMode::Auto, true);
+  expect(c.on && !c.note, "auto with a tower: on, nothing logged");
+  c = choose_vision(VisionMode::Auto, false);
+  expect(!c.on && c.note && std::string(c.note) == "vision off: the checkpoint has no vision tower",
+         "auto without a tower: off, one line");
+  c = choose_vision(VisionMode::On, false);
+  expect(c.on && !c.note, "on without a tower: on (the start then fails)");
+  c = choose_vision(VisionMode::Off, true);
+  expect(!c.on && !c.note, "off with a tower: off");
+  // The probe reads the safetensors headers only.
+  char tmpl[] = "/tmp/ragon-vision-mode-XXXXXX";
+  const std::string dir = mkdtemp(tmpl);
+  const std::string with = dir + "/with", without = dir + "/without";
+  std::filesystem::create_directories(with);
+  std::filesystem::create_directories(without);
+  write_checkpoint(with, "model.visual.patch_embed.proj.weight");
+  write_checkpoint(without, "model.layers.0.mlp.down_proj.weight");
+  expect(checkpoint_has_vision_tower(with), "a checkpoint with model.visual.* has a tower");
+  expect(!checkpoint_has_vision_tower(without), "a text-only checkpoint has none");
+  expect(checkpoint_has_vision_tower(dir + "/missing"), "an unreadable directory: left to the start's own error");
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -394,6 +437,7 @@ int main() {
   test_patches();
   test_template_and_expansion();
   test_rope_rows();
+  test_vision_mode();
   std::printf(failures ? "VISION INPUT TESTS FAILED (%d)\n" : "all vision input tests passed\n", failures);
   return failures ? 1 : 0;
 }

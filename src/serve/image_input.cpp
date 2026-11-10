@@ -16,6 +16,8 @@
 #include <cstring>
 #include <thread>
 
+#include "core/safetensors.hpp"
+
 namespace ragon::serve {
 namespace {
 
@@ -296,6 +298,29 @@ const char* image_format_name(ImageFormat f) {
 }
 
 void set_jpeg_decoder(JpegDecoder d) { g_jpeg = d; }
+
+bool parse_vision_mode(const std::string& s, VisionMode& out) {
+  if (s == "auto") out = VisionMode::Auto;
+  else if (s == "on") out = VisionMode::On;
+  else if (s == "off") out = VisionMode::Off;
+  else return false;
+  return true;
+}
+
+VisionChoice choose_vision(VisionMode mode, bool has_tower) {
+  if (mode == VisionMode::On) return {true, nullptr};
+  if (mode == VisionMode::Off) return {false, nullptr};
+  if (has_tower) return {true, nullptr};
+  return {false, "vision off: the checkpoint has no vision tower"};
+}
+
+bool checkpoint_has_vision_tower(const std::string& model_dir) {
+  try {
+    return VisionTower::in_checkpoint(Checkpoint(model_dir));
+  } catch (const std::exception&) {
+    return true;
+  }
+}
 
 DecodedImage decode_jpeg_cpu(const std::string& bytes) {
   jpeg_decompress_struct cinfo;

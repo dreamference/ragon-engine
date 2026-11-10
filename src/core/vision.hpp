@@ -38,6 +38,9 @@ class VisionTower {
   // Loads model.visual.* from the checkpoint directory onto the current GPU and allocates scratch for images of up to
   // `max_patches` patches (the processor's maximum is 65,536).
   VisionTower(const std::string& model_dir, int max_patches);
+  // Whether the checkpoint has a tower: the tensor the constructor reads first. Host only, no GPU (ragon-serve's
+  // --vision auto asks it before the start plans its memory).
+  static bool in_checkpoint(const Checkpoint& ck);
   ~VisionTower();
   VisionTower(const VisionTower&) = delete;
   VisionTower& operator=(const VisionTower&) = delete;

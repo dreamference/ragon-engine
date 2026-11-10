@@ -39,6 +39,21 @@ const char* image_format_name(ImageFormat f);
 enum class JpegDecoder { Gpu, Cpu };
 void set_jpeg_decoder(JpegDecoder d);
 
+// --vision (§20.3): auto, the default, loads the tower when the checkpoint has one and turns it off when it has
+// none (a text-only checkpoint), saying so in one line; on requires the tower (the start fails without one, "vision:
+// the checkpoint has no vision tower"); off never loads it.
+enum class VisionMode { Auto, On, Off };
+bool parse_vision_mode(const std::string& s, VisionMode& out);  // false: not auto, on or off
+struct VisionChoice {
+  bool on = false;
+  const char* note = nullptr;  // the line the start logs, or none
+};
+// `has_tower` is read in auto mode only.
+VisionChoice choose_vision(VisionMode mode, bool has_tower);
+// VisionTower::in_checkpoint for a checkpoint directory (safetensors headers only). True when the directory cannot be
+// read, so the start fails there with the message it gives today.
+bool checkpoint_has_vision_tower(const std::string& model_dir);
+
 // Decodes PNG, JPEG or WebP to 8-bit RGB as production's loader leaves it (alpha dropped, not composited; no EXIF
 // rotation). Anything else: ImageError (unsupported_image_format); a corrupt file: ImageError (invalid_image).
 DecodedImage decode_image(const std::string& bytes);
