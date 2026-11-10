@@ -703,6 +703,10 @@ Engine::~Engine() {
   if (profile_) {
     for (const auto& [phase, sec] : phase_seconds_) std::fprintf(stderr, "profile %-24s %8.3f s\n", phase.c_str(), sec);
   }
+  if (commit_draft_batch_)
+    std::fprintf(stderr, "commit draft batch: mode %d, %ld passes, %ld rows, %ld per-sequence fallbacks, %ld checked\n",
+                 commit_draft_batch_, commit_draft_passes_, commit_draft_rows_, commit_draft_fallbacks_,
+                 commit_draft_checked_);
   for (void* p : buffers_) cudaFree(p);
   if (commit_done_) cudaEventDestroy(commit_done_);
   if (pend_free_) cudaEventDestroy(pend_free_);

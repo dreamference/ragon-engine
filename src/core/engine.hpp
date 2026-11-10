@@ -713,6 +713,12 @@ class Engine {
   // resets and hashes) joins first; the draft and the drafter's context KV (draft_materialize) do not need to.
   bool commit_overlap_ = false;
   bool commit_state_batch_ = true;  // speculate_batch: commit_state_seqs, not one replay per sequence
+  // RAGON_COMMIT_DRAFT_BATCH: 0 off (default), 1 speculate_batch's drafter commit in one pass (draft_materialize_rows),
+  // 2 the same, then each sequence's own commit over it and a byte compare of the ring slots (a check: throws).
+  int commit_draft_batch_ = 0;
+  __nv_bfloat16* cap_gather_ = nullptr;
+  int cap_gather_stride_ = 0;
+  long commit_draft_passes_ = 0, commit_draft_rows_ = 0, commit_draft_fallbacks_ = 0, commit_draft_checked_ = 0;
   bool commit_pending_ = false;
   cudaStream_t commit_stream_ = nullptr;
   cudaEvent_t commit_done_ = nullptr;
@@ -775,7 +781,11 @@ class Engine {
   // The plain fan-out step's upkeep (BATCHING §5.8): sequence i's one row (cap_ row i) at its own position, into its own
   // rings, all rows in one pass; the rings come out as draft_materialize(1, pos, i) for each leaves them.
   void draft_materialize_seqs(std::span<Session* const> seqs);
-  void draft_context(int rows, int cap_row0);  // fc over the target features, then the hidden norm, into dctx_
+  void draft_context(int rows, int cap_row0, const __nv_bfloat16* src = nullptr);  // fc + hidden norm, into dctx_
+  // A wide step's drafter commit in one pass (RAGON_COMMIT_DRAFT_BATCH): sequence i's rows cap_ row0[i] ..
+  // row0[i] + rows[i] - 1 at its positions pos .. pos + rows[i] - 1 into its own rings. False (nothing launched) when
+  // they do not fit one pass (> 32 sequences, > 64 rows, two drafters); the caller then commits per sequence.
+  bool draft_materialize_rows(std::span<Session* const> seqs, std::span<const int> row0, std::span<const int> rows);
   void draft_propose(int anchor, int B, bool graph);  // the drafter's block, top-16 candidates and lattice
   void alloc_drafter();
   void alloc_verify_rows();  // the buffers a Verify pass keeps its rows in: with a drafter, or for step_batch
