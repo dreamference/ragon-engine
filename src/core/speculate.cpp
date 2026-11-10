@@ -1738,7 +1738,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     state_batched = !ss.empty() && ss.size() <= size_t(kernels::kMaxSeqs);
     if (state_batched) commit_state_seqs(ss, r0, kk);
   }
-  // RAGON_COMMIT_DRAFT_BATCH (default off): every sequence's drafter context KV in one pass (one fc GEMM and one k/v
+  // RAGON_COMMIT_DRAFT_BATCH (default on, 0 off): every sequence's drafter context KV in one pass (one fc GEMM and one k/v
   // GEMM per drafter layer over all the accepted rows) instead of one commit per sequence, each re-reading the fc
   // weight (eng-fanout-verify-levers lever 1: ~17 ms of a 32-wide step). Falls back when the rows do not fit one pass.
   bool draft_batched = false;
