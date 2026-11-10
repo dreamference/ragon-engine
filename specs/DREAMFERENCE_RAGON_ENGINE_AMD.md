@@ -1,13 +1,13 @@
 # ragon-engine on AMD Strix Halo: a port to the AMD box, researched
 
-Part of the ragon-engine specification; the index is [README.md](./README.md). Written on 2026-10-26 in answer to the owner's question of the same day, "can we port ragon-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status (2026-10-27):** the first milestone passed at 140 W (§6.7), and **the owner postponed the AMD/Windows engine port to 2.0, to finish 1.x first. Superseded on 2026-11-06:** the port is planned again as part of Ragon's Windows node (`DREAMFERENCE_WINDOWS_NODE.md` in the ragon repository's `specs/`); the "postponed to 2.0" lines below record the earlier decision. The Windows-only plan of §5 is what a restart picks up. No engine code is ported. The probes and their results stay in `bench/amd/` and in a working folder on the box (§6.1). The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decisions:**
+Part of the ragon-engine specification; the index is [README.md](./README.md). Written in answer to the owner's question, "can we port ragon-engine to Windows so we can run it on the AMD box?". It has no section number in the former `SPEC.md`. **Status:** the first milestone passed at 140 W (§6.7), and **the owner postponed the AMD/Windows engine port to 2.0, to finish 1.x first. Superseded on 2026-11-06:** the port is planned again as part of Ragon's Windows node (`DREAMFERENCE_WINDOWS_NODE.md` in the ragon repository's `specs/`); the "postponed to 2.0" lines below record the earlier decision. The Windows-only plan of §5 is what a restart picks up. No engine code is ported. The probes and their results stay in `bench/amd/` and in a working folder on the box (§6.1). The measurements in §1 and §6 were taken on the box that evening over SSH with small probes, kept in `bench/amd/`; nothing was installed on it. §6.5 records the first milestone, which the owner approved once the study was written. **The owner's decisions:**
 
-- **2026-10-26:** there is no interim llama.cpp engine in Ragon.
-- **2026-10-27, superseding the Linux-first plan of 2026-10-26:** the port is **Windows only**. There is no Linux phase ("later, if ever") and the box's Linux dual boot is off.
-- **2026-10-27:** **the first milestone passed** at the box's 140 W setting (§6.7).
-- **2026-10-27:** **the port is postponed to 2.0**, so that 1.x is finished first. §5 is the plan for when it restarts.
+- There is no interim llama.cpp engine in Ragon.
+- **Superseding the earlier Linux-first plan:** the port is **Windows only**. There is no Linux phase ("later, if ever") and the box's Linux dual boot is off.
+- **The first milestone passed** at the box's 140 W setting (§6.7).
+- **The port is postponed to 2.0**, so that 1.x is finished first. §5 is the plan for when it restarts.
 
-Every figure is tagged: *measured* (on `the AMD box`, 2026-10-26, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Ragon's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Ragon's `specs/DREAMFERENCE_RAGON_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
+Every figure is tagged: *measured* (on `the AMD box`, the settings named), *third-party* (source named in §7), or *estimate* (the arithmetic is shown). Ragon's side of the AMD box (the client test box, the node pieces, the Windows memory model) is in Ragon's `specs/DREAMFERENCE_RAGON_AMD_NODES.md` (cited as AMD_NODES), which this document builds on and does not repeat.
 
 ## Short answer
 
@@ -15,12 +15,12 @@ Every figure is tagged: *measured* (on `the AMD box`, 2026-10-26, the settings n
 2. **The box's memory bus is not the problem.** *Measured:* a HIP read stream reaches **240 GB/s**, 94% of the 256 GB/s theoretical. That is as fast as the GB10's in-order read on `cudaMalloc` (234 GB/s, BACKLOG 19 item 28). So decode, which is bandwidth-bound, can come close to the GB10's.
 3. **Two things are worse than on the GB10: the verify's compute, and prefill.** *Measured:* WMMA sustains **51–53 TFLOPS in FP16, BF16 and INT8, and 105 TOPS in INT4** at the box's 140 W setting (40–43 and 70–83 at the delivered setting). There is no FP4 or FP8 matrix unit. That is about 220 FLOP per byte of bus, against about 900 on the GB10. A 16-row verify fits under the weight stream (§1.3, measured in §6.7), but prefill is compute-bound. *Estimate:* its ceiling is about **550–850 tokens/s**, against ragon-engine's 2,100–2,600 on the GB10.
 4. **What the engine's design is worth here** (*estimate*, §1.2): a ragon-engine-grade port with 16-row tree verification reaches about **55–65 tokens/s** on agent output (raised from 50–60 by §6.7's kernel figures). One agent turn at 32K would take about **6–7 s**, against about 4 s on the GB10, ~15 s for gufo (*third-party*) and ~18 s for llama.cpp (*measured*, §6.3). The engine's *speculation* is not the missing piece: DFlash2 already runs in upstream llama.cpp on this box. What is missing is a **verify that costs no more than a plain decode step**. *Measured* on four agentlong turns: llama.cpp's DFlash2 chain accepts **5.33 tokens per step**, close to ragon-engine's 6.02–6.74 on the GB10. But its 8-row step costs **2.6× its plain decode step**, so it decodes at 22 tokens/s instead of about 55.
-5. **Plan (§5, the owner's decisions of 2026-10-26 and 2026-10-27).**
+5. **Plan (§5, the owner's decisions).**
    - **The first milestone has passed** (§6.5–§6.7). It asked whether a 16-row NVFP4/FP8 WMMA streaming GEMM over the 27B's real matrix shapes runs at ≥ 200 GB/s and costs ≤ 1.15× a one-row pass, and whether a captured step graph costs ≤ 10 µs per node. At the box's 140 W setting:
      - NVFP4 at 16 rows runs at **227–230 GB/s steady over 90 s**, against 190–192 at the delivered setting. It is 223–230 GB/s in every condition, 92–95% of the read stream.
      - 16 rows cost 0.98–1.03× one row.
      - FP8 runs at 221–222 GB/s, and a graph node costs 1.1 µs.
-   - **The port is Windows only** (the owner, 2026-10-27), in three phases (§5):
+   - **The port is Windows only** (the owner), in three phases (§5):
      - W0, the Windows toolchain and bring-up;
      - W1, decode;
      - W2, prefill and serving with the Windows host layer.
@@ -65,7 +65,7 @@ Against the GB10:
 | FP8, FP4 | **none** on gfx11 (FP8 WMMA is gfx12 and gfx1170 only, LLVM `BuiltinsAMDGPU.td`) | — |
 
 - These figures are at the box's delivered power setting, and they are about 70% of peak, the same fraction as a third-party hipBLASLt BF16 GEMM (36.9 TFLOPS, llm-tracker). The cause was the power limit.
-- **At the 140 W setting** (the front knob, 2026-10-27, §6.7), the same probe measures **52.5 TFLOPS FP16, 51.5 BF16, 53.4 TOPS INT8 and 105.1 TOPS INT4**, 88% of peak.
+- **At the 140 W setting** (the front knob, §6.7), the same probe measures **52.5 TFLOPS FP16, 51.5 BF16, 53.4 TOPS INT8 and 105.1 TOPS INT4**, 88% of peak.
 - The read stream is unchanged at 240 GB/s.
 - INT8 runs at the FP16 rate, so W8A8 buys bandwidth, not compute.
 - The NVIDIA side, for comparison: the GB10 has about 250 TFLOPS of dense FP8 and 500 TFLOPS of dense FP4 (OVERVIEW §4).
@@ -111,7 +111,7 @@ The right-hand column applies the GB10's ratio of step-average to read-stream ba
 - On the GB10, 21.2 GB in 102.6 ms is 207 GB/s, which is 79–88% of its read figures.
 - At 79–88% of 240 GB/s, a step on the box takes 100–112 ms.
 
-**Risk.** The GB10 hides its verify compute for free and the box does not (§1.3). If none of the verify's compute overlaps the stream, the step grows by about 20–40 ms. At τ = 6.74 that is **48 tokens/s**, the low end. The range stated on 2026-10-26 was therefore **about 50–60 tokens/s** on agentlong greedy, for a port as well made as the GB10 engine. The first milestone then measured the verify's compute hiding under the stream (16 rows cost what one costs, at 223–230 GB/s at 140 W, §6.7), which moves the range to **55–65 tokens/s**.
+**Risk.** The GB10 hides its verify compute for free and the box does not (§1.3). If none of the verify's compute overlaps the stream, the step grows by about 20–40 ms. At τ = 6.74 that is **48 tokens/s**, the low end. The range first stated was therefore **about 50–60 tokens/s** on agentlong greedy, for a port as well made as the GB10 engine. The first milestone then measured the verify's compute hiding under the stream (16 rows cost what one costs, at 223–230 GB/s at 140 W, §6.7), which moves the range to **55–65 tokens/s**.
 
 The acceptance itself should carry over:
 
@@ -252,7 +252,7 @@ The Windows penalty is third-party: gufo's Windows fork measured decode 7.6–9.
 | Packaging, signing, Smart App Control (AMD_NODES §13.2) | 0.5 |
 | **Windows total, Linux included** | **15–21** |
 
-The owner chose a Windows-only port (2026-10-27). §5 re-estimates the work for that: still **15–21 weeks**, since the kernel rows stay and move to Windows.
+The owner chose a Windows-only port (§5). §5 re-estimates the work for that: still **15–21 weeks**, since the kernel rows stay and move to Windows.
 
 **Risks.**
 
@@ -333,7 +333,7 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ### 3.4 (d) The box's Linux side only
 
-**Not chosen.** The owner decided on 2026-10-27 that the port is Windows only, and the box's Linux dual boot is off. This option is kept as the record of what Linux would have saved and cost; it is "later, if ever".
+**Not chosen.** The owner decided that the port is Windows only, and the box's Linux dual boot is off. This option is kept as the record of what Linux would have saved and cost; it is "later, if ever".
 
 **What it is.** (a) on Ubuntu 26.04 with ROCm, plus AMD_NODES §7's minimum Linux node (platform detection, a registry entry, the `/dev/kfd` launch prefix, the GTT pre-flight, the advertisement).
 
@@ -366,8 +366,8 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 **Best on Windows:**
 
-- **Of the engines that exist today:** llama.cpp (release zips, *measured* here) and gufo (native Windows build, upstream). The owner decided against an interim llama.cpp engine in Ragon (2026-10-26), so neither is planned as a Ragon engine.
-- **For ragon-engine itself:** (a), on Windows only. This is the owner's choice of 2026-10-27 (§5).
+- **Of the engines that exist today:** llama.cpp (release zips, *measured* here) and gufo (native Windows build, upstream). The owner decided against an interim llama.cpp engine in Ragon, so neither is planned as a Ragon engine.
+- **For ragon-engine itself:** (a), on Windows only. This is the owner's choice (§5).
 
 **Best on Linux:** (d), which is (a) built where ROCm is first-class. Not pursued: the port is Windows only (§5).
 
@@ -413,17 +413,17 @@ Ranked last, unless shipping without ROCm becomes the deciding requirement. The 
 
 ---
 
-## 5. The plan: a Windows-only port (the owner's decisions of 2026-10-26 and 2026-10-27)
+## 5. The plan: a Windows-only port (the owner's decisions)
 
 **The decisions:**
 
-| Date | Decision |
+| No. | Decision |
 |---|---|
-| 2026-10-26 | No interim llama.cpp engine in Ragon |
-| 2026-10-26 | If the first milestone passes, port on Linux and Windows, Linux first, each phase exact against a reference. *Superseded the next day* |
-| **2026-10-27** | **The port is Windows only.** No Linux phase: Linux is "later, if ever". The box's Linux dual boot is off |
-| 2026-10-27 | The box's front power knob set to 140 W. The first milestone was re-measured at it and **passed** (§6.7) |
-| **2026-10-27** | **The port is postponed to 2.0**, to finish 1.x first. The phases below start when 2.0 work begins |
+| 1 | No interim llama.cpp engine in Ragon |
+| 2 | If the first milestone passes, port on Linux and Windows, Linux first, each phase exact against a reference. *Superseded the next day* |
+| **3** | **The port is Windows only.** No Linux phase: Linux is "later, if ever". The box's Linux dual boot is off |
+| 4 | The box's front power knob set to 140 W. The first milestone was re-measured at it and **passed** (§6.7) |
+| **5** | **The port is postponed to 2.0**, to finish 1.x first. The phases below start when 2.0 work begins |
 
 **Why Windows-only costs about what Linux-then-Windows did.**
 
@@ -455,7 +455,7 @@ The rule makes the references below checkable. It also keeps a later Linux build
 
 | Phase | What | Effort | Gate to the next |
 |---|---|---|---|
-| **M1 (passed, 2026-10-27)** | The verify-kernel probe (§6.5–§6.7) | 3 days | NVFP4 and FP8 at 16 rows ≥ 200 GB/s and ≤ 1.15× one row; graph ≤ 10 µs per node. **Measured at 140 W:** 223–230 and 221–222 GB/s, 0.98–1.03×, 1.1 µs |
+| **M1 (passed)** | The verify-kernel probe (§6.5–§6.7) | 3 days | NVFP4 and FP8 at 16 rows ≥ 200 GB/s and ≤ 1.15× one row; graph ≤ 10 µs per node. **Measured at 140 W:** 223–230 and 221–222 GB/s, 0.98–1.03×, 1.1 µs |
 | **W0** | The Windows toolchain and bring-up: a build machine with Visual Studio Build Tools + the Windows SDK + TheRock 10.0.0 + vcpkg (ICU, PCRE2, nlohmann_json); CMake with clang-cl; hipify of the host code; the portable kernels (norms, conv, DeltaNet recurrence, sampling, top-k, drafter non-GEMM parts); the loader on `MapViewOfFile`; kernel tests green on the box | 3–4 weeks | W0's reference; the test binaries run on the box against the driver's HIP runtime (§6.4) |
 | **W1** | Decode: the streaming GEMM from the probe (NVFP4 and FP8, 1–16 rows, the head and the drafter's shapes), decode and verify attention over BF16 KV, split across the KV length with a fixed-order combine, DeltaNet with the tree replay, the drafter, the tree and lookup, `hipGraph` capture of the step, `ragon-run` on Windows | 6–8 weeks | W1's reference; **≥ 50 tokens/s on agentlong greedy**; the GB10 quality bar |
 | **W2** | Prefill on WMMA (W4A16/W8A16 FP16, or W8A8 INT8), prefill DeltaNet; `ragon-serve` with a Windows HTTP layer (a small server for the routes of [API](./DREAMFERENCE_RAGON_ENGINE_API.md), or proxygen if it builds); WDDM host safety (the DXGI budget, TDR-bounded kernels, the 96 GB carve-out, kill and restart); packaging as a zip against the driver's HIP runtime; signing | 6–9 weeks | W2's reference; prefill ≥ 500 tokens/s at 32K; a Work session from a client against the box |
@@ -471,9 +471,9 @@ The rule makes the references below checkable. It also keeps a later Linux build
 
 ---
 
-## 6. What was run on the box (2026-10-26 22:15 UTC to 2026-10-27 09:03 UTC, box clock)
+## 6. What was run on the box (box clock)
 
-The probes are in this repository under `bench/amd/`. a working folder on the box (named by `AMD_PORT_DIR`) keeps them and their results, cleaned on 2026-10-27 to 0.5 MB:
+The probes are in this repository under `bench/amd/`. a working folder on the box (named by `AMD_PORT_DIR`) keeps them and their results, cleaned to 0.5 MB:
 
 - **Kept:** the sources, the scripts, the code objects (`vgf.co` is the build that passed in §6.7), the run logs and the result files.
 - **Dropped:** the drafter GGUF (re-downloadable; its SHA-256 is below), the copied agentlong request bodies and their answers, the template and the tuning variants. Nothing was installed, no driver or setting was changed, and the downloads came to 1.14 GB (the drafter).
@@ -553,7 +553,7 @@ A ragon-engine build for Windows therefore needs TheRock only to compile. The re
 
 ### 6.5 The first milestone, day 1: the verify kernel probe
 
-The owner approved starting §5's first milestone once this study was written. This is its first day (2026-10-26, from 23:24 UTC), with `bench/amd/vg.hip` and `vg.ps1`. Everything is *measured*.
+The owner approved starting §5's first milestone once this study was written. This is its first day, with `bench/amd/vg.hip` and `vg.ps1`. Everything is *measured*.
 
 **The setup.**
 
@@ -602,7 +602,7 @@ ragon-engine's loader already retiles every matrix for its kernels on the GB10 (
 
 ### 6.6 The first milestone, day 2: a faster NVFP4 decode, the graph gap, and sustained load
 
-*Measured* on 2026-10-26 (box clock, 23:35–23:56 UTC), same matrices and harness. All kernels stay within 1.4–1.6 × 10⁻⁵ of the FP32 reference.
+*Measured* (box clock), same matrices and harness. All kernels stay within 1.4–1.6 × 10⁻⁵ of the FP32 reference.
 
 **The decode through a byte table** (`dec_fp4_lut`, `-DLUT`):
 
@@ -655,7 +655,7 @@ Two findings came out of these runs:
 
 ### 6.7 The first milestone at 140 W: passed
 
-The owner set the box's front power knob to 140 W on 2026-10-27. *Measured* the same morning (box clock, 08:57–09:03 UTC) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ragon exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
+The owner set the box's front power knob to 140 W. *Measured* then (box clock) with the same code object as §6.6 (`-DKMAJOR -DNT -DKC=256 -DLUT -DXDB`), with no code changed. A `ragon exec` test of the Windows fix agent was running at the time; it uses the GB10 node, not the GPU.
 
 **The NVFP4 16-row kernel**, the gate's open item:
 
@@ -705,7 +705,7 @@ All kernels stay within 1.4–1.6 × 10⁻⁵ of the FP32 reference.
 
 ## 7. Sources
 
-Read on the web on 2026-10-26 unless dated otherwise. "Third-party" means not measured by us.
+Read on the web unless dated otherwise. "Third-party" means not measured by us.
 
 - **gufo:** github.com/gufo-org/gufo at `bb5ab8dc` (v0.25.0, 2026-10-26, MIT):
   - `docs/models/qwen3.8-27b/BENCHMARKS.md` (2026-10-19; Q4 AR 12.37 / 11.13 tokens/s, DFlash2 mixed 26.91 / 19.77, prefill 648.89 / 469.28 / 413.41 at 0 / 32K);
