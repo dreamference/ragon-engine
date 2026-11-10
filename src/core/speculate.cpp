@@ -241,10 +241,13 @@ void Engine::alloc_drafter() {
       for (int h = 0; h < c.kv_heads; ++h) {
         // P4: a head's run inside each page, rows through the session's page table (in element units); kv_head_stride
         // is the head stride of either layout
-        const size_t off = size_t(h) * kernels::kv_head_stride(D);
+        // FP8-only pages: a middle layer's rows are in its slots (their head stride, the slot half of pages8)
+        const bool mid8 = kv_fp8_only_ && l > 0 && l + 1 < s.kcache.size();
+        const size_t off = size_t(h) * (mid8 ? kv_slot_hs_ : kernels::kv_head_stride(D));
+        const uint64_t* pg = mid8 ? s.pages8 : s.pages;
         const int unit = s.pages ? int(sizeof(__nv_bfloat16)) : 0;
-        g.push_back({reinterpret_cast<char*>(s.kcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
-        g.push_back({reinterpret_cast<char*>(s.vcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
+        g.push_back({reinterpret_cast<char*>(s.kcache[l] + off), D * 2, int(D * 2), 1, pg, unit});
+        g.push_back({reinterpret_cast<char*>(s.vcache[l] + off), D * 2, int(D * 2), 1, pg, unit});
       }
     for (const kernels::GatherBuf& b : g)
       if (b.row_bytes % 16 != 0) throw std::runtime_error("tree gather: a row is not a multiple of 16 bytes");

@@ -159,6 +159,7 @@ int main(int argc, char** argv) {
       else k::set_kv_layout(size_t(PT) * D, D);
       for (int bulk = 0; bulk < 2; ++bulk)
         for (int pf : {0, 2}) {
+          if (bulk && q8mode && layout == "page") continue;  // the FP8 read needs the cp.async tiles
           k::set_attention_bulk(bulk != 0);
           k::set_attention_prefetch(pf);
           std::vector<float> ms;

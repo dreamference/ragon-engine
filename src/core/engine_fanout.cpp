@@ -329,7 +329,7 @@ void Engine::fork_session(int from) {
     kv_book_->unshare(s_->kv_ids, L);
     kv_table_sync(*s_, stream_);
     if (kv_book_->pending_pages() > pending) kv_record_release();
-    kv_ensure(*s_, L, target, stream_);
+    kv_ensure(*s_, L, target, stream_, false);  // FP8-only: slots when its passes run
   }
   // The parent's state is read only until here: its next pass or commit may run on another stream.
   check(cudaStreamSynchronize(stream_), "fork");

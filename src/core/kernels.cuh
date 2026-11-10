@@ -160,6 +160,11 @@ struct KvQ8 {
   const uint8_t* v8 = nullptr;
   const uint8_t* sealed = nullptr;
   unsigned long long unit = 0;
+  // FP8-only pages (RAGON_KV_FP8_ONLY): hs8 != 0. The layer's pages live as codes only, k8/v8 the FP8 home by page id
+  // (head stride hs8, the pool's), and the BF16 table the kernel gets (pages) addresses the unsealed pages' slots; the
+  // ids table sits at pages + ids_at. sealed[id] alone decides: a sealed tile is read from the home whatever the rows.
+  unsigned long long hs8 = 0;
+  int ids_at = 0;
   bool on() const { return ks > 0.f; }
 };
 // M2 (LOWBIT §8): the FP8 mirror of the pages ids[0 .. n) (host list, copied as parameters, kKvSealMax a launch) for the
@@ -171,6 +176,15 @@ void kv_seal(const __nv_bfloat16* pool, uint8_t* mirror, uint8_t* sealed, const 
              int Hkv, int D, size_t page_unit, const float* kinv, const float* vinv, cudaStream_t s);
 // sealed[ids[i]] = 0 (host list): the pages' BF16 is about to change (a write, a copy into them, a new owner).
 void kv_unseal(uint8_t* sealed, const int* ids, int n, cudaStream_t s);
+// FP8-only pages: the full-attention slots [l0, l1) of the BF16 slot pool `slots` ([l - l0][K, V][kv head][slot][page],
+// head stride hs_slot) and of the FP8 home `home` ([l - l0][K, V][kv head][page id][page], head stride hs_home), page
+// element offsets slot * unit and id * unit. kv_seal8: home[ids[i]] = e4m3(slots[sl[i]] * inv), then sealed[ids[i]] = 1
+// (the codes kv_seal writes). kv_open8: slots[sl[i]] = the decoded home[ids[i]] (the values a sealed tile reads).
+void kv_seal8(const __nv_bfloat16* slots, uint8_t* home, uint8_t* sealed, const int* ids, const int* sl, int n, int l0,
+              int l1, int Hkv, int D, size_t hs_slot, size_t hs_home, size_t unit, const float* kinv,
+              const float* vinv, cudaStream_t s);
+void kv_open8(__nv_bfloat16* slots, const uint8_t* home, const int* ids, const int* sl, int n, int l0, int l1, int Hkv,
+              int D, size_t hs_slot, size_t hs_home, size_t unit, const float* ks, const float* vs, cudaStream_t s);
 // The verify's conv over a tree: post[m] from pre[m] and its ancestors' pre rows (or the window `state`, unwritten).
 void gdn_conv_tree(const float* pre, float* post, const float* state, const __nv_bfloat16* w, int M, int C,
                    const TreeDesc* td, cudaStream_t s);
@@ -534,6 +548,8 @@ void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float
 // is interleaved [pos][head][dim]; the engine sets head-major [head][pos][dim], so one head's keys are
 // one contiguous stream for the attention kernels.
 void set_kv_layout(size_t head_stride, size_t pos_stride);
+// The head stride the launches that follow use (the FP8-only slot pool's for its layers); returns the previous one.
+size_t swap_kv_head_stride(size_t head_stride);
 // RAGON_KV_CALIB (LOWBIT §8): folds the largest |K| and |V| of positions [p0, p0 + n) of one layer's cache (pages:
 // its page table, or nullptr for a flat slot) into amax[0] and amax[1].
 void kv_absmax(const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, const uint64_t* pages, int p0, int n,

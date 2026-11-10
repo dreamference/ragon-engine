@@ -295,20 +295,27 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
   - the serving tools have dropped it.
 - **No-go on MXFP4 and on layer skipping.**
 
-**Built 2026-11-09: the FP8 KV cache (c), behind `--kv-fp8` / `RAGON_KV_FP8=1`, off by default; stopped at the step-time gate.**
+**Built 2026-11-09 and 2026-11-10: the FP8 KV cache (c), behind `--kv-fp8` / `RAGON_KV_FP8=1`, off by default. It failed the step-time gate at 25.7K and two quality measures, so it stays off until the owner rules.**
 
 - **What it does:**
   - per-layer K and V scales come from a calibration sidecar (`--kv-fp8-scales`, `bench/quant/kv_calib.py`), because the checkpoint names an FP8 static scheme but carries no scale tensors; scale = absmax/448, and the sidecar records its source;
-  - only full accepted pages are sealed into an E4M3 mirror; the tail page, the verify and tree rows, and the first and last full-attention layers stay BF16;
+  - the 14 middle full-attention layers store a page only as E4M3 (its home page, 2.36 MB against 4.19 MB in BF16); a page still being written lives in a BF16 slot, is sealed into its home page when the read rule's 32-position boundary passes it, and is opened back into a slot for copy-on-write or rollback. The tail page, the verify and tree rows, and the first and last full-attention layers stay BF16;
   - the paged attention kernel reads a sealed page's FP8 codes and dequantizes them on chip, for decode, verify, tree and prefill.
-- **Knob off:** every path is unchanged (the BF16 attention kernels' SASS is identical to the base build's; the two KV-write kernels take the page flags, which are null with the knob off; ctest 21/21; spec, prefix, batch and graph checks; agentlong 16 turns greedy identical).
+- **Knob off:** every path is unchanged (the BF16 attention kernels' SASS is identical to the base build's; ctest; spec, prefix, batch and graph checks).
 - **Knob on:** `--spec-check` (including two 28K prompts) and `--prefix-check` pass bit for bit.
-- **Step time, one stream, 16-row tree, medians of three interleaved runs:**
-  - at 25.7K: 98.6 → 98.0 ms, saving 0.6 ms against a 2.5 ms gate (below half the byte gain);
-  - at 64K: 111.5 → 105.3 ms, saving 6.2 ms against a 6 ms gate.
-  - This used FP8 layers on 2048-key ranges. A kernel round that issued FP8 tiles two ahead was slower and was dropped.
-- **Memory:** the mirror sits beside the BF16 pool, so this build adds about half a page per sealed page instead of halving it. Pages stored only as FP8 are still to build.
-- **Not run:** the quality gate (flips, gaps, tool names, KL by length, the 32K needles) and the replay acceptance check, because the build stopped at step time first.
+- **Memory:** sessions per GB of pool at 64K go from 0.23 (BF16) to 0.40 at 8 sessions (0.41 for the pages alone; the slots cost the rest). The first build's mirror beside the BF16 pool gave 0.16.
+- **Step time, one stream, 16-row tree, graphs and PDL, medians of three interleaved runs:**
+  - at 25.7K: 98.4 → 97.6 ms, saving 0.8 ms against a 2.5 ms gate (FAIL); 97.4 ms with `--attn-prefetch 0`, which is bit-identical;
+  - at 64K: 111.5 → 107.1 ms, saving 4.4 ms against a 6 ms gate (FAIL); with 2048-key ranges (`RAGON_ATTN_CHUNK=2048`, which changes the outputs and was not quality-gated) 105.2 ms, 6.3 ms saved, but 0.5 ms at 25.7K;
+  - the full-attention core is 9 % of the 25.7K step and the microbench's best FP8 setting saves 0.11 ms per layer there, so none of the measured settings reaches 2.5 ms at 25.7K (1.5 ms at best): the gain is a long-context one, and no kernel round was run.
+  - Prefill attention is slower with the knob on: 3.23 → 3.88 s at 25.7K.
+- **Quality, teacher-forced against the BF16 cache** (`bench/agreement`, 54 cases, 2,490 positions):
+  - top-1 flips 24 (limit 85), the largest flip's gap 1.45 nats (limit 1.75), needles 16 of 16 as BF16;
+  - mean KL 0.00168 nats; 0.00124 below 25K and 0.00334 from 25K to 64K, a ratio of 2.70 against a 1.25 limit (FAIL). The short bucket is mostly prompts under 2K (KL 0.00043); from the 8–25K sub-bucket to 25K+ the ratio is 1.13;
+  - tool names in the first responses: 18 of 24 against BF16's 19 (FAIL by one). Two FP8 responses open `<function=exec_command>` and reach the 400-token cap before `</tool_call>`; counted from the opening tag the two are equal, 19 and 19;
+  - top-5: 66.3 % in order, 79.7 % as a set, FP8's top-1 in BF16's top-5 100 %;
+  - one recalibration round (scales ×2) gave 21 flips, gap 1.08, and a KL ratio of 1.96, still over the limit, so the reported scales are the absmax ones.
+- **Replay acceptance** (M0 main set, one stream, on against off): seed 1013 4.414 → 4.378 accepted per pass (−0.8 %, limit 3 %); seed 2026 4.419 → 4.363 (−1.3 %).
 
 ## Sources
 

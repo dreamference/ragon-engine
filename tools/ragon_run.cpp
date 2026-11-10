@@ -536,7 +536,9 @@ int main(int argc, char** argv) {
     opts.kv_fp8_scales = kv_fp8_scales;
     opts.kv_pages = kv_pages;
     if (kv_pool_mb >= 0) {  // P4b: pages of the model's page size (64 positions of every full-attention layer's K and V)
-      const size_t page = ragon::serve::kv_page_bytes(ragon::ModelConfig::from_file(model + "/config.json"));
+      const ragon::ModelConfig mc = ragon::ModelConfig::from_file(model + "/config.json");
+      const size_t page = ragon::kv_fp8_only(kv_fp8, kv_pages) ? ragon::serve::kv_page_bytes_fp8(mc)
+                                                               : ragon::serve::kv_page_bytes(mc);
       opts.kv_pool_pages = static_cast<int>(std::max<size_t>(1, (size_t(kv_pool_mb) << 20) / page));
     }
     opts.draft_nvfp4 = !draft_bf16;
