@@ -1084,7 +1084,7 @@ size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
 // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
 // 16-key tiles with 3-5 stages were no faster.
 constexpr int kAttnRows = 96, kAttnTk = 32, kAttnNs = 2;
-// RAGON_ATTN_SHARED_RETILE=1: the cascade's shared phase (attention_shared_kernel) with 128 query rows per block, 8 warps,
+// RAGON_ATTN_SHARED_RETILE (default on, 0 off; not with --kv-fp8, which keeps 96 rows): the cascade's shared phase (attention_shared_kernel) with 128 query rows per block, 8 warps,
 // not 96 and 6. 64 verify rows of 6 heads are then 3 row blocks per (KV head, key range), not 4: 96 blocks, two full
 // waves on 48 SMs, where 128 left a third wave two thirds full, and 8 warps fill the 4 sub-partitions evenly (6 put two
 // on two of them, one on the others). Each warp keeps its 16 rows, the tile grid and the key order: the same floats.
@@ -1093,7 +1093,7 @@ constexpr int kAttnSharedRetileRows = 128;
 bool attention_shared_retile() {
   static const bool on = [] {
     const char* e = std::getenv("RAGON_ATTN_SHARED_RETILE");
-    const bool v = e && std::atoi(e) != 0;
+    const bool v = !e || std::atoi(e) != 0;
     if (v) std::fprintf(stderr, "attention shared retile: %d query rows per block\n", kAttnSharedRetileRows);
     return v;
   }();
