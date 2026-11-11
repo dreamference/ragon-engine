@@ -767,18 +767,19 @@ int Engine::match_session(const std::vector<int>& prompt, const std::string& key
 }
 
 int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned) const {
-  auto is_pinned = [&](size_t i) { return i < pinned.size() && pinned[i]; };
-  for (size_t i = 0; i < sessions_.size(); ++i)
-    if (!sessions_[i].owned && !is_pinned(i)) return static_cast<int>(i);
+  return lru_slot(slot_states(), protect_seconds, pinned);
+}
+
+std::vector<SlotState> Engine::slot_states() const {
   const auto now = std::chrono::steady_clock::now();
-  int best = -1;
+  std::vector<SlotState> out(sessions_.size());
   for (size_t i = 0; i < sessions_.size(); ++i) {
     const Session& s = sessions_[i];
-    if (is_pinned(i)) continue;
-    if (!s.key.empty() && std::chrono::duration<double>(now - s.last_used).count() < protect_seconds) continue;
-    if (best < 0 || s.last_used < sessions_[best].last_used) best = static_cast<int>(i);
+    out[i].owned = s.owned;
+    out[i].keyed = !s.key.empty();
+    out[i].idle_s = std::chrono::duration<double>(now - s.last_used).count();
   }
-  return best;
+  return out;
 }
 
 void Engine::load_drafters() {
