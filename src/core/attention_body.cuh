@@ -554,13 +554,17 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   [[maybe_unused]] unsigned f8 = 0;
   auto sealed_tile = [&](int k0) {
     if constexpr (!Q8) return false;
+    else if (q8.hs8 != 0) return q8.sealed[pages[q8.ids_at + k0 / kKvPageTokens] / q8.unit] != 0;
     else return q8.k8 != nullptr && pages != nullptr && k0 + TK <= minP && k0 + TK <= kctx &&
                 q8.sealed[pages[k0 / kKvPageTokens] / q8.unit] != 0;
   };
+  // Where a sealed tile's codes are: the mirror at the tile's own offsets, or (FP8-only) the home by page id.
+  [[maybe_unused]] auto f8_pages = [&]() { return q8.hs8 != 0 ? pages + q8.ids_at : pages; };
+  [[maybe_unused]] auto f8_hs = [&]() { return q8.hs8 != 0 ? static_cast<size_t>(q8.hs8) : hs; };
   auto load_tile = [&](int i, int k0) {
     if constexpr (Q8) {
       if (sealed_tile(k0)) {
-        attn_load_tile_f8<TK>(raw8, q8, k0, kvh, hs, ps, pages);
+        attn_load_tile_f8<TK>(raw8, q8, k0, kvh, f8_hs(), ps, f8_pages());
         f8 |= 1u << (i % NS);
         return;
       }
@@ -571,7 +575,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   auto prefetch_tile = [&](int k0) {
     if constexpr (Q8) {
       if (sealed_tile(k0)) {  // the codes into L2: TK * D bytes each of K and V
-        const size_t off = kv_off(pages, kvh, k0, hs, ps);
+        const size_t off = kv_off(f8_pages(), kvh, k0, f8_hs(), ps);
         const uint32_t bytes = static_cast<uint32_t>(TK) * kMmaD;
         if (threadIdx.x == 0)
           asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(q8.k8 + off), "r"(bytes) : "memory");

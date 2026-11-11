@@ -648,7 +648,8 @@ class Engine {
   // asks for (copy-on-write; none in P4b, where no page is shared) and writes the changed table entries, all on st.
   // Throws KvPoolExhausted, with nothing changed, when the pool is short even after waiting for the deferred frees.
   // Never inside a graph capture (a captured table update would replay stale entries): there it only checks.
-  void kv_ensure(Session& s, int from, int to, cudaStream_t st);
+  // write = false (begin_prefill's whole prompt, a fork's target): the pages mapped, FP8-only slots only for copies.
+  void kv_ensure(Session& s, int from, int to, cudaStream_t st, bool write = true);
   // s's pages wholly at or past position n released (their table entries back to page 0 on the main stream), and
   // the release recorded on every stream.
   void kv_release(Session& s, int n);
@@ -668,6 +669,29 @@ class Engine {
   std::vector<uint8_t> kv_sealed_host_;
   std::vector<float> kv_q8_kinv_, kv_q8_vinv_;
   void kv_seal_pages(Session& s, int from, cudaStream_t st);
+  // FP8-only pages (kv_fp8_only, RAGON_KV_FP8_ONLY): the pool holds the first and last full-attention layer (BF16, by
+  // id); kv_home8_ the middle ones as E4M3 codes by id ([layer][K, V][kv head][id][page], the pool's head stride);
+  // kv_slots_ BF16 slots for the middle layers' unsealed pages ([layer][K, V][kv head][slot][page], kv_slot_hs_).
+  // A page is sealed (codes in the home, kv_sealed_ set, no slot) once it lies below its writer's position; a page a
+  // pass writes has a slot (kv_materialize; a sealed one is decoded into it first). Session::pages8 holds each page's
+  // slot offset, then (at pages_per_session) its id offset, for the middle layers' kernels.
+  bool kv_fp8_only_ = false;
+  __nv_bfloat16* kv_slots_ = nullptr;
+  uint8_t* kv_home8_ = nullptr;
+  size_t kv_slot_hs_ = 0;
+  int kv_pps_ = 0;                        // pages_per_session (Session::pages8's ids half starts there)
+  std::vector<int> kv_slot_free_, kv_slot_pending_;
+  std::vector<int> kv_slot_of_;           // by page id: its slot, 0 none
+  std::vector<uint8_t> kv_stale_;         // by page id: the device flag still set from before the page was given back
+  std::vector<float> kv_q8_ks_, kv_q8_vs_;
+  int kv_slots_used_ = 0, kv_slot_peak_ = 0;
+  long kv_unaligned_ = 0;                 // pages decoded for a write whose start is off the 32 grid (inexact, B41)
+  long kv_opened_ = 0, kv_sealed_n_ = 0;
+  void kv_ensure8(Session& s, int from, int to, cudaStream_t st, bool write);
+  void kv_seal8(Session& s, int from, cudaStream_t st);
+  void kv_materialize(Session& s, int from, int to, cudaStream_t st);
+  int kv_take_slot();
+  std::vector<int> kv_hold8(int from, int to);
   std::string kv_calib_path_;             // RAGON_KV_CALIB: where the destructor merges the K/V maxima
   float* kv_amax_ = nullptr;              // [n_full][2] absolute maxima (float bits, atomicMax), calibration only
   int kv_amax_slots_ = 0;
@@ -1117,6 +1141,8 @@ class Engine {
     // per full-attention layer, [Hkv][max_context][D]; P4 (--kv-pages): the layer's K and V bases in the pool
     std::vector<__nv_bfloat16*> kcache, vcache;
     uint64_t* pages = nullptr;           // P4: the device page table (element offsets of its pages), or nullptr: flat
+    uint64_t* pages8 = nullptr;          // FP8-only: the slot offsets, then the id offsets (Engine::kv_fp8_only_)
+    std::vector<uint64_t> page8_host;    // FP8-only: what pages8's slot half holds
     std::vector<uint64_t> page_host;     // P4: what the device table holds (written only through kv_table_set)
     std::vector<int> kv_ids;             // P4b: its pages' ids, KvPool's table (0: unmapped)
     std::vector<float*> gdn, conv;                // DeltaNet and conv state, per linear layer

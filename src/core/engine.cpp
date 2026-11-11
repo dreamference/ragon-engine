@@ -218,10 +218,16 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     // holds id * PT * D. The kernels see only a larger head stride: the same values, the same results. Verify passes
     // read faster so (4 sessions at 65,536: 35.1 tok/s against 33.8 interleaved). RAGON_KV_HEAD_MAJOR=0 interleaves.
     alloc_store_arena();  // P4f: the store first, the pool from what remains
-    kv_page_elems_ = size_t(n_full) * 2 * kvsize * PT;
+    // FP8-only pages (LOWBIT §8): the pool holds the first and last full-attention layer; the middle ones are codes by
+    // page id (kv_home8_) and BF16 slots for the pages being written (kv_slots_), set up below.
+    if (const char* e = std::getenv("RAGON_KV_HEAD_MAJOR")) kv_head_major_ = std::atoi(e) != 0;
+    kv_fp8_only_ = kv_fp8_only(opts_.kv_fp8, true);
+    if (kv_fp8_only_ && !kv_head_major_)
+      throw std::runtime_error("kv-fp8: FP8-only pages need the head-major pool (RAGON_KV_HEAD_MAJOR=1)");
+    if (kv_fp8_only_ && n_full < 3) throw std::runtime_error("kv-fp8: FP8-only pages need three full-attention layers");
+    kv_page_elems_ = size_t(kv_fp8_only_ ? 2 : n_full) * 2 * kvsize * PT;
     const long cap = long(opts_.sessions) * pages_per_session;
     const int pool_pages = static_cast<int>(opts_.kv_pool_pages > 0 ? std::min<long>(opts_.kv_pool_pages, cap) : cap);
-    if (const char* e = std::getenv("RAGON_KV_HEAD_MAJOR")) kv_head_major_ = std::atoi(e) != 0;
     kv_head_stride_ = kv_head_major_ ? (size_t(pool_pages) + 1) * PT * c.head_dim : size_t(PT) * c.head_dim;
     kv_page_unit_ = kv_head_major_ ? size_t(PT) * c.head_dim : kv_page_elems_;
     kernels::set_kv_layout(kv_head_stride_, c.head_dim);
@@ -234,6 +240,24 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
                  "max_context\n",
                  kv_page_elems_ * 2.0 * pool_pages / 1e9, pool_pages, PT, kv_page_elems_ * 2 / 1e6,
                  long(pool_pages) * PT, pages_per_session);
+    if (kv_fp8_only_) {
+      const int slots = kv_fp8_slots(opts_.sessions, opts_.prefill_chunk);
+      const size_t mid_runs = size_t(n_full - 2) * 2 * c.kv_heads;  // middle layers, K and V, KV heads
+      kv_pps_ = pages_per_session;
+      kv_slot_hs_ = (size_t(slots) + 1) * PT * c.head_dim;
+      kv_slots_ = alloc<__nv_bfloat16>(mid_runs * kv_slot_hs_);
+      check(cudaMemset(kv_slots_, 0, mid_runs * kv_slot_hs_ * sizeof(__nv_bfloat16)), "KV FP8 slots");
+      kv_home8_ = alloc<uint8_t>(mid_runs * kv_head_stride_);
+      check(cudaMemset(kv_home8_, 0, mid_runs * kv_head_stride_), "KV FP8 pages");
+      kv_slot_of_.assign(size_t(pool_pages) + 1, 0);
+      kv_stale_.assign(size_t(pool_pages) + 1, 0);
+      for (int i = slots; i >= 1; --i) kv_slot_free_.push_back(i);  // slot 0: what a zero entry reads
+      std::fprintf(stderr,
+                   "kv-fp8: FP8-only pages, %.2f GB of E4M3 pages (%d middle layers) and %d BF16 slots (%.2f GB); a "
+                   "page %.2f MB in all\n",
+                   mid_runs * double(kv_head_stride_) / 1e9, n_full - 2, slots,
+                   mid_runs * kv_slot_hs_ * 2.0 / 1e9, (kv_page_elems_ * 2.0 + mid_runs * double(PT) * c.head_dim) / 1e6);
+    }
   } else {
     // Head-major KV caches: one KV head's keys are one contiguous stream for the attention kernels.
     kernels::set_kv_layout(size_t(opts_.max_context) * c.head_dim, c.head_dim);
@@ -242,14 +266,26 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   for (Session& s : sessions_) {
     if (kv_pages_) {
       const size_t lkv = size_t(c.kv_heads) * kv_head_stride_;  // one layer's K (or V) block
+      const size_t lkv_slot = size_t(c.kv_heads) * kv_slot_hs_;
       for (int i = 0; i < n_full; ++i) {
-        s.kcache.push_back(kv_pool_ + size_t(i) * 2 * lkv);
-        s.vcache.push_back(kv_pool_ + (size_t(i) * 2 + 1) * lkv);
+        if (kv_fp8_only_ && i > 0 && i < n_full - 1) {  // a middle layer: its slots (its pages8 entries)
+          s.kcache.push_back(kv_slots_ + size_t(i - 1) * 2 * lkv_slot);
+          s.vcache.push_back(kv_slots_ + (size_t(i - 1) * 2 + 1) * lkv_slot);
+          continue;
+        }
+        const int pl = kv_fp8_only_ ? (i == 0 ? 0 : 1) : i;  // its layer in the pool
+        s.kcache.push_back(kv_pool_ + size_t(pl) * 2 * lkv);
+        s.vcache.push_back(kv_pool_ + (size_t(pl) * 2 + 1) * lkv);
       }
       // Every entry at page 0 until a pass maps the page (kv_ensure).
       s.page_host.assign(pages_per_session, 0);
       s.pages = alloc<uint64_t>(pages_per_session);
       check(cudaMemset(s.pages, 0, pages_per_session * sizeof(uint64_t)), "KV page table");
+      if (kv_fp8_only_) {
+        s.page8_host.assign(pages_per_session, 0);
+        s.pages8 = alloc<uint64_t>(2 * size_t(pages_per_session));
+        check(cudaMemset(s.pages8, 0, 2 * size_t(pages_per_session) * sizeof(uint64_t)), "KV page table");
+      }
     } else {
       for (int i = 0; i < n_full; ++i) {
         s.kcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
@@ -319,7 +355,27 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       if (kernels::attention_chunk() % 32) throw std::runtime_error("kv-fp8: the attention chunk is off the 32 grid");
       load_kv_fp8_scales(scales, n_full);
       const char* me = std::getenv("RAGON_KV_FP8_MIRROR");  // 0: M1 only (every read rounded on chip)
-      if (kv_pool_ != nullptr && (me == nullptr || std::atoi(me) != 0)) {
+      if (kv_fp8_only_) {
+        const size_t pages = size_t(kv_book_->capacity()) + 1;
+        kv_sealed_ = alloc<uint8_t>(pages);
+        check(cudaMemset(kv_sealed_, 0, pages), "KV seal flags");
+        kv_sealed_host_.assign(pages, 0);
+        const size_t lkv8 = size_t(c.kv_heads) * kv_head_stride_;
+        for (int i = 0; i < n_full; ++i) {
+          kv_q8_kinv_.push_back(kv_q8_[i].kinv);
+          kv_q8_vinv_.push_back(kv_q8_[i].vinv);
+          kv_q8_ks_.push_back(kv_q8_[i].ks);
+          kv_q8_vs_.push_back(kv_q8_[i].vs);
+          if (i == 0 || i == n_full - 1) continue;
+          if (!kv_q8_[i].on()) throw std::runtime_error("kv-fp8: FP8-only pages need a scale for every middle layer");
+          kv_q8_[i].k8 = kv_home8_ + size_t(i - 1) * 2 * lkv8;
+          kv_q8_[i].v8 = kv_home8_ + (size_t(i - 1) * 2 + 1) * lkv8;
+          kv_q8_[i].sealed = kv_sealed_;
+          kv_q8_[i].unit = kv_page_unit_;
+          kv_q8_[i].hs8 = kv_head_stride_;
+          kv_q8_[i].ids_at = kv_pps_;
+        }
+      } else if (kv_pool_ != nullptr && (me == nullptr || std::atoi(me) != 0)) {
         const size_t pages = size_t(kv_book_->capacity()) + 1;  // ids 1..capacity (page 0 reserved)
         kv_mirror_ = alloc<uint8_t>(kv_page_elems_ * pages);
         kv_sealed_ = alloc<uint8_t>(pages);
@@ -340,6 +396,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       }
     }
     if (const char* e = std::getenv("RAGON_KV_CALIB"); e && *e) {
+      if (kv_fp8_only_) throw std::runtime_error("kv-calib: not with FP8-only pages (RAGON_KV_FP8_ONLY=0)");
       kv_calib_path_ = e;
       kv_amax_slots_ = n_full;
       kv_amax_ = alloc<float>(size_t(n_full) * 2);
@@ -490,6 +547,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
         // P4c paged mode: a node holds a reference to each pool page of the active session its run overlaps (the
         // session that just prefilled the prompt, kv_insert), no copy; the arena holds the states only.
         ops.hold = [this](int from, int to) -> std::vector<int> {
+          if (kv_fp8_only_) return kv_hold8(from, to);
           const int a = KvPool::index_of(from), b = KvPool::index_of(to - 1);
           if (b >= static_cast<int>(s_->kv_ids.size())) return {};
           for (int j = a; j <= b; ++j)
@@ -676,6 +734,10 @@ Engine::~Engine() {
   if (gdn_fused_)
     std::fprintf(stderr, "gdn fused: %lld verifies, %lld sequences replayed in them, %lld flushes\n",
                  gdn_fused_verifies_, gdn_fused_seqs_, gdn_fused_flushes_);
+  if (kv_fp8_only_)
+    std::fprintf(stderr, "kv-fp8: slots peak %d of %zu, pages sealed %ld, opened %ld, opened off the 32 grid %ld\n",
+                 kv_slot_peak_, kv_slot_hs_ / (size_t(kernels::kKvPageTokens) * model_->config().head_dim) - 1,
+                 kv_sealed_n_, kv_opened_, kv_unaligned_);
   if (mk_ffn_times_ || mk_gdn_times_ || mk_attn_times_) {
     cudaDeviceSynchronize();
     mk_times_report();
@@ -1030,7 +1092,7 @@ void Engine::kv_record_release() {
 }
 
 bool Engine::kv_retire(bool wait) {
-  if (!kv_book_ || kv_book_->pending_pages() == 0) return true;
+  if (!kv_book_ || (kv_book_->pending_pages() == 0 && kv_slot_pending_.empty())) return true;
   for (int i = 0; i < 3; ++i) {
     if (!kv_release_rec_[i]) continue;
     if (wait) {
@@ -1040,6 +1102,22 @@ bool Engine::kv_retire(bool wait) {
       if (e == cudaErrorNotReady) return false;
       check(e, "KV release");
     }
+  }
+  if (kv_fp8_only_) {  // the pages given back give back their slots; a sealed one's device flag is cleared on reuse
+    for (const int id : kv_book_->pending()) {
+      if (kv_slot_of_[id]) {
+        kv_slot_free_.push_back(kv_slot_of_[id]);
+        kv_slot_of_[id] = 0;
+        --kv_slots_used_;
+      }
+      if (kv_sealed_host_[id]) {
+        kv_sealed_host_[id] = 0;
+        kv_stale_[id] = 1;
+      }
+    }
+    for (const int sl : kv_slot_pending_) kv_slot_free_.push_back(sl);
+    kv_slots_used_ -= static_cast<int>(kv_slot_pending_.size());
+    kv_slot_pending_.clear();
   }
   kv_book_->retire();
   return true;
@@ -1056,6 +1134,18 @@ void Engine::kv_table_sync(Session& s, cudaStream_t st) {
     s.page_host[j] = want;
   }
   if (!idx.empty()) kernels::kv_table_set(s.pages, idx.data(), val.data(), static_cast<int>(idx.size()), st);
+  if (!kv_fp8_only_) return;
+  // FP8-only: the middle layers' table, each page's slot (0 when sealed or none), then (at kv_pps_) its id.
+  for (size_t k = 0; k < idx.size(); ++k) idx[k] += kv_pps_;
+  for (size_t j = 0; j < s.page8_host.size(); ++j) {
+    const int id = j < s.kv_ids.size() ? s.kv_ids[j] : 0;
+    const uint64_t want = id > 0 ? uint64_t(kv_slot_of_[id]) * kv_page_unit_ : 0;
+    if (want == s.page8_host[j]) continue;
+    idx.push_back(static_cast<int>(j));
+    val.push_back(want);
+    s.page8_host[j] = want;
+  }
+  if (!idx.empty()) kernels::kv_table_set(s.pages8, idx.data(), val.data(), static_cast<int>(idx.size()), st);
 }
 
 // M2: the session's pages from from's page on lose their flags (host first: a device flag is never set without the
@@ -1085,8 +1175,9 @@ void Engine::kv_seal_pages(Session& s, int from, cudaStream_t st) {
                      kv_q8_vinv_.data(), st);
 }
 
-void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
+void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st, bool write) {
   if (!kv_book_) return;
+  if (kv_fp8_only_) return kv_ensure8(s, from, to, st, write);
   kv_seal_pages(s, from, st);
   to = std::min(to, opts_.max_context);
   if (to <= from) return;
@@ -1115,6 +1206,190 @@ void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
   kv_table_sync(s, st);
   kv_seal_pages(s, from, st);  // the pages just mapped (a copy's destination among them) start unsealed
   if (kv_book_->pending_pages() > pending) kv_record_release();  // a copied page this holder let go of
+}
+
+// FP8-only pages: a free slot, after the deferred frees if none is left.
+int Engine::kv_take_slot() {
+  if (kv_slot_free_.empty()) kv_retire(false);
+  if (kv_slot_free_.empty()) kv_retire(true);
+  if (kv_slot_free_.empty())
+    throw KvPoolExhausted("KV FP8 slots exhausted: " + std::to_string(kv_slots_used_) + " in use (RAGON_KV_FP8_SLOTS)");
+  const int sl = kv_slot_free_.back();
+  kv_slot_free_.pop_back();
+  kv_slot_peak_ = std::max(kv_slot_peak_, ++kv_slots_used_);
+  return sl;
+}
+
+// FP8-only pages: every page of the session wholly below `from` that still has a slot is encoded into its codes and
+// flagged, in stream order; its slot is free once the streams that may read it are past this point.
+void Engine::kv_seal8(Session& s, int from, cudaStream_t st) {
+  if (use_dev_pos_) return;
+  std::vector<int> ids, sl;
+  const int first_open = std::max(from, 0) / kernels::kKvPageTokens;
+  for (int i = 0; i < first_open && i < static_cast<int>(s.kv_ids.size()); ++i) {
+    const int id = s.kv_ids[i];
+    if (id <= 0 || kv_sealed_host_[id] || kv_slot_of_[id] == 0) continue;
+    ids.push_back(id);
+    sl.push_back(kv_slot_of_[id]);
+    kv_sealed_host_[id] = 1;
+    kv_slot_pending_.push_back(kv_slot_of_[id]);
+    kv_slot_of_[id] = 0;
+  }
+  if (ids.empty()) return;
+  const ModelConfig& c = model_->config();
+  const int n_full = static_cast<int>(kv_q8_.size());
+  kernels::kv_seal8(kv_slots_, kv_home8_, kv_sealed_, ids.data(), sl.data(), static_cast<int>(ids.size()), 1,
+                    n_full - 1, c.kv_heads, c.head_dim, kv_slot_hs_, kv_head_stride_, kv_page_unit_,
+                    kv_q8_kinv_.data(), kv_q8_vinv_.data(), st);
+  kv_sealed_n_ += static_cast<long>(ids.size());
+  kv_table_sync(s, st);
+  kv_record_release();
+}
+
+// FP8-only pages: every page [from, to) touches gets a slot before a pass writes it; a sealed one (a page the session
+// holds alone and writes again after a rewind) is decoded into it first: exact when `from` is on the 32 grid (B41).
+void Engine::kv_materialize(Session& s, int from, int to, cudaStream_t st) {
+  constexpr int PT = kernels::kKvPageTokens;
+  std::vector<int> open_ids, open_sl, unseal;
+  for (int i = from / PT; i <= (to - 1) / PT && i < static_cast<int>(s.kv_ids.size()); ++i) {
+    const int id = s.kv_ids[i];
+    if (id <= 0) continue;
+    if (kv_sealed_host_[id]) {
+      if (kv_book_->refs(id) != 1) throw std::logic_error("kv-fp8: a shared sealed page to write");
+      if (use_dev_pos_) throw std::logic_error("KV FP8 slot to take inside a graph capture");
+      kv_slot_of_[id] = kv_take_slot();
+      open_ids.push_back(id);
+      open_sl.push_back(kv_slot_of_[id]);
+      unseal.push_back(id);
+      kv_sealed_host_[id] = 0;
+      if (i == from / PT && from % 32) ++kv_unaligned_;
+    } else if (kv_slot_of_[id] == 0) {
+      if (use_dev_pos_) throw std::logic_error("KV FP8 slot to take inside a graph capture");
+      kv_slot_of_[id] = kv_take_slot();
+    }
+  }
+  if (!open_ids.empty()) {
+    const ModelConfig& c = model_->config();
+    const int n_full = static_cast<int>(kv_q8_.size());
+    kernels::kv_open8(kv_slots_, kv_home8_, open_ids.data(), open_sl.data(), static_cast<int>(open_ids.size()), 1,
+                      n_full - 1, c.kv_heads, c.head_dim, kv_slot_hs_, kv_head_stride_, kv_page_unit_,
+                      kv_q8_ks_.data(), kv_q8_vs_.data(), st);
+    kernels::kv_unseal(kv_sealed_, unseal.data(), static_cast<int>(unseal.size()), st);
+    kv_opened_ += static_cast<long>(open_ids.size());
+  }
+  kv_table_sync(s, st);
+}
+
+void Engine::kv_ensure8(Session& s, int from, int to, cudaStream_t st, bool write) {
+  kv_seal8(s, from, st);
+  to = std::min(to, opts_.max_context);
+  if (to <= from) return;
+  const int need = kv_book_->needed(s.kv_ids, from, to);
+  if (need > 0) {
+    if (use_dev_pos_) throw std::logic_error("KV pages to map inside a graph capture");
+    if (need > kv_book_->free_pages()) kv_retire(false);
+    if (need > kv_book_->free_pages()) kv_retire(true);
+    const int pending = kv_book_->pending_pages();
+    const size_t slot_pending = kv_slot_pending_.size();
+    const std::vector<int> before = s.kv_ids;
+    std::vector<KvPool::Copy> copies;
+    if (!kv_book_->ensure(s.kv_ids, from, to, &copies))
+      throw KvPoolExhausted("KV page pool exhausted: " + std::to_string(need) + " pages needed, " +
+                            std::to_string(kv_book_->free_pages()) + " free of " +
+                            std::to_string(kv_book_->capacity()));
+    // Pages new to the session: a flag left set from before the page was given back is cleared in this stream.
+    std::vector<int> stale;
+    for (size_t i = 0; i < s.kv_ids.size(); ++i) {
+      const int id = s.kv_ids[i];
+      if (id > 0 && (i >= before.size() || before[i] != id) && kv_stale_[id]) {
+        kv_stale_[id] = 0;
+        stale.push_back(id);
+      }
+    }
+    if (!stale.empty()) kernels::kv_unseal(kv_sealed_, stale.data(), static_cast<int>(stale.size()), st);
+    // Copy-on-write: the first and last layer as in the BF16 pool; the middle ones from the source's slot into a slot
+    // of the copy, or decoded from its codes (exact at a 32-aligned `from`, which the prefix store's resumes keep).
+    const size_t unit_bytes = kv_page_unit_ * sizeof(__nv_bfloat16);
+    const size_t pitch = kv_head_stride_ * sizeof(__nv_bfloat16);
+    const size_t runs = kv_page_elems_ / kv_page_unit_;
+    const ModelConfig& c = model_->config();
+    const int n_full = static_cast<int>(kv_q8_.size());
+    const size_t mid_runs = size_t(n_full - 2) * 2 * c.kv_heads;
+    std::vector<int> open_ids, open_sl;
+    for (const KvPool::Copy& cp : copies) {
+      check(cudaMemcpy2DAsync(kv_pool_ + size_t(cp.dst) * kv_page_unit_, pitch, kv_pool_ + size_t(cp.src) * kv_page_unit_,
+                              pitch, unit_bytes, runs, cudaMemcpyDeviceToDevice, st),
+            "KV page copy");
+      if (kv_sealed_host_[cp.src]) {
+        kv_slot_of_[cp.dst] = kv_take_slot();
+        open_ids.push_back(cp.src);
+        open_sl.push_back(kv_slot_of_[cp.dst]);
+        if (from % 32 && KvPool::index_of(from) < static_cast<int>(s.kv_ids.size()) &&
+            s.kv_ids[KvPool::index_of(from)] == cp.dst)
+          ++kv_unaligned_;
+      } else if (kv_slot_of_[cp.src]) {
+        kv_slot_of_[cp.dst] = kv_take_slot();
+        const size_t sp = kv_slot_hs_ * sizeof(__nv_bfloat16);
+        check(cudaMemcpy2DAsync(kv_slots_ + size_t(kv_slot_of_[cp.dst]) * kv_page_unit_, sp,
+                                kv_slots_ + size_t(kv_slot_of_[cp.src]) * kv_page_unit_, sp, unit_bytes, mid_runs,
+                                cudaMemcpyDeviceToDevice, st),
+              "KV slot copy");
+      }
+    }
+    if (!open_ids.empty()) {
+      kernels::kv_open8(kv_slots_, kv_home8_, open_ids.data(), open_sl.data(), static_cast<int>(open_ids.size()), 1,
+                        n_full - 1, c.kv_heads, c.head_dim, kv_slot_hs_, kv_head_stride_, kv_page_unit_,
+                        kv_q8_ks_.data(), kv_q8_vs_.data(), st);
+      kv_opened_ += static_cast<long>(open_ids.size());
+    }
+    kv_table_sync(s, st);
+    if (kv_book_->pending_pages() > pending || kv_slot_pending_.size() > slot_pending) kv_record_release();
+  }
+  if (write) kv_materialize(s, from, to, st);
+}
+
+// FP8-only pages: the prefix store's references for positions [from, to) of the active session (ops.hold). Its whole
+// pages are sealed in place first (the session writes past them only), so the store pins no slot; the page `to` ends
+// inside is given to the store as a sealed copy under a new id, the session keeping its page and slot.
+std::vector<int> Engine::kv_hold8(int from, int to) {
+  constexpr int PT = kernels::kKvPageTokens;
+  Session& s = *s_;
+  const int a = KvPool::index_of(from), b = KvPool::index_of(to - 1);
+  if (b >= static_cast<int>(s.kv_ids.size())) return {};
+  for (int j = a; j <= b; ++j)
+    if (s.kv_ids[j] == 0) return {};
+  kv_seal8(s, to, stream_);
+  std::vector<int> ids;
+  for (int j = a; j <= b; ++j) {
+    const int id = s.kv_ids[j];
+    if (j < b || to % PT == 0 || kv_sealed_host_[id] || kv_slot_of_[id] == 0) {
+      kv_book_->retain(id);
+      ids.push_back(id);
+      continue;
+    }
+    if (kv_book_->free_pages() < 1) kv_retire(false);
+    std::vector<int> tmp;
+    if (!kv_book_->ensure(tmp, 0, 1, nullptr)) {  // no page for the copy: the store keeps what it has
+      for (const int h : ids) kv_book_->release(h);
+      return {};
+    }
+    const int nid = tmp[0];
+    if (kv_stale_[nid]) kv_stale_[nid] = 0;  // the seal below sets the flag anyway
+    const ModelConfig& c = model_->config();
+    const int n_full = static_cast<int>(kv_q8_.size());
+    const int sl = kv_slot_of_[id];
+    kernels::kv_seal8(kv_slots_, kv_home8_, kv_sealed_, &nid, &sl, 1, 1, n_full - 1, c.kv_heads, c.head_dim,
+                      kv_slot_hs_, kv_head_stride_, kv_page_unit_, kv_q8_kinv_.data(), kv_q8_vinv_.data(), stream_);
+    const size_t pitch = kv_head_stride_ * sizeof(__nv_bfloat16);
+    check(cudaMemcpy2DAsync(kv_pool_ + size_t(nid) * kv_page_unit_, pitch, kv_pool_ + size_t(id) * kv_page_unit_, pitch,
+                            kv_page_unit_ * sizeof(__nv_bfloat16), kv_page_elems_ / kv_page_unit_,
+                            cudaMemcpyDeviceToDevice, stream_),
+          "KV page copy");
+    kv_sealed_host_[nid] = 1;
+    ++kv_sealed_n_;
+    ids.push_back(nid);
+  }
+  return ids;
 }
 
 void Engine::kv_release(Session& s, int n) {
@@ -1329,6 +1604,7 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
   const size_t buf_pitch = size_t(buf_len) * row, width = size_t(to - from) * row;
   auto* b = static_cast<__nv_bfloat16*>(buf);
   if (kv_pages_) {  // P4: one launch over the positions, through the page table
+    if (kv_fp8_only_) throw std::logic_error("kv_copy: not with FP8-only pages");
     if (!to_buf && kv_mirror_ != nullptr && to > from) {  // M2: the pages written lose their flags
       std::vector<int> ids;
       for (int i = from / kernels::kKvPageTokens; i <= (to - 1) / kernels::kKvPageTokens && i < static_cast<int>(s_->kv_ids.size()); ++i)
@@ -1768,6 +2044,17 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // Per sequence (M4 §2): its rows' q/k norms and RoPE at its positions, their KV into its cache, and their
       // attention over it.
       const int kvsize = c.kv_heads * c.head_dim;
+      // FP8-only pages: a middle layer's K/V are its slots (their own head stride, for the kernels' launches here)
+      // through each session's pages8, its sealed pages codes by id.
+      const bool mid8 = kv_fp8_only_ && kv_q8_of(slot).hs8 != 0;
+      struct HsScope {
+        bool on;
+        size_t old = 0;
+        HsScope(bool o, size_t hs) : on(o) { if (on) old = kernels::swap_kv_head_stride(hs); }
+        ~HsScope() { if (on) kernels::swap_kv_head_stride(old); }
+      } hs_scope(mid8, kv_slot_hs_);
+      auto pages_of = [&](const Session* ss) -> const uint64_t* { return mid8 ? ss->pages8 : ss->pages; };
+      uint8_t* const sealed_w = kv_fp8_only_ ? nullptr : kv_sealed_;
       if (joint) {
         kernels::SeqPtrs<__nv_bfloat16> kc, vc;
         kernels::SeqPtrs<const __nv_bfloat16> kcr, vcr;
@@ -1775,10 +2062,10 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         for (int i = 0; i < sb.n; ++i) {
           kcr.p[i] = kc.p[i] = segs[i].s->kcache[slot];
           vcr.p[i] = vc.p[i] = segs[i].s->vcache[slot];
-          pg.p[i] = segs[i].s->pages;
+          pg.p[i] = pages_of(segs[i].s);
         }
         kernels::attn_prepare_seqs(q_gate_, k_, v_, L.q_norm, L.k_norm, sb, c.heads, c.kv_heads, c.head_dim, c.rotary_dim,
-                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg, kv_sealed_, kv_page_unit_);
+                                   c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg, sealed_w, kv_page_unit_);
         if (groups.n > 0)
           kernels::attention_rows_cascade(q_, kcr, vcr, sb, groups, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_,
                                           stream_, pg, kv_q8_of(slot));
@@ -1802,7 +2089,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::attn_prepare(q_gate_ + r0 * 2 * qsize, k_ + r0 * kvsize, v_ + r0 * kvsize, L.q_norm, L.k_norm,
                               seg_pos(g, 0), g.rows, c.heads, c.kv_heads, c.head_dim, c.rotary_dim, c.rope_theta, c.eps,
                               q_ + r0 * qsize, gate_ + r0 * qsize, g.s->kcache[slot], g.s->vcache[slot], stream_,
-                              seg_tree(g), mrope, g.s->pages, kv_sealed_, kv_page_unit_);
+                              seg_tree(g), mrope, pages_of(g.s), sealed_w, kv_page_unit_);
         calib(g);
         // Fixed key ranges at fixed positions for every pass (row-invariant), in slices of queries that
         // bound the partial results' scratch. A captured graph launches the ranges of the whole context.
@@ -1810,7 +2097,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           const int n = std::min(kAttnSlice, g.rows - q0);
           kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
                                   c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
-                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages, kv_q8_of(slot));
+                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), pages_of(g.s), kv_q8_of(slot));
         }
       }
       if (quantized_ && !L.o.fp4) {
@@ -2482,7 +2769,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
     kv_book_->unshare(s_->kv_ids, reuse);
     kv_table_sync(*s_, stream_);
     if (kv_book_->pending_pages() > pending) kv_record_release();
-    kv_ensure(*s_, reuse, kv_target(prompt.size()), stream_);
+    kv_ensure(*s_, reuse, kv_target(prompt.size()), stream_, false);  // FP8-only: each chunk's slots when it runs
   }
 
   // Chunk ends: every prefill_chunk tokens, and the checkpoint positions (the end of each of the first

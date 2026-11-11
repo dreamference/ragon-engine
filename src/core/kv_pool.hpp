@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <vector>
 
 namespace ragon {
@@ -30,6 +31,7 @@ class KvPool {
   int capacity() const { return static_cast<int>(refs_.size()) - 1; }
   int free_pages() const { return static_cast<int>(free_.size()); }
   int pending_pages() const { return static_cast<int>(pending_.size()); }
+  const std::vector<int>& pending() const { return pending_; }  // released, not yet retired
   int refs(int page) const { return refs_.at(page); }
 
   // References listed by holder (each entry of each table one reference, 0 ignored).
@@ -81,5 +83,26 @@ class KvPool {
   std::vector<int> refs_;
   std::vector<int> free_, pending_;
 };
+
+
+// FP8-only pages (--kv-fp8 with paged KV, LOWBIT §8): the middle full-attention layers keep their pages as E4M3 codes
+// only (by page id), the first and last layer as BF16 pages; the pages a pass writes are BF16 slots meanwhile. One
+// resolution for the engine and the memory plans: the flag or RAGON_KV_FP8, and RAGON_KV_FP8_ONLY (default 1; 0 keeps
+// the M2 mirror beside the BF16 pool instead).
+inline bool kv_fp8_on(bool flag) {
+  if (const char* e = std::getenv("RAGON_KV_FP8")) return std::atoi(e) != 0;
+  return flag;
+}
+inline bool kv_fp8_only(bool flag, bool paged) {
+  if (!paged || !kv_fp8_on(flag)) return false;
+  const char* e = std::getenv("RAGON_KV_FP8_ONLY");
+  return e == nullptr || std::atoi(e) != 0;
+}
+// The BF16 slots: every session's open pages (the page at its position and a step's growth, with a deferred free
+// each), the pages of three prefill chunks in flight, and a margin; RAGON_KV_FP8_SLOTS overrides.
+inline int kv_fp8_slots(int sessions, int prefill_chunk) {
+  if (const char* e = std::getenv("RAGON_KV_FP8_SLOTS"); e && std::atoi(e) > 0) return std::atoi(e);
+  return 4 * sessions + 3 * (prefill_chunk / KvPool::kPageTokens + 2) + 32;
+}
 
 }  // namespace ragon

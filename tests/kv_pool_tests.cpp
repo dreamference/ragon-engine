@@ -213,6 +213,18 @@ void plan() {
   MemoryPlan v = plan_memory(c, weights, 4, 262144, true, true);
   check(plan_kv_pool(v, c, 262144, 50000, reserve, store, -1) > 0 && !refuse_kv_pool(v, 262144).empty(),
         "a pool smaller than one conversation at max_context: refused");
+  // FP8-only pages (--kv-fp8): the middle layers at one byte a value, 0.5625 of the BF16 page for 16 layers; the
+  // slots counted in the pool's bytes, and more pages from the same memory.
+  check(kv_page_bytes_fp8(c) * 16 == kv_page_bytes(c) * 9, "an FP8-only page is 9/16 of a BF16 page");
+  MemoryPlan b8 = plan_memory(c, weights, 8, 262144, true, true), f = b8;  // 8 sessions: limited by memory, not cap
+  const long bpages = plan_kv_pool(b8, c, 262144, avail, reserve, store, -1);
+  const long fpages = plan_kv_pool(f, c, 262144, avail, reserve, store, -1, true, 100);
+  std::printf("FP8-only plan on node-b: %ld pages against %ld BF16\n", fpages, bpages);
+  check(f.kv_pool == size_t(fpages + 1) * kv_page_bytes_fp8(c) + size_t(fpages) * kKvPageOverheadBytes +
+                         kv_fp8_slot_bytes(c, 100),
+        "FP8-only: the pool's bytes count the slots");
+  check(fpages > bpages * 17 / 10 && static_cast<long>(f.total() >> 20) + reserve <= avail,
+        "FP8-only: about 1.75x the pages, the reserve kept");
 }
 
 // The scheduler's policy for a full pool (serve/kv_policy.hpp), on its own and played out on a KvPool.

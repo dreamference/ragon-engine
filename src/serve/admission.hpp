@@ -36,6 +36,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/kv_pool.hpp"
 #include "core/model.hpp"
 
 namespace ragon::serve {
@@ -76,6 +77,18 @@ inline size_t kv_bytes_per_token(const ModelConfig& c) {
 // P4: positions per KV page (kernels::kKvPageTokens) and one page's bytes (4 MiB for Qwen3.8-27B).
 inline constexpr int kKvPageTokens = 64;
 inline size_t kv_page_bytes(const ModelConfig& c) { return kv_bytes_per_token(c) * kKvPageTokens; }
+// FP8-only pages (--kv-fp8, LOWBIT §8): the first and last full-attention layer BF16, the middle ones one byte a value
+// (0.5625 of the BF16 page for Qwen3.8-27B's 16 layers); the BF16 slots the middle layers write through beside them.
+inline size_t kv_page_bytes_fp8(const ModelConfig& c) {
+  int full = 0;
+  for (bool f : c.full_attention) full += f;
+  return size_t(2 * 2 + (full - 2)) * 2 * c.kv_heads * c.head_dim * kKvPageTokens;
+}
+inline size_t kv_fp8_slot_bytes(const ModelConfig& c, int slots) {
+  int full = 0;
+  for (bool f : c.full_attention) full += f;
+  return (size_t(slots) + 1) * kKvPageTokens * size_t(full - 2) * 2 * c.kv_heads * c.head_dim * 2;
+}
 inline long kv_pages_for(long positions) { return (positions + kKvPageTokens - 1) / kKvPageTokens; }
 
 // One session's flat slot at `max_context` tokens: the full-attention layers' BF16 KV, the DeltaNet and conv state
@@ -130,21 +143,22 @@ inline MemoryPlan plan_memory(const ModelConfig& c, size_t weight_bytes, int ses
 // judge by (avail_mb < 0, or no reserve) every session's max_context. Never more pages than sessions x max_context
 // positions need, never fewer than 0. Returns the pages.
 inline long plan_kv_pool(MemoryPlan& p, const ModelConfig& c, int max_context, long avail_mb, long reserve_mb,
-                         size_t other_bytes, long pool_mb) {
-  const size_t page = kv_page_bytes(c), per = page + kKvPageOverheadBytes;
+                         size_t other_bytes, long pool_mb, bool fp8_only = false, int fp8_slots = 0) {
+  const size_t page = fp8_only ? kv_page_bytes_fp8(c) : kv_page_bytes(c), per = page + kKvPageOverheadBytes;
+  const size_t slots = fp8_only ? kv_fp8_slot_bytes(c, fp8_slots) : 0;
   const long cap = long(p.session_count) * kv_pages_for(max_context);
   p.store = other_bytes;
   long pages = cap;
   if (pool_mb >= 0) {
     pages = static_cast<long>((size_t(pool_mb) << 20) / page);
   } else if (avail_mb >= 0 && reserve_mb > 0) {
-    const size_t have = size_t(avail_mb) << 20, keep = p.total() + (size_t(reserve_mb) << 20) + page;
+    const size_t have = size_t(avail_mb) << 20, keep = p.total() + (size_t(reserve_mb) << 20) + page + slots;
     pages = have > keep ? static_cast<long>((have - keep) / per) : 0;
   }
   pages = std::max(0L, std::min(pages, cap));
   p.kv_pool_pages = pages;
   // With the reserved page 0 and (P4f) each page's own cost beside it.
-  p.kv_pool = size_t(pages + 1) * page + size_t(pages) * kKvPageOverheadBytes;
+  p.kv_pool = size_t(pages + 1) * page + size_t(pages) * kKvPageOverheadBytes + slots;
   return pages;
 }
 
@@ -216,6 +230,8 @@ struct KvPlanInputs {
   bool on = false;
   size_t store_bytes = 0;
   long pool_mb = -1;
+  bool fp8_only = false;  // FP8-only pages (kv_fp8_only): the page cost and the slots (kv_fp8_slots)
+  int prefill_chunk = 2048;
 };
 
 // The start's plan and why it is refused (empty when it starts), the one computation the start check, auto-size and
@@ -229,7 +245,8 @@ inline StartPlan start_plan(const ModelConfig& c, size_t weight_bytes, size_t sc
                             int max_context, long avail_mb, long reserve_mb, const KvPlanInputs& kv = {}) {
   StartPlan s{plan_memory(c, weight_bytes, sessions, max_context, drafter, kv.on, scratch), {}};
   if (kv.on) {
-    plan_kv_pool(s.plan, c, max_context, reserve_mb > 0 ? avail_mb : -1, reserve_mb, kv.store_bytes, kv.pool_mb);
+    plan_kv_pool(s.plan, c, max_context, reserve_mb > 0 ? avail_mb : -1, reserve_mb, kv.store_bytes, kv.pool_mb,
+                 kv.fp8_only, kv.fp8_only ? kv_fp8_slots(sessions, kv.prefill_chunk) : 0);
     if (kv.pool_mb < 0 && reserve_mb > 0 && avail_mb >= 0) s.refusal = refuse_kv_pool(s.plan, max_context);
   }
   if (s.refusal.empty() && reserve_mb > 0) s.refusal = refuse_start(s.plan, avail_mb, reserve_mb);

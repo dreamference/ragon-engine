@@ -2799,6 +2799,8 @@ int main(int argc, char** argv) try {
     // (its KV is pool pages); since P4f the engine allocates it before the pool, at min(prefix_kv_mb, free above its
     // own reserve), so the plan counts prefix_kv_mb (planned_bytes includes it) and the pool takes what remains.
     as::KvPlanInputs kv{kv_pages, 0, kv_pool_mb};
+    kv.fp8_only = ragon::kv_fp8_only(kv_fp8, kv_pages);  // FP8-only pages: their size and the slots (LOWBIT §8)
+    kv.prefill_chunk = opts.prefill_chunk;
     if (kv_pages) {
       long store_mb = opts.prefix_kv_mb;
       if (const char* e = std::getenv("RAGON_PREFIX_KV_MB")) store_mb = std::atol(e);

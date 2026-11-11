@@ -848,6 +848,12 @@ void set_kv_layout(size_t head_stride, size_t pos_stride) {
   g_kv_ps = pos_stride;
 }
 
+size_t swap_kv_head_stride(size_t head_stride) {
+  const size_t old = g_kv_hs;
+  g_kv_hs = head_stride;
+  return old;
+}
+
 
 // Rows per warp: with one or two token rows each warp streams 2 weight rows (measured best of 1, 2, 4, 8:
 // 235 GB/s NVFP4 and 263 GB/s FP8 at M = 1, against 262 GB/s for a plain read); more rows need the registers.
@@ -1242,6 +1248,90 @@ void kv_unseal(uint8_t* sealed, const int* ids, int n, cudaStream_t s) {
     for (int i = 0; i < m; ++i) f.ids[i] = ids[at + i];
     launch_kernel("kv_unseal", kv_flag_kernel, dim3(1), dim3(kKvSealMax), 0, s, sealed, f, m, uint8_t(0));
   }
+}
+
+namespace {
+// FP8-only pages: block (i, l * 2 + kv, h) moves page i's run of slot l0 + l, K or V, KV head h between the BF16 slot
+// pool (slot a.sl[i]) and the FP8 home (page id a.ids[i]), 16 codes a thread a step. a.f: the reciprocal scales
+// (encode) or the scales (decode), by slot.
+struct KvMove8Args {
+  int ids[kKvSealMax];
+  int sl[kKvSealMax];
+  float kf[kMaxKvQ8Slots];
+  float vf[kMaxKvQ8Slots];
+};
+template <bool ENCODE>
+__global__ void kv_move8_kernel(__nv_bfloat16* __restrict__ slots, uint8_t* __restrict__ home, KvMove8Args a, int l0,
+                                int Hkv, int D, size_t hs_slot, size_t hs_home, size_t unit) {
+  pdl_begin();  // first statement: see launch.cuh
+  const int lkv = blockIdx.y, l = lkv / 2, kv = lkv % 2, h = blockIdx.z;
+  const float f = kv ? a.vf[l0 + l] : a.kf[l0 + l];
+  const size_t run = (size_t(l) * 2 + kv) * Hkv;
+  __nv_bfloat16* bf = slots + size_t(a.sl[blockIdx.x]) * unit + run * hs_slot + size_t(h) * hs_slot;
+  uint8_t* q = home + size_t(a.ids[blockIdx.x]) * unit + run * hs_home + size_t(h) * hs_home;
+  const int n16 = kKvPageTokens * D / 16;
+  for (int i = threadIdx.x; i < n16; i += blockDim.x) {
+    if constexpr (ENCODE) {
+      const uint4* src = reinterpret_cast<const uint4*>(bf) + 2 * i;
+      uint4 w[2] = {src[0], src[1]};
+      const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(w);
+      uint4 out;
+      uint16_t* o = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) o[j] = kv_q8_encode2(__bfloat1622float2(hv[j]), f);
+      reinterpret_cast<uint4*>(q)[i] = out;
+    } else {
+      const uint4 w = reinterpret_cast<const uint4*>(q)[i];
+      const __nv_fp8x2_storage_t* e = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w);
+      uint4 o[2];
+      __nv_bfloat162* hv = reinterpret_cast<__nv_bfloat162*>(o);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) hv[j] = kv_q8_decode2(e[j], f);
+      uint4* dst = reinterpret_cast<uint4*>(bf) + 2 * i;
+      dst[0] = o[0];
+      dst[1] = o[1];
+    }
+  }
+}
+
+template <bool ENCODE>
+void kv_move8(__nv_bfloat16* slots, uint8_t* home, uint8_t* sealed, const int* ids, const int* sl, int n, int l0,
+              int l1, int Hkv, int D, size_t hs_slot, size_t hs_home, size_t unit, const float* kf, const float* vf,
+              cudaStream_t s) {
+  if (l1 > kMaxKvQ8Slots) throw std::runtime_error("kv_move8: too many full-attention layers");
+  if (D % 16) throw std::runtime_error("kv_move8: head_dim a multiple of 16");
+  for (int at = 0; at < n; at += kKvSealMax) {
+    const int m = std::min(kKvSealMax, n - at);
+    KvMove8Args a{};
+    KvIds f{};
+    for (int i = 0; i < m; ++i) {
+      a.ids[i] = f.ids[i] = ids[at + i];
+      a.sl[i] = sl[at + i];
+    }
+    for (int l = 0; l < l1; ++l) {
+      a.kf[l] = kf[l];
+      a.vf[l] = vf[l];
+    }
+    if (l1 > l0)
+      launch_kernel(ENCODE ? "kv_seal8" : "kv_open8", kv_move8_kernel<ENCODE>, dim3(m, (l1 - l0) * 2, Hkv), dim3(256),
+                    0, s, slots, home, a, l0, Hkv, D, hs_slot, hs_home, unit);
+    if (sealed)
+      launch_kernel("kv_seal_flags", kv_flag_kernel, dim3(1), dim3(kKvSealMax), 0, s, sealed, f, m, uint8_t(1));
+  }
+}
+}  // namespace
+
+void kv_seal8(const __nv_bfloat16* slots, uint8_t* home, uint8_t* sealed, const int* ids, const int* sl, int n, int l0,
+              int l1, int Hkv, int D, size_t hs_slot, size_t hs_home, size_t unit, const float* kinv,
+              const float* vinv, cudaStream_t s) {
+  kv_move8<true>(const_cast<__nv_bfloat16*>(slots), home, sealed, ids, sl, n, l0, l1, Hkv, D, hs_slot, hs_home, unit,
+                 kinv, vinv, s);
+}
+
+void kv_open8(__nv_bfloat16* slots, const uint8_t* home, const int* ids, const int* sl, int n, int l0, int l1, int Hkv,
+              int D, size_t hs_slot, size_t hs_home, size_t unit, const float* ks, const float* vs, cudaStream_t s) {
+  kv_move8<false>(slots, const_cast<uint8_t*>(home), nullptr, ids, sl, n, l0, l1, Hkv, D, hs_slot, hs_home, unit, ks,
+                  vs, s);
 }
 
 // --kv-fp8: the FP8 read domain needs the cp.async tiles on the 32-key grid.
