@@ -15,8 +15,12 @@
 // its own KV cache and state, so N agent tasks that alternate keep their histories warm. A request runs in the session
 // it extends (its prompt_cache_key's session is looked at first; the token prefix decides), else in a new session,
 // which takes a free slot or evicts the least recently used one. A session bound with a prompt_cache_key whose last
-// request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-11-01) is never
-// evicted: a new session's request waits in the queue instead, while requests that continue a resident session run.
+// request ran less than --session-protect-seconds ago (default 30, 0 off; the owner's decision of 2026-11-01) is
+// protected: a new session's request waits in the queue instead, while requests that continue a resident session run.
+// The protection holds against a waiting request for the window only: once it has waited that long, it takes the least
+// recently used slot that no running request holds and no request queued ahead of it continues, protected or not
+// (core/session_slots.hpp; ragon:session_protect_lifts_total counts them), so a full table of agents that keep coming
+// back delays a new conversation by about the window instead of starving it.
 //
 // --batch N (default: the sessions when they are chosen at start, else 2; at most --sessions; M4 §3, stage 2) requests
 // run at once, each in its own session, interleaved: the running requests take turns, one prefill chunk or one decode
@@ -200,6 +204,7 @@ struct Metrics {
   // The session pool (M4 §1): slots, slots holding a session, evictions so far, the protection window.
   int sessions = 0, sessions_resident = 0;
   double session_evictions = 0, protect_seconds = 0;
+  double session_protect_lifts = 0;  // new sessions that took a protected slot after waiting the window
   // P4b (--kv-pages): the KV page pool's pages and free pages, and the requests ended by its last resort.
   int kv_pages_total = 0, kv_pages_free = 0;
   double kv_pool_exhausted = 0, kv_evictions = 0;
@@ -273,6 +278,8 @@ struct Metrics {
     counter("ragon:memory_refusals_total", memory_refusals,
             "Generation requests answered 503 because host memory was below --admit-reserve-mb.");
     counter("ragon:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
+    counter("ragon:session_protect_lifts_total", session_protect_lifts,
+            "New sessions that took a protected slot after waiting the protection window.");
     counter("ragon:prefill_chunks_interleaved_total", prefill_chunks_interleaved,
             "Prefill chunks run between another request's decode steps.");
     counter("ragon:batched_steps_total", batched_steps,
@@ -522,7 +529,9 @@ class Scheduler {
   // its session (M4 §1): the resident session it continues, else a slot for a new session. Sessions that a
   // running request holds or a queued job continues are pinned, so a new session never takes them; a job
   // that continues a running request's session waits for it (one request per session at a time), and when
-  // every other slot is pinned or protected a new session's job waits while the jobs behind it still run.
+  // every other slot is pinned or protected a new session's job waits while the jobs behind it still run, until it
+  // has waited the protection window: then it takes the least recently used slot that is not running and that no
+  // job ahead of it continues, protected or not (core/session_slots.hpp's new_session_slot).
   // P4b (--kv-pages): a job is admitted only when its prompt's KV pages and two more are free (kv_make_room may evict
   // idle sessions for them); otherwise it waits and the jobs behind it may still run.
   bool pick(Job& out) {
@@ -545,11 +554,21 @@ class Scheduler {
       match[j] = queue_[j].fork ? -1 : eng.match_session(queue_[j].prompt, queue_[j].req.session_key, queue_[j].req.share_scope);
       if (match[j] >= 0) pinned[match[j]] = true;
     }
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<SlotState> slots;  // taken at the first new session's job
     for (size_t j = 0; j < queue_.size(); ++j) {
+      bool lifted = false;
       int s = match[j];
       if (s >= 0 && busy[s]) continue;
       const bool fresh = s < 0;
-      if (fresh) s = eng.free_session(protect_seconds_, pinned);
+      if (fresh) {
+        if (slots.empty()) slots = eng.slot_states();
+        std::vector<bool> ahead = busy;  // the running requests' sessions and those the jobs ahead of this one continue
+        for (size_t k = 0; k < j; ++k)
+          if (match[k] >= 0) ahead[match[k]] = true;
+        const double waited = std::chrono::duration<double>(now - queue_[j].received).count();
+        s = new_session_slot(slots, protect_seconds_, waited, pinned, ahead, &lifted);
+      }
       if (s < 0) continue;
       if (eng.kv_paged() && eng.kv_admit_pages(queue_[j].prompt.size()) <= eng.kv_pages_total()) {
         // (A prompt whose pages the whole pool could never hold is admitted to be answered at once: start().)
@@ -566,6 +585,9 @@ class Scheduler {
       int lslot = -1;
       bool upload = false;
       if (queue_[j].lora && (lslot = ctx_.lora_slots->acquire(queue_[j].lora->id, &upload)) < 0) continue;
+      if (lifted)
+        std::fprintf(stderr, "session %d: a new session's request that waited %.1f s takes it (protection lifted)\n", s,
+                     std::chrono::duration<double>(now - queue_[j].received).count());
       out = std::move(queue_[j]);
       out.session = s;
       out.fresh = fresh;
@@ -574,6 +596,7 @@ class Scheduler {
       queue_.erase(queue_.begin() + j);
       std::lock_guard<std::mutex> m(ctx_.metrics.mu);
       ctx_.metrics.queued -= 1;
+      if (lifted) ctx_.metrics.session_protect_lifts += 1;
       return true;
     }
     return false;

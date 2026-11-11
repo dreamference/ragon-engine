@@ -40,6 +40,7 @@
 #include "core/lora_kernels.cuh"
 #include "core/model.hpp"
 #include "core/prefix_kv.hpp"
+#include "core/session_slots.hpp"
 #include "core/sampling.hpp"
 #include "core/tree.hpp"
 #include "core/vision.hpp"
@@ -473,8 +474,11 @@ class Engine {
   int match_session(const std::vector<int>& prompt, const std::string& key, uint64_t scope = 0) const;
   // A slot for a new session: one never used, else the least recently used one that is neither in `pinned`
   // nor protected; -1 when there is none (the request waits). Protected: a session bound with a key (an
-  // agent's thread) whose last request ran less than protect_seconds ago (M4 §7 question 6).
+  // agent's thread) whose last request ran less than protect_seconds ago (M4 §7 question 6). The policy is
+  // core/session_slots.hpp's lru_slot; the scheduler lifts the protection for a request that has waited the window.
   int free_session(double protect_seconds, const std::vector<bool>& pinned) const;
+  // Every slot as session_slots.hpp's policy sees it, idle times taken now.
+  std::vector<SlotState> slot_states() const;
   // Makes session i active. `fresh`: a new session takes the slot (an eviction when another held it).
   // Nothing is copied out or cleared: the slot's tokens stay usable as KV by a prompt that shares them.
   // `scope` (P4c): the request's share scope; a slot that held another scope's session keeps its pages (rewritten or

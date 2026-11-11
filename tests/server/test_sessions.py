@@ -4,11 +4,12 @@ specs/drafts/M4-sessions-and-batches.md §1, §3, §6, §7).
 ragon-serve keeps --sessions (default 2) resident sessions, each with its own KV cache and state, and runs
 each request in the session it continues, else in a new session that takes a free slot or evicts the least
 recently used one. Sessions bound with a prompt_cache_key whose last request ran less than
---session-protect-seconds ago are never evicted: a new session's request waits instead. Up to --batch
+--session-protect-seconds ago are protected: a new session's request waits instead, for the window at most (then
+it takes the least recently used slot no running request holds, protected or not). Up to --batch
 (default 2) requests run at once, each in its own session, taking turns one prefill chunk or decode step at
 a time.
 
-The queueing test runs last and leaves its two keyed sessions protected for the protection window, so a
+The queueing tests run last and leave their keyed sessions protected for the protection window, so a
 new conversation sent right after this file (a re-run of the suite) waits up to that long.
 
     RAGON_SERVE_URL=http://127.0.0.1:8300 python3 -m pytest tests/server -q
@@ -189,3 +190,54 @@ def test_third_conversation_queues_while_both_sessions_are_busy(server):
     while metrics(server)["sglang:num_queue_reqs"] != 0 and time.monotonic() < deadline:
         time.sleep(0.2)
     assert metrics(server)["sglang:num_queue_reqs"] == 0, "the abandoned request stayed in the queue"
+
+
+def test_waiting_conversation_is_admitted_after_the_window(server):
+    """A protected session delays a new conversation by about the window, never starves it (eng-session-protect-starve,
+    2026-11-11). Check: with every slot held by a keyed conversation that keeps coming back well within the window, a
+    new keyed conversation waits while the window lasts and then runs, in the least recently used slot (one eviction,
+    ragon:session_protect_lifts_total up by one), within the window plus a margin. Before the fix it waited for as
+    long as the conversations kept coming back."""
+    m = metrics(server)
+    window = m.get("ragon:session_protect_seconds", 0)
+    if window <= 0 or window > 60:
+        pytest.skip("session protection is off, or too long for this test (run the server with 60 s or less)")
+    if "ragon:session_protect_lifts_total" not in m:
+        pytest.skip("this server does not lift the protection for a waiting request")
+    n = int(m["ragon:sessions"])
+    convs = [conversation(f"keep{i}", lines=40) for i in range(n)]
+    replies = [greedy_chat(server, c, max_tokens=8, prompt_cache_key=f"m4-keep-{i}") for i, c in enumerate(convs)]
+    # A first turn may have waited for an earlier test's protected session, so the first turns can be spread over the
+    # window. A second turn of each, warm in its own session, makes every slot's last use recent.
+    for i in range(n):
+        prompt = replies[i]["usage"]["prompt_tokens"]
+        convs[i] = next_turn(convs[i], replies[i], "And for x = 0?")
+        replies[i] = greedy_chat(server, convs[i], max_tokens=4, prompt_cache_key=f"m4-keep-{i}")
+        assert cached(replies[i]) >= 0.9 * prompt, f"conversation {i}'s second turn was not warm"
+    before = metrics(server)
+    done = {}
+
+    def newcomer():
+        t0 = time.monotonic()
+        r = greedy_chat(server, conversation("newcomer", lines=40), max_tokens=8, prompt_cache_key="m4-newcomer")
+        done["wait"] = time.monotonic() - t0
+        done["reply"] = r
+
+    t = threading.Thread(target=newcomer)
+    t.start()
+    # The resident conversations keep coming back every few seconds, each turn well within the window.
+    turn = 1
+    deadline = time.monotonic() + window + 30
+    while t.is_alive() and time.monotonic() < deadline:
+        i = turn % n
+        convs[i] = next_turn(convs[i], replies[i], f"And for x = {turn}?")
+        replies[i] = greedy_chat(server, convs[i], max_tokens=4, prompt_cache_key=f"m4-keep-{i}")
+        turn += 1
+        time.sleep(max(0.5, min(5.0, window / (2 * n))))
+    t.join(timeout=60)
+    assert "reply" in done, "the new conversation was not admitted within the window plus 30 s"
+    assert done["reply"]["choices"][0]["message"].get("content") is not None
+    assert done["wait"] >= window - 1, f"admitted after {done['wait']:.1f} s, before the window ran out"
+    after = metrics(server)
+    assert after["ragon:session_protect_lifts_total"] == before["ragon:session_protect_lifts_total"] + 1, after
+    assert after["ragon:session_evictions_total"] >= before["ragon:session_evictions_total"] + 1, after
