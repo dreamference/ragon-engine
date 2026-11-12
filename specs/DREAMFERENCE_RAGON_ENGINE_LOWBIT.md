@@ -314,7 +314,7 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
 - **Memory:** sessions per GB of pool at 64K go from 0.23 (BF16) to 0.40 at 8 sessions (0.41 for the pages alone; the slots cost the rest). The first build's mirror beside the BF16 pool gave 0.16.
 - **Step time, one stream, 16-row tree, graphs and PDL, medians of three interleaved runs:**
   - at 25.7K: 98.4 → 97.6 ms, saving 0.8 ms against a 2.5 ms gate (FAIL); 97.4 ms with `--attn-prefetch 0`, which is bit-identical;
-  - at 64K: 111.5 → 107.1 ms, saving 4.4 ms against a 6 ms gate (FAIL); with 2048-key ranges (`RAGON_ATTN_CHUNK=2048`, which changes the outputs and was not quality-gated) 105.2 ms, 6.3 ms saved, but 0.5 ms at 25.7K;
+  - at 64K: 111.5 → 107.1 ms, saving 4.4 ms against a 6 ms gate (FAIL); with 2048-key ranges (`RAGON_ATTN_CHUNK=2048`, which changes the outputs; gated on 2026-11-11 and not kept, see the last bullet of this list) 105.2 ms, 6.3 ms saved, but 0.5 ms at 25.7K;
   - the full-attention core is 9 % of the 25.7K step and the microbench's best FP8 setting saves 0.11 ms per layer there, so none of the measured settings reaches 2.5 ms at 25.7K (1.5 ms at best): the gain is a long-context one, and no kernel round was run.
   - Prefill attention is slower with the knob on: 3.23 → 3.88 s at 25.7K.
 - **Quality, teacher-forced against the BF16 cache** (`bench/agreement`, 54 cases, 2,490 positions):
@@ -330,7 +330,24 @@ Not tried: (b) 2:4, (a3) MXFP4, (d) layer skipping.
   - On this one prompt FP8 took 87 steps at 4.66 tokens a step against BF16's 78 at 5.13, so its time per token was higher (22.6 against 21.4 ms). That is one greedy text that diverged (n = 1); the replay's acceptance figures above are the measure.
 - **Hot window (negative, not kept):** keeping the last N positions of each session in BF16 slots and only older pages FP8 (a measurement knob on the seal boundary). With N = 38.3K (the context beyond 25.7K) the 64K step is 108.7 ms, keeping 1.2 of the 4.4 ms, and one session needs 737 slots (2.7 GB) beside its 1.9 GB of pages, about 0.22 sessions per GB, under BF16's 0.23. With N = 4K it is 106.2 ms, 0.7 ms slower than plain FP8. A BF16 tile reads twice the bytes and also passes through the read rule's rounding, so a hot window only costs. Outputs are identical to plain FP8, as the read rule requires.
 - **The fan-out cascade's 128-row shared phase now runs with `--kv-fp8` too** (it kept 96 rows before). The sealed-tile decode loops over the block's threads and its shared memory does not depend on the row count, so each warp computes the same floats. On the fan-out shape (33 paged sessions at 32K, 32 greedy forks of one 32K prefix, 100 tokens), the span rises from 185.8 to 189.9 tokens/s (+2.2 %, two servers × two repeats each way) with every fork's text, step count and acceptance identical. BF16 on the same shape gives 187.5 and 191.7. Moving the dequantisation from the shared-memory stage into registers was not tried: the trace shows the decode stage is not where the time goes.
-- **2048-key ranges with FP8 (a follow-up, not gated):** `RAGON_ATTN_CHUNK=2048` takes the 64K FP8 step from 105.5 to 103.3 ms, while BF16 goes from 109.9 to 110.1 (single runs against the medians of three above). BF16's step count on the same prompt moved from 78 to 83, so that prompt's step count shifts with float-level changes alone. The ranges change the floats; FP8 already differs from BF16, but a per-mode default would still need its own quality gate.
+- **2048-key ranges (`RAGON_ATTN_CHUNK=2048`, against the default 4096), with the BF16 cache and with `--kv-fp8` (negative, 2026-11-11; the default stays 4096 in both modes).**
+  - *First look (single runs):* the 64K FP8 step went from 105.5 to 103.3 ms and BF16 from 109.9 to 110.1. On the same prompt BF16's step count moved from 78 to 83, so that prompt's step count shifts with float-level changes alone.
+  - *Step gate (one stream, `--block 12`, sparse head, graphs and PDL, 400 tokens, two runs per arm in A-B-B-A order):*
+    - ms/step: BF16 108.5 → 109.0 at 64K and 96.25 → 98.0 at 25.7K; FP8 104.1 → 102.6 at 64K and 95.6 → 95.85 at 25.7K. The spread is at most 0.3 ms per arm.
+    - Both runs of an arm took the same number of steps, so accepted tokens per step come from one greedy text per context:
+      - BF16: 5.13 → 4.82 at 64K, 4.48 → 4.08 at 25.7K;
+      - FP8: 4.66 → 4.82 at 64K, 4.35 → 4.66 at 25.7K.
+    - ms/token: BF16 21.16 → 22.62 and 21.42 → 24.01; FP8 22.64 → 21.80 and 21.99 → 20.85. FP8's gain is mostly these step counts: the step itself saves 1.5 ms at 64K and nothing at 25.7K.
+  - *Agentlong (16 turns, 28K–62K prompts, greedy, the production server argv; FP8 with the paged pool):*
+    - BF16: 6.74 → 6.55 accepted per pass, 104.1 → 104.2 ms per pass, 64.8 → 62.8 tokens/s;
+    - FP8: 6.80 → 6.68 accepted per pass, 100.0 → 100.0 ms per pass over all turns but 105–106 → 103 ms on the four turns from 51K to 62K, 68.0 → 66.9 tokens/s.
+    - The response text (its SHA-256) matches the default's in 7 of 16 turns (BF16) and 6 of 16 (FP8). Some of those turns differ in generated-token count, so fewer full outputs match. The change is not exact.
+  - *Quality (`bench/agreement`, 54 cases, 2,490 positions, scored to 40K, so the 64K step claim lies beyond what was scored; the reference is the BF16 cache with 4096-key ranges):*
+    - BF16 with 2048: mean KL 0.00154 (8–25K 0.00351, 25K+ 0.00315, ratio 0.90), 17 flips, largest gap 1.00 nats. KL is exactly 0 under 2K, where both settings make one range. The split alone moves long-prompt logits about as far as the FP8 cache does (0.00168).
+    - FP8 with 2048: mean KL 0.00197 against plain FP8's 0.00168 (8–25K 0.00365 against 0.00296, 25K+ 0.00391 against 0.00334). On the 25K+ over 8–25K ratio with the 1,200-token cap it passes at 1.07, where plain FP8 scores 1.13 and 19 of 19 tools; it passes because both buckets got worse. On the older below-25K split the two are 2.68 and 2.70. 29 flips against 24, largest gap 1.45, tool names 19 of 19 against production at the 1,200-token cap, needles 16 of 16. This passes the bar, but at a higher KL.
+  - *Verdict.* Not kept in either mode.
+    - BF16: slower per step and per token, with fewer tokens per pass.
+    - FP8: the step saves about 1.5–2.5 ms from about 50K up and nothing at 25.7K. Over agentlong's 28K–62K turns, the lower tokens per pass take back more than that, and the KL against BF16 is higher.
 
 ### 8.1 (a1) as built: the loader and the tiler (2026-11-09)
 
