@@ -2,14 +2,21 @@ cmake_minimum_required(VERSION 3.28)
 project(ragon_engine LANGUAGES CXX VERSION 0.1.0)
 
 # The compute backend (specs/DREAMFERENCE_RAGON_ENGINE_BACKEND.md): one kernel interface (src/backend/backend.hpp,
-# core/kernels.cuh), one implementation per build. cuda is today's engine, unchanged; hip (the Windows node) and
-# metal (the Mac node) build on the same interface and are not implemented yet.
+# core/kernels.cuh), one implementation per build. cuda is today's engine, unchanged; hip (the Windows node, BACKEND
+# §7) compiles the same .cu files as HIP and builds the kernels ported so far with their tests only; metal (the Mac
+# node) is not implemented yet.
 set(RAGON_BACKEND cuda CACHE STRING "Compute backend: cuda, hip or metal")
 set_property(CACHE RAGON_BACKEND PROPERTY STRINGS cuda hip metal)
 if(RAGON_BACKEND STREQUAL "cuda")
   enable_language(CUDA)
-elseif(RAGON_BACKEND STREQUAL "hip" OR RAGON_BACKEND STREQUAL "metal")
-  message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: not implemented yet (BACKEND §7, §8); cuda is the only backend")
+elseif(RAGON_BACKEND STREQUAL "hip")
+  # gfx1151 (Radeon 8060S, the Windows node), wave32: the kernels assume 32-lane warps (BACKEND §7).
+  if(NOT CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx1151)
+  endif()
+  enable_language(HIP)
+elseif(RAGON_BACKEND STREQUAL "metal")
+  message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: not implemented yet (BACKEND §8)")
 else()
   message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: unknown backend (cuda, hip or metal)")
 endif()
@@ -39,6 +46,23 @@ option(RAGON_SANITIZE "Build host code with AddressSanitizer and UndefinedBehavi
 if(RAGON_SANITIZE)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address,undefined>)
   add_link_options(-fsanitize=address,undefined)
+endif()
+
+# The HIP build (BACKEND §7): the kernels ported so far, compiled as HIP from the CUDA sources, and their tests. The
+# rest of the engine (and its host dependencies) joins as its kernels do.
+if(RAGON_BACKEND STREQUAL "hip")
+  set(CMAKE_HIP_STANDARD 20)
+  set(CMAKE_HIP_STANDARD_REQUIRED ON)
+  set(RAGON_HIP_SOURCES src/core/topk.cu)
+  set_source_files_properties(${RAGON_HIP_SOURCES} tests/topk_tests.cu PROPERTIES LANGUAGE HIP)
+  add_library(ragon_kernels_hip STATIC ${RAGON_HIP_SOURCES})
+  target_include_directories(ragon_kernels_hip PUBLIC src)
+  target_compile_definitions(ragon_kernels_hip PUBLIC RAGON_BACKEND_HIP)
+  enable_testing()
+  add_executable(ragon-topk-tests tests/topk_tests.cu)
+  target_link_libraries(ragon-topk-tests PRIVATE ragon_kernels_hip)
+  add_test(NAME topk COMMAND ragon-topk-tests)
+  return()
 endif()
 
 find_package(CUDAToolkit REQUIRED)
@@ -147,6 +171,9 @@ add_test(NAME paged_head_major COMMAND ragon-paged-tests head-major)
 add_executable(ragon-kvq8-tests tests/kvq8_tests.cu)
 target_link_libraries(ragon-kvq8-tests PRIVATE ragon_core)
 add_test(NAME kvq8 COMMAND ragon-kvq8-tests)
+add_executable(ragon-topk-tests tests/topk_tests.cu)  # also the HIP build's (BACKEND §7)
+target_link_libraries(ragon-topk-tests PRIVATE ragon_core)
+add_test(NAME topk COMMAND ragon-topk-tests)
 add_executable(ragon-stream-tests tests/stream_tests.cu)
 target_link_libraries(ragon-stream-tests PRIVATE ragon_core CUDA::cuda_driver)
 add_test(NAME stream COMMAND ragon-stream-tests)
