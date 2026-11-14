@@ -10,8 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "backend/backend.hpp"  // the interface types; the CUDA-only device helpers at the end
+// test __CUDACC__ (inline PTX), the declarations above them are the backend interface (BACKEND §2).
 
 #include "core/kernels.cuh"
 
@@ -29,8 +29,8 @@ struct LoraSegDev {
 
 // One site of one layer in one slot of the GPU pool. a == nullptr: the slot's adapter does not touch the site.
 struct LoraSiteDev {
-  const __nv_bfloat16* a = nullptr;  // [blocks * rank][K]
-  const __nv_bfloat16* b = nullptr;
+  const gpu::bf16* a = nullptr;  // [blocks * rank][K]
+  const gpu::bf16* b = nullptr;
   int K = 0, rank = 0, blocks = 0, nsegs = 0;
   float scale = 0.f;
   LoraSegDev segs[kLoraSegs];
@@ -62,7 +62,7 @@ struct LoraGemm {
     long long b_off = 0;
   };
   const float* t = nullptr;  // [M][kLoraRankRows]
-  const __nv_bfloat16* b = nullptr;
+  const gpu::bf16* b = nullptr;
   int rank = 0, nsegs = 0;
   float scale = 0.f;
   Seg segs[kLoraSegs];
@@ -71,25 +71,25 @@ struct LoraGemm {
 // t[r][j] = sum_k x[r][k] A[j][k] for every row r on a slot, j < blocks * rank of that slot's site. `site` is the
 // site in slot 0; slot s's is site[s * slot_stride]. x is FP32 [M][ldx]; K a multiple of 4.
 void lora_shrink(const float* x, int ldx, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
-                 int a_rows, float* t, cudaStream_t stream);
+                 int a_rows, float* t, gpu::Stream stream);
 
 // y_out[r][n] += scale * sum_j B[n - n0][j] t[r][block * rank + j] for every row r on a slot and every segment of its
 // site.
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
-                 const LoraOuts& outs, cudaStream_t stream);
+                 const LoraOuts& outs, gpu::Stream stream);
 
 // The prefill path (a prompt's tokens, whatever the chunk's size): tensor cores on BF16, as the reference computes an
 // adapter. The shrink, K a multiple of 16; the expand has no kernel of its own, its rows are added by the GEMM that
 // writes the output (prefill_gemm_fp8_lora), so a chunk's y is written once and not read back.
 void lora_shrink_prefill(const float* x, int ldx, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
-                         float* t, cudaStream_t stream);
+                         float* t, gpu::Stream stream);
 
 // d's segments split by output, with t the shrink's output; an output with no segment gets nsegs == 0.
 void lora_gemm_parts(const LoraSiteDev& d, const float* t, LoraGemm (&parts)[kLoraOuts]);
 
 // prefill_gemm_fp8, every row of M on the adapter: y = [y +] alpha * W x + scale * B t. Segment bounds multiples of 8.
 void prefill_gemm_fp8_lora(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
-                           bool accumulate, const LoraGemm& lora, cudaStream_t s);
+                           bool accumulate, const LoraGemm& lora, gpu::Stream s);
 
 #ifdef __CUDACC__
 // Sequence q's slot (-1: the base), from slot_dev in a captured graph.

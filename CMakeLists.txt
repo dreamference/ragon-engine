@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.28)
-project(ragon_engine LANGUAGES CXX CUDA VERSION 0.1.0)
+project(ragon_engine LANGUAGES CXX VERSION 0.1.0)
+
+# The compute backend (specs/DREAMFERENCE_RAGON_ENGINE_BACKEND.md): one kernel interface (src/backend/backend.hpp,
+# core/kernels.cuh), one implementation per build. cuda is today's engine, unchanged; hip (the Windows node) and
+# metal (the Mac node) build on the same interface and are not implemented yet.
+set(RAGON_BACKEND cuda CACHE STRING "Compute backend: cuda, hip or metal")
+set_property(CACHE RAGON_BACKEND PROPERTY STRINGS cuda hip metal)
+if(RAGON_BACKEND STREQUAL "cuda")
+  enable_language(CUDA)
+elseif(RAGON_BACKEND STREQUAL "hip" OR RAGON_BACKEND STREQUAL "metal")
+  message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: not implemented yet (BACKEND §7, §8); cuda is the only backend")
+else()
+  message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: unknown backend (cuda, hip or metal)")
+endif()
 
 # ragon-engine v0: one model (Qwen3.8-27B, NVFP4 MLP + FP8 attention), one GPU (GB10, sm_121).
 # SPEC.md §8: C++20 and CUDA throughout; separate targets for the core, the tokenizer and the server,

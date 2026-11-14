@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "backend/backend.hpp"  // the interface types; vision_kernels are backend entry points
+// (specs/DREAMFERENCE_RAGON_ENGINE_BACKEND.md §2), VisionTower is host code over them.
 
 namespace ragon {
 
@@ -51,55 +51,55 @@ class VisionTower {
   // pixel_values cast to BF16); `out` (device) receives [gh * gw / 4][5120] BF16. gh and gw are even.
   // tap >= -1 (a check): also copies the residual stream after the patch and position embeddings (-1) or after block
   // `tap` into *tap_out ([gh * gw][1152] BF16 bits), before the merger.
-  void forward(const uint16_t* patches, int gh, int gw, __nv_bfloat16* out, cudaStream_t s, int tap = -2,
+  void forward(const uint16_t* patches, int gh, int gw, gpu::bf16* out, gpu::Stream s, int tap = -2,
                std::vector<uint16_t>* tap_out = nullptr);
 
  private:
   struct Block {
-    const __nv_bfloat16 *n1w, *n1b, *n2w, *n2b;
-    const __nv_bfloat16 *qkv_w, *qkv_b, *proj_w, *proj_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
+    const gpu::bf16 *n1w, *n1b, *n2w, *n2b;
+    const gpu::bf16 *qkv_w, *qkv_b, *proj_w, *proj_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
   };
   // y = x . W^T + b over M rows, in chunks of kChunk rows through the FP32 scratch; then the epilogue (act: 0 none,
   // 1 tanh GELU, 2 erf GELU) into `out` (BF16, row stride ld_out, columns N .. ld_out zeroed), or added into it
   // (residual: out = bf16(out + bf16(y + b))).
-  void linear(const __nv_bfloat16* x, int M, int K, const __nv_bfloat16* w, const __nv_bfloat16* b, int N,
-              __nv_bfloat16* out, int ld_out, int act, bool residual, cudaStream_t s);
-  const __nv_bfloat16* upload(const Checkpoint& ck, const std::string& name, std::vector<int64_t> shape);
+  void linear(const gpu::bf16* x, int M, int K, const gpu::bf16* w, const gpu::bf16* b, int N,
+              gpu::bf16* out, int ld_out, int act, bool residual, gpu::Stream s);
+  const gpu::bf16* upload(const Checkpoint& ck, const std::string& name, std::vector<int64_t> shape);
 
   VisionConfig cfg_;
   int max_patches_ = 0;
   size_t weight_bytes_ = 0, scratch_bytes_ = 0;
   std::vector<void*> owned_;
-  const __nv_bfloat16 *patch_w_ = nullptr, *patch_b_ = nullptr, *pos_ = nullptr;
+  const gpu::bf16 *patch_w_ = nullptr, *patch_b_ = nullptr, *pos_ = nullptr;
   std::vector<Block> blocks_;
-  const __nv_bfloat16 *mn_w_ = nullptr, *mn_b_ = nullptr, *m1_w_ = nullptr, *m1_b_ = nullptr, *m2_w_ = nullptr,
+  const gpu::bf16 *mn_w_ = nullptr, *mn_b_ = nullptr, *m1_w_ = nullptr, *m1_b_ = nullptr, *m2_w_ = nullptr,
                       *m2_b_ = nullptr;
   // Scratch.
-  __nv_bfloat16 *x_ = nullptr, *xn_ = nullptr, *qkv_ = nullptr, *attn_ = nullptr, *act_ = nullptr;
+  gpu::bf16 *x_ = nullptr, *xn_ = nullptr, *qkv_ = nullptr, *attn_ = nullptr, *act_ = nullptr;
   float* y_ = nullptr;  // kChunk x max N FP32
   int* pos_idx_ = nullptr;       // [4][max_patches] the bilinear corners
-  __nv_bfloat16* pos_wt_ = nullptr;  // [4][max_patches] their BF16 weights
+  gpu::bf16* pos_wt_ = nullptr;  // [4][max_patches] their BF16 weights
   int* rot_pos_ = nullptr;       // [max_patches][2] (row, col)
 };
 
 namespace vision_kernels {
 // The kernels, exposed for ragon-vision-tests.
 // out[r] = bf16(LayerNorm(x[r]) * w + b), rows of `cols` (FP32 statistics).
-void layernorm(const __nv_bfloat16* x, const __nv_bfloat16* w, const __nv_bfloat16* b, __nv_bfloat16* out, int rows,
-               int cols, float eps, cudaStream_t s);
+void layernorm(const gpu::bf16* x, const gpu::bf16* w, const gpu::bf16* b, gpu::bf16* out, int rows,
+               int cols, float eps, gpu::Stream s);
 // The rotary on q and k of qkv [n][3][heads][72] in place: dimension d < 36 and d + 36 turn by the angle
 // pos.row * f[d] (d < 18) or pos.col * f[d - 18], f[j] = 10000^(-2j/36); FP32 math, BF16 out.
-void rotary(__nv_bfloat16* qkv, const int* pos, int n, int heads, cudaStream_t s);
+void rotary(gpu::bf16* qkv, const int* pos, int n, int heads, gpu::Stream s);
 // Bidirectional attention over n tokens: qkv [n][3][heads][72] -> out [n][heads][72], softmax scale 72^-0.5.
-void attention(const __nv_bfloat16* qkv, __nv_bfloat16* out, int n, int heads, cudaStream_t s);
+void attention(const gpu::bf16* qkv, gpu::bf16* out, int n, int heads, gpu::Stream s);
 // The epilogue of linear().
-void bias_act(const float* y, const __nv_bfloat16* b, int M, int N, __nv_bfloat16* out, int ld_out, int act,
-              bool residual, cudaStream_t s);
+void bias_act(const float* y, const gpu::bf16* b, int M, int N, gpu::bf16* out, int ld_out, int act,
+              bool residual, gpu::Stream s);
 // x[p] = bf16(x[p] + bf16(sum_i bf16(table[idx[i][p]] * wt[i][p]))), the interpolated position embedding.
-void add_pos(__nv_bfloat16* x, const __nv_bfloat16* table, const int* idx, const __nv_bfloat16* wt, int n, int hidden,
-             cudaStream_t s);
+void add_pos(gpu::bf16* x, const gpu::bf16* table, const int* idx, const gpu::bf16* wt, int n, int hidden,
+             gpu::Stream s);
 // h[r][c] = float(src[r][c]): an image's rows of the language model's input (its embedding replaces the token's).
-void embed_rows(const __nv_bfloat16* src, int rows, int hidden, float* h, cudaStream_t s);
+void embed_rows(const gpu::bf16* src, int rows, int hidden, float* h, gpu::Stream s);
 }  // namespace vision_kernels
 
 // The host side of the position embedding and the rotary positions for a gh x gw patch grid, in merge-window order
