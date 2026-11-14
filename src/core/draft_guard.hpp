@@ -23,6 +23,15 @@
 //     session whose drafter is back at 4-7 tokens per step is on again after 1-3 probes (16-48 plain steps).
 // Switching costs nothing: a plain step feeds the drafter's context ring as a speculative step's commit does
 // (Engine::step), so a probe or the first step after switching back on drafts from the context it would have had.
+//
+// The hold (eng-fanout-policy; EngineOptions::draft_off_wide): the break-even above is one stream's. While the server
+// runs the wide regime (more than 7 requests drafting, all in one batched verify at the gang block), a fork's draft
+// rows ride a pass whose period the batch sets, so switching that fork off only slows it: it then needs ~80 one-token
+// passes where its siblings need ~52, and runs the last ~25 of them alone after the batch has drained (32 forks x 32K:
+// span 236 -> 284 tok/s with the guard off, outputs identical). A held step keeps the mean and never switches off
+// (a session that was off is on again); when the hold ends the guard of every session it touched starts afresh
+// (release(): the warm-up again), so a fork left alone re-earns its decision at one stream's break-even instead of
+// tripping on a mean taken at the gang block (at most 3 tokens a step there).
 #pragma once
 
 namespace ragon {
@@ -43,11 +52,20 @@ class DraftGuard {
   double mean() const { return ema_; }
   long seen() const { return seen_; }
 
+  bool held() const { return held_; }
+
   // After a speculative step that produced `tokens` (accepted + 1). Returns true when the guard switched (off, or
-  // back on).
-  bool observe(const DraftGuardConfig& c, double tokens) {
+  // back on). `hold`: a step under the hold (see above): no switch off, an off guard on again.
+  bool observe(const DraftGuardConfig& c, double tokens, bool hold = false) {
     ema_ = ema_ < 0 ? tokens : ema_ * (1 - c.alpha) + tokens * c.alpha;
     ++seen_;
+    if (hold) {
+      held_ = true;
+      const bool was_off = !on_;
+      on_ = true;
+      plain_left_ = 0;
+      return was_off;
+    }
     if (c.off_below <= 0) {  // the guard off: it keeps the mean but never switches
       on_ = true;
       return false;
@@ -73,12 +91,17 @@ class DraftGuard {
   }
 
   void reset() { *this = DraftGuard{}; }
+  // The hold has ended: a guard that saw a held step starts afresh; any other is left as it is.
+  void release() {
+    if (held_) reset();
+  }
 
  private:
   bool on_ = true;
   double ema_ = -1;  // no step seen yet
   long seen_ = 0;
   int plain_left_ = 0;  // while off: plain steps before the next probe
+  bool held_ = false;   // a held step seen since the last reset
 };
 
 }  // namespace ragon

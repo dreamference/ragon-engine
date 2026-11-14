@@ -1,6 +1,6 @@
 // Host-side checks of the drafter-off guard's policy (core/draft_guard.hpp, BACKLOG 10), no GPU: the warm-up, the
 // switch off below the threshold, the probes while off, the hysteresis, the switch back on, the check's flapping
-// configuration (a margin of -off_below) and the guard off at 0.
+// configuration (a margin of -off_below), the guard off at 0 and the wide regime's hold.
 #include <cmath>
 #include <cstdio>
 
@@ -111,6 +111,28 @@ void check_reset() {
   for (int i = 0; i < c.warmup - 1; ++i) expect(!g.observe(c, 1.0), "the warm-up again after a reset");
 }
 
+void check_hold() {
+  const ragon::DraftGuardConfig c;
+  // Held from the start: 1 token per step far past the warm-up never switches off, and the mean is kept.
+  ragon::DraftGuard g;
+  bool switched = false;
+  for (int i = 0; i < 200; ++i) switched |= g.observe(c, 1.0, true);
+  expect(!switched && g.on() && g.speculate() && g.held(), "a held guard never switches off");
+  expect(g.seen() == 200 && std::fabs(g.mean() - 1.0) < 1e-9, "the mean is kept while held");
+  // The release: the warm-up again, then the one-stream rule.
+  g.release();
+  expect(g.on() && !g.held() && g.seen() == 0 && g.mean() < 0, "release: afresh");
+  for (int i = 0; i < c.warmup - 1; ++i) expect(!g.observe(c, 1.0), "the warm-up after the release");
+  expect(g.observe(c, 1.0) && !g.on(), "and the trip at its end");
+  // An off guard under the hold: on again at its first held step, with no plain step owed.
+  expect(g.observe(c, 1.0, true) && g.on() && g.speculate(), "a held step switches an off guard back on");
+  // A guard that never saw a held step is left as it is by a release.
+  ragon::DraftGuard off;
+  for (int i = 0; i < c.warmup; ++i) off.observe(c, 1.0);
+  off.release();
+  expect(!off.on() && off.seen() == c.warmup, "release leaves an unheld guard alone");
+}
+
 }  // namespace
 
 int main() {
@@ -120,6 +142,7 @@ int main() {
   check_hysteresis();
   check_flapping();
   check_reset();
+  check_hold();
   std::printf(failures ? "DRAFT GUARD TESTS FAILED (%d)\n" : "all draft guard tests passed\n", failures);
   return failures ? 1 : 0;
 }

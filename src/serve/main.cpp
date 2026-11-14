@@ -3,7 +3,7 @@
 // time; the HTTP threads parse requests and stream server-sent events back.
 //
 //   ragon-serve --model DIR [--host 0.0.0.0] [--port 8000] [--served-model-name NAME] [--max-context N]
-//              [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X]] [--graphs] [--pdl]
+//              [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--lookup 0|1|2] [--lookup-min N] [--draft-off-below X] [--draft-off-wide 0|1] [--sparse-head-batch N]] [--graphs] [--pdl]
 //              [--attn-bulk] [--attn-prefetch N] [--keepalive-seconds N] [--prefill-bf16] [--kv-fp8 --kv-fp8-scales F]
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on|off] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N]
@@ -55,7 +55,13 @@
 // session whose running mean of tokens per speculative step falls below X decodes one plain row per step, with no
 // drafter pass, and probes the drafter once every 16 plain steps until the mean is back at X + 0.25
 // (core/draft_guard.hpp). Greedy output is the same token for token; counted in /spec_stats (drafter_off_steps,
-// drafter_switches) and /metrics (ragon:drafter_off_steps_total, ragon:drafter_switches_total).
+// drafter_switches) and /metrics (ragon:drafter_off_steps_total, ragon:drafter_switches_total). --draft-off-wide 0|1
+// (RAGON_DRAFT_OFF_WIDE; default 0): 0 holds the guard while the wide regime runs (no session switched off while the
+// requests speculate at the gang block; EngineOptions::draft_off_wide), 1 lets it switch there as anywhere else.
+//
+// --sparse-head-batch N (RAGON_SH_BATCH; default 6, 0 never): with more than N greedy sequences drafting
+// in one batched step they draft with the full head, one pass for the batch instead of the sparse head's gather per
+// sequence (EngineOptions::sparse_head_batch); the outputs are the same.
 //
 // Fan-out (BATCHING P4d and §5.8): --fanout-plain-above N (RAGON_FANOUT_PLAIN_ABOVE; default 6 with a drafter, 1
 // without, 0 never) has every decoding request take plain batched steps above N decoding requests; --fanout-gang-above
@@ -929,6 +935,8 @@ class Scheduler {
   // x 2 rows fill a 64-row verify). At fewer the server is what it was (plain above 6, the global block, trees). A
   // change of block drops the captured graphs (Engine::set_draft_block), so it waits while a side chunk is in flight
   // and the regime with it. Called once a turn, before anything reads the block. --fanout-default off: never wide.
+  // eng-fanout-policy: while the requests speculate at the gang block, the engine holds the drafter-off guard
+  // (Engine::set_fanout_wide, --draft-off-wide).
   void fanout_regime() {
     if (fanout_wide_above_ <= 0) return;
     int drafting = 0;
@@ -937,12 +945,13 @@ class Scheduler {
     const bool before = wide_;
     wide_ = drafting > fanout_wide_above_;
     const int block = wide_ && !fanout_plain() ? wide_block_ : base_block_;
-    if (block == eng.draft_block()) return;
-    if (eng.side_busy()) {
-      wide_ = before;
-      return;
+    if (block != eng.draft_block()) {
+      if (eng.side_busy())
+        wide_ = before;
+      else
+        eng.set_draft_block(block);
     }
-    eng.set_draft_block(block);
+    eng.set_fanout_wide(wide_ && !fanout_plain());
   }
   // Fan-out's question prefills (BATCHING P4d): above --fanout-gang-above live requests (by default the plain
   // threshold), the short prefills waiting (at most a chunk left: a fork's question after a shared context) run ahead
@@ -2530,6 +2539,8 @@ int main(int argc, char** argv) try {
   std::string repetition_arg, repetition_report = "incomplete";
   std::string draft_head = "sparse", sparse_head_dir;  // the drafter's head (BACKLOG 19)
   int sparse_head_dynamic = 16384;
+  int sparse_head_batch = ragon::EngineOptions{}.sparse_head_batch;  // eng-fanout-policy
+  bool draft_off_wide = false;                                  // eng-fanout-policy
   std::string vision = "on", jpeg = "gpu";  // images (VISION §20.3)
   long vision_max_pixels = 16777216;
   int vision_cache_mb = 512;
@@ -2581,6 +2592,8 @@ int main(int argc, char** argv) try {
     else if (a == "--draft-head") draft_head = next();  // sparse (default) or full (BACKLOG 19)
     else if (a == "--sparse-head-dir") sparse_head_dir = next();
     else if (a == "--sparse-head-dynamic") sparse_head_dynamic = std::stoi(next());
+    else if (a == "--sparse-head-batch") sparse_head_batch = std::stoi(next());
+    else if (a == "--draft-off-wide") draft_off_wide = std::stoi(next()) != 0;
     else if (a == "--sessions") sessions_arg = std::stoi(next());
     else if (a == "--session-protect-seconds") protect_seconds = std::stod(next());
     else if (a == "--batch") batch_arg = std::stoi(next());
@@ -2622,7 +2635,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-off-wide 0|1] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N] [--sparse-head-batch N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2729,6 +2742,8 @@ int main(int argc, char** argv) try {
   opts.draft_head = draft_head;
   opts.sparse_head_dir = sparse_head_dir;
   opts.sparse_head_dynamic = sparse_head_dynamic;
+  opts.sparse_head_batch = sparse_head_batch;
+  opts.draft_off_wide = draft_off_wide;
   opts.side_prefill = side_prefill;
   if (vision != "on" && vision != "off") {
     std::cerr << "--vision is on or off\n";
