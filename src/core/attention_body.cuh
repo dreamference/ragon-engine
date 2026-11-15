@@ -1,12 +1,12 @@
 // The rows path's attention (decode and verify) and its prepare step as device bodies of their block coordinates,
 // shared by their kernels (kernels.cu) and the megakernel's attention layer (stream_gemm.cu, RAGON_MK_ATTN, BACKLOG 28):
 // one source, so every launcher computes the same bits. Also warp_sum and block_sum, and the tree verify's DeltaNet
-// recurrence (gdn_recurrent_tree_body, for the megakernel's DeltaNet mixer, RAGON_MK_GDN). CUDA source files only.
+// recurrence (gdn_recurrent_tree_body, for the megakernel's DeltaNet mixer, RAGON_MK_GDN). GPU source files only.
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include "backend/device.hpp"  // the types and device helpers of the build's backend (BACKEND §3)
+// (the include block keeps its three lines: the CUDA objects' line tables stay put)
+//
 
 #include <climits>
 #include <cmath>
@@ -19,7 +19,7 @@ namespace {
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(gpu::kWarpMask, v, o);
   return v;
 }
 
@@ -54,12 +54,12 @@ __device__ __forceinline__ int mrope_pos(int i, int pt, int ph, int pw) {
 // Row m (its RoPE positions pos, ph, pw: (temporal, height, width), all equal for text) of attn_prepare; the caches
 // are its sequence's.
 __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_gate, const float* __restrict__ k,
-                                                  const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
-                                                  const __nv_bfloat16* __restrict__ k_norm, int m, int pos, int ph,
+                                                  const float* __restrict__ v, const gpu::bf16* __restrict__ q_norm,
+                                                  const gpu::bf16* __restrict__ k_norm, int m, int pos, int ph,
                                                   int pw, int Hq,
                                                   int Hkv, int D, int rot, float theta, float eps, float* __restrict__ q,
-                                                  float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
-                                                  __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
+                                                  float* __restrict__ gate, gpu::bf16* __restrict__ kcache,
+                                                  gpu::bf16* __restrict__ vcache, size_t hs, size_t ps,
                                                   const uint64_t* __restrict__ pages,
                                                   int cpos,  // cpos: the cache slot (pos except in a tree)
                                                   int slot) {  // q heads, then k heads, then v heads (the launch's blockIdx.y)
@@ -100,6 +100,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
   }
 }
 
+#if !defined(RAGON_BACKEND_HIP)  // W1 (tensor-core attention, FP8 KV, TMA): CUDA only until the W1 port (BACKEND §7)
 // ---- Rows-path attention on tensor cores (decode and verify, M <= 32). ----
 // One block takes all query rows of one KV head (row r = position m * 6 + head g, up to 96 rows: 16
 // positions) and one fixed range of attention_chunk() keys, in tiles staged in shared memory.
@@ -110,7 +111,7 @@ __device__ __forceinline__ void attn_prepare_body(const float* __restrict__ q_ga
 constexpr int kMmaD = 256;
 constexpr int kMmaKS = kMmaD + 8;  // padded row stride (bf16) of the K and V tiles: conflict-free fragments
 // One K tile and one V tile per stage; `ns` stages in a ring.
-constexpr size_t mma_stage(int tk) { return size_t(2) * tk * kMmaKS * sizeof(__nv_bfloat16); }
+constexpr size_t mma_stage(int tk) { return size_t(2) * tk * kMmaKS * sizeof(gpu::bf16); }
 constexpr size_t mma_smem(int tk, int ns) { return ns * mma_stage(tk); }
 // --kv-fp8 (M2): the Q8 instantiations' ring plus one tile's FP8 codes (K then V, tk keys of kMmaD bytes each).
 constexpr size_t mma_raw8(int tk) { return size_t(2) * tk * kMmaD; }
@@ -126,7 +127,7 @@ __device__ __forceinline__ void mma_bf16_16816(float (&c)[4], uint32_t a0, uint3
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
-  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  gpu::bf16x2 v = __floats2bfloat162_rn(lo, hi);
   return *reinterpret_cast<uint32_t*>(&v);
 }
 
@@ -143,8 +144,8 @@ __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src,
 // costs no shared memory and no registers. Measured at 24K, 16 rows: 0.557 -> 0.492 ms per layer at pf 2;
 // 3 and 4 no better. It moves data only: the arithmetic, and so every output bit, is unchanged.
 template <int TK>
-__device__ __forceinline__ void attn_prefetch_tile(const __nv_bfloat16* __restrict__ kcache,
-                                                   const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+__device__ __forceinline__ void attn_prefetch_tile(const gpu::bf16* __restrict__ kcache,
+                                                   const gpu::bf16* __restrict__ vcache, int k0, int khi, int kvh,
                                                    size_t hs, size_t ps, const uint64_t* __restrict__ pages) {
   const int n = min(TK, khi - k0);
   if (n <= 0) return;
@@ -160,12 +161,12 @@ __device__ __forceinline__ void attn_prefetch_tile(const __nv_bfloat16* __restri
 // page is looked up once and every key is base + j * ps: the same addresses as kv_off per key, without a dependent
 // read of the page table before each copy.
 template <int TK>
-__device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
-                                               const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+__device__ __forceinline__ void attn_load_tile(gpu::bf16* stage, const gpu::bf16* __restrict__ kcache,
+                                               const gpu::bf16* __restrict__ vcache, int k0, int khi, int kvh,
                                                size_t hs, size_t ps, const uint64_t* __restrict__ pages) {
   constexpr int D = kMmaD, KS = kMmaKS;
-  __nv_bfloat16* ks = stage;
-  __nv_bfloat16* vs = stage + TK * KS;
+  gpu::bf16* ks = stage;
+  gpu::bf16* vs = stage + TK * KS;
   const size_t base = kv_off(pages, kvh, k0 < khi ? k0 : 0, hs, ps);
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
@@ -181,13 +182,13 @@ __device__ __forceinline__ void attn_load_tile(__nv_bfloat16* stage, const __nv_
 // key sits at slot pos0 + path[j]), at the positions a chain holding that path would hold them in; the keys below
 // pos0 are the context's, as in attn_load_tile.
 template <int TK>
-__device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
-                                                    const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+__device__ __forceinline__ void attn_load_tile_tree(gpu::bf16* stage, const gpu::bf16* __restrict__ kcache,
+                                                    const gpu::bf16* __restrict__ vcache, int k0, int khi, int kvh,
                                                     size_t hs, size_t ps, const uint64_t* __restrict__ pages, int pos0,
                                                     const int* __restrict__ path) {
   constexpr int D = kMmaD, KS = kMmaKS;
-  __nv_bfloat16* ks = stage;
-  __nv_bfloat16* vs = stage + TK * KS;
+  gpu::bf16* ks = stage;
+  gpu::bf16* vs = stage + TK * KS;
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
     const bool valid = key < khi;
@@ -210,25 +211,25 @@ __device__ __forceinline__ void attn_load_tile_tree(__nv_bfloat16* stage, const 
 __device__ __forceinline__ __nv_fp8x2_storage_t kv_q8_encode2(float2 x, float inv) {
   return __nv_cvt_float2_to_fp8x2(make_float2(__fmul_rn(x.x, inv), __fmul_rn(x.y, inv)), __NV_SATFINITE, __NV_E4M3);
 }
-__device__ __forceinline__ __nv_bfloat162 kv_q8_decode2(__nv_fp8x2_storage_t e, float s) {
+__device__ __forceinline__ gpu::bf16x2 kv_q8_decode2(__nv_fp8x2_storage_t e, float s) {
   const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(e, __NV_E4M3);
   const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
   return __floats2bfloat162_rn(__fmul_rn(f.x, s), __fmul_rn(f.y, s));
 }
-__device__ __forceinline__ __nv_bfloat162 kv_q8_round2(__nv_bfloat162 v, float s, float inv) {
+__device__ __forceinline__ gpu::bf16x2 kv_q8_round2(gpu::bf16x2 v, float s, float inv) {
   return kv_q8_decode2(kv_q8_encode2(__bfloat1622float2(v), inv), s);
 }
 
 // A staged tile (K rows, then V rows) replaced by R of its values, in place; every thread of the block takes part.
 template <int TK>
-__device__ __forceinline__ void attn_round_stage(__nv_bfloat16* stage, const KvQ8& q8) {
+__device__ __forceinline__ void attn_round_stage(gpu::bf16* stage, const KvQ8& q8) {
   constexpr int D = kMmaD, KS = kMmaKS;
   for (int i = threadIdx.x; i < 2 * TK * (D / 8); i += blockDim.x) {
     const int r = i / (D / 8), c = i % (D / 8);
     const float s = r < TK ? q8.ks : q8.vs, inv = r < TK ? q8.kinv : q8.vinv;
     uint4* p = reinterpret_cast<uint4*>(stage + r * KS + 8 * c);
     uint4 w = *p;
-    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&w);
+    gpu::bf16x2* h = reinterpret_cast<gpu::bf16x2*>(&w);
 #pragma unroll
     for (int j = 0; j < 4; ++j) h[j] = kv_q8_round2(h[j], s, inv);
     *p = w;
@@ -253,7 +254,7 @@ __device__ __forceinline__ void attn_load_tile_f8(uint8_t* raw, const KvQ8& q8, 
 
 // M2: the staged codes decoded into a stage (K rows, then V rows): kv_q8_decode2, the values attn_round_stage leaves.
 template <int TK>
-__device__ __forceinline__ void attn_decode_stage(__nv_bfloat16* stage, const uint8_t* raw, const KvQ8& q8) {
+__device__ __forceinline__ void attn_decode_stage(gpu::bf16* stage, const uint8_t* raw, const KvQ8& q8) {
   constexpr int D = kMmaD, KS = kMmaKS;
   for (int i = threadIdx.x; i < 2 * TK * (D / 16); i += blockDim.x) {
     const int r = i / (D / 16), c = i % (D / 16);
@@ -261,7 +262,7 @@ __device__ __forceinline__ void attn_decode_stage(__nv_bfloat16* stage, const ui
     const uint4 w = *reinterpret_cast<const uint4*>(raw + r * D + 16 * c);
     const __nv_fp8x2_storage_t* e = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w);
     uint4 o[2];
-    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(o);
+    gpu::bf16x2* h = reinterpret_cast<gpu::bf16x2*>(o);
 #pragma unroll
     for (int j = 0; j < 8; ++j) h[j] = kv_q8_decode2(e[j], s);
     uint4* dst = reinterpret_cast<uint4*>(stage + r * KS + 16 * c);
@@ -302,8 +303,8 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
 // their scores are masked to -inf and their probabilities are exactly 0, so they add nothing, as the zero
 // rows of attn_load_tile add nothing.
 template <int TK>
-__device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_bfloat16* __restrict__ kcache,
-                                               const __nv_bfloat16* __restrict__ vcache, int k0, int khi, int kvh,
+__device__ __forceinline__ void attn_bulk_tile(gpu::bf16* stage, const gpu::bf16* __restrict__ kcache,
+                                               const gpu::bf16* __restrict__ vcache, int k0, int khi, int kvh,
                                                size_t hs, size_t ps, const uint64_t* __restrict__ pages,
                                                uint64_t* bar) {
   static_assert(TK <= 32, "one key per lane");
@@ -339,8 +340,8 @@ __device__ __forceinline__ void attn_bulk_tile(__nv_bfloat16* stage, const __nv_
 // sequences that share those pages; 2 runs only keys from kcut on, starting a range that holds kcut from the partial
 // state the first phase left in `scratch`. Same tile grid, same order of keys, so the same floats as CASC 0.
 template <int ROWS, int TK, int NS, bool BULK, bool CQ = false, int CASC = 0, bool Q8 = false>
-__device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
-                                                   const __nv_bfloat16* __restrict__ vcache, int pos0, int M, int Hq,
+__device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, const gpu::bf16* __restrict__ kcache,
+                                                   const gpu::bf16* __restrict__ vcache, int pos0, int M, int Hq,
                                                    int Hkv, int splits, int chunk, float* __restrict__ scratch, size_t hs,
                                                    size_t ps, int pf, int bx, int kvh, int split,
                                                    const TreeDesc* __restrict__ td = nullptr,
@@ -350,7 +351,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   static_assert(kKvPageTokens % TK == 0, "a tile inside one KV page (P4)");
   static_assert(!Q8 || (TK == 32 && !BULK && NS == 2), "Q8: one 32-key unit per tile, cp.async tiles, one tile in flight");
   extern __shared__ __align__(16) unsigned char smem[];
-  auto stage = [&](int i) { return reinterpret_cast<__nv_bfloat16*>(smem + (i % NS) * mma_stage(TK)); };
+  auto stage = [&](int i) { return reinterpret_cast<gpu::bf16*>(smem + (i % NS) * mma_stage(TK)); };
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
   const int R = M * G, r0 = bx * ROWS, nrows = min(ROWS, R - r0);
   const bool active = warp * 16 < nrows;
@@ -452,8 +453,8 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   }
   // One tile's scores, online softmax and P V for this warp's rows; ca / cb: rows a / b take the tile (a chain's
   // rows always do).
-  auto tile_compute = [&](const __nv_bfloat16* ks, int k0, bool ca, bool cb) {
-    const __nv_bfloat16* vs = ks + TK * KS;
+  auto tile_compute = [&](const gpu::bf16* ks, int k0, bool ca, bool cb) {
+    const gpu::bf16* vs = ks + TK * KS;
     {
       // S = Q K^T for 16 rows x 32 keys: 4 key tiles of 8.
       float sc[TK / 8][4];
@@ -463,7 +464,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       for (int s = 0; s < D / 16; ++s) {
 #pragma unroll
         for (int n = 0; n < TK / 8; ++n) {
-          const __nv_bfloat16* kr = ks + (n * 8 + g) * KS + 16 * s;
+          const gpu::bf16* kr = ks + (n * 8 + g) * KS + 16 * s;
           mma_bf16_16816(sc[n], qf[s][0], qf[s][1], qf[s][2], qf[s][3],
                          *reinterpret_cast<const uint32_t*>(kr + 2 * t),
                          *reinterpret_cast<const uint32_t*>(kr + 8 + 2 * t));
@@ -481,10 +482,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
           ta = fmaxf(ta, sc[n][e]);
           tb = fmaxf(tb, sc[n][2 + e]);
         }
-      ta = fmaxf(ta, __shfl_xor_sync(0xffffffffu, ta, 1));
-      ta = fmaxf(ta, __shfl_xor_sync(0xffffffffu, ta, 2));
-      tb = fmaxf(tb, __shfl_xor_sync(0xffffffffu, tb, 1));
-      tb = fmaxf(tb, __shfl_xor_sync(0xffffffffu, tb, 2));
+      ta = fmaxf(ta, __shfl_xor_sync(gpu::kWarpMask, ta, 1));
+      ta = fmaxf(ta, __shfl_xor_sync(gpu::kWarpMask, ta, 2));
+      tb = fmaxf(tb, __shfl_xor_sync(gpu::kWarpMask, tb, 1));
+      tb = fmaxf(tb, __shfl_xor_sync(gpu::kWarpMask, tb, 2));
       const float na = fmaxf(ma, ta), nb = fmaxf(mb, tb);
       const float alpha_a = na == -INFINITY ? 1.f : __expf(ma - na);
       const float alpha_b = nb == -INFINITY ? 1.f : __expf(mb - nb);
@@ -498,10 +499,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
           sa += sc[n][e];
           sb += sc[n][2 + e];
         }
-      sa += __shfl_xor_sync(0xffffffffu, sa, 1);
-      sa += __shfl_xor_sync(0xffffffffu, sa, 2);
-      sb += __shfl_xor_sync(0xffffffffu, sb, 1);
-      sb += __shfl_xor_sync(0xffffffffu, sb, 2);
+      sa += __shfl_xor_sync(gpu::kWarpMask, sa, 1);
+      sa += __shfl_xor_sync(gpu::kWarpMask, sa, 2);
+      sb += __shfl_xor_sync(gpu::kWarpMask, sb, 1);
+      sb += __shfl_xor_sync(gpu::kWarpMask, sb, 2);
       // A tree's tail tile: a row of another variant keeps its state (alpha 1 and P 0 leave it bit for bit).
       if (ca) {
         la = la * alpha_a + sa;
@@ -585,7 +586,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // Q8: a tile in the rows' two domains. Rows whose unit is not past the tile's (P <= k0) take it as stored; then it is
   // rounded in place (R) and the rows past it take it. A row that does not take a pass keeps its state bit for bit, so
   // each row's result is a single pass in its own domain. Block-uniform branches (every thread meets the barriers).
-  auto tile_q8 = [&](__nv_bfloat16* st, int k0, bool ca, bool cb) {
+  auto tile_q8 = [&](gpu::bf16* st, int k0, bool ca, bool cb) {
     const bool raw = k0 >= minP, rnd = k0 < maxP;
     if (raw && active) tile_compute(st, k0, ca && Pa <= k0, cb && Pb <= k0);
     if (rnd) {
@@ -637,7 +638,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         tile_q8(stage(it), k0, true, true);
       }
     } else {
-      const __nv_bfloat16* ks = stage(it);
+      const gpu::bf16* ks = stage(it);
       if (active) tile_compute(ks, k0, true, true);
     }
   }
@@ -701,6 +702,7 @@ __device__ __forceinline__ float attention_combine_body(const float* __restrict_
   }
   return A / L;
 }
+#endif  // !RAGON_BACKEND_HIP
 
 // The gated delta rule's key and value head sizes (kernels.cu's recurrences).
 constexpr int kGdnDk = 128, kGdnDv = 128;
@@ -738,8 +740,8 @@ __device__ __forceinline__ void gdn_recurrent_tree_body(const float* __restrict_
     float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-      qn += __shfl_xor_sync(0xffffffffu, qn, o);
-      kn += __shfl_xor_sync(0xffffffffu, kn, o);
+      qn += __shfl_xor_sync(gpu::kWarpMask, qn, o);
+      kn += __shfl_xor_sync(gpu::kWarpMask, kn, o);
     }
     const float qr = rsqrtf(qn + 1e-6f) * scale, kr = rsqrtf(kn + 1e-6f);
     __syncwarp();
@@ -773,8 +775,8 @@ __device__ __forceinline__ void gdn_recurrent_tree_body(const float* __restrict_
       for (int k = 0; k < kGdnDk; ++k) {
         // The same product as the first loop's, recomputed (an opaque multiply: kept products would double the live
         // registers and spill the state).
-        float sd;
-        asm volatile("mul.rn.f32 %0, %1, %2;" : "=f"(sd) : "f"(S[k]), "f"(decay));
+        const float sd = gpu::mul_rn(S[k], decay);
+
         const float sk = fmaf(d, ks[k], sd);
         o = fmaf(sk, qs[k], o);
       }
