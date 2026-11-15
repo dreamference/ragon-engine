@@ -83,7 +83,6 @@ T* dev_zero(size_t n) {
   return d;
 }
 gpu::bf16* as_bf16(bits16* p) { return reinterpret_cast<gpu::bf16*>(p); }
-const gpu::bf16* as_bf16(const bits16* p) { return reinterpret_cast<const gpu::bf16*>(p); }
 gpu::bf16* dev_bf16(const std::vector<bits16>& h) { return as_bf16(dev(h)); }
 
 // ---- checks -----------------------------------------------------------------------------------------------------
@@ -124,9 +123,6 @@ double err_of(const std::vector<float>& got, const std::vector<double>& ref) {
     if (!(d <= e)) e = d;  // NaN sticks
   }
   return e;
-}
-double err_of(const std::vector<float>& got, const std::vector<float>& ref) {
-  return err_of(got, std::vector<double>(ref.begin(), ref.end()));
 }
 template <typename T>
 double mismatches(const std::vector<T>& got, const std::vector<T>& ref) {
@@ -236,6 +232,27 @@ void test_conversions(Rng& r) {
     for (size_t i = 0; i < w.size(); ++i) ref[i] = bf16_bits(e4m3(w[i]) * scale);
     const auto got = download(out, w.size());
     check("dequant_fp8", got, mismatches(got, ref), 0);
+  }
+  {
+    // NVFP4: two E2M1 codes per byte (low nibble first), one E4M3 scale per 16 values, times the tensor's scale2.
+    static const float kFp4[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+    const int N = 8, Kd = 512;
+    std::vector<uint8_t> w(size_t(N) * Kd / 2), ws(size_t(N) * Kd / 16);
+    for (auto& b : w) b = static_cast<uint8_t>(r.below(256));
+    for (auto& b : ws) b = static_cast<uint8_t>(r.below(0x7f));  // positive, finite
+    const float scale2 = 0.00213f;
+    auto* out = dev_zero<bits16>(size_t(N) * Kd);
+    K::dequant_nvfp4(dev(w), dev(ws), scale2, as_bf16(out), N, Kd, nullptr);
+    std::vector<bits16> ref(size_t(N) * Kd);
+    for (size_t i = 0; i < w.size(); ++i) {
+      const size_t row = i / (Kd / 2), col = (i % (Kd / 2)) * 2;
+      const float sc = e4m3(ws[row * (Kd / 16) + col / 16]) * scale2;
+      const float lo = kFp4[w[i] & 0xf] * sc, hi = kFp4[w[i] >> 4] * sc;
+      ref[row * Kd + col] = bf16_bits(lo);
+      ref[row * Kd + col + 1] = bf16_bits(hi);
+    }
+    const auto got = download(out, ref.size());
+    check("dequant_nvfp4", got, mismatches(got, ref), 0);
   }
 }
 
@@ -986,6 +1003,37 @@ void test_drafter(Rng& r) {
       for (int h = 0; h < H; ++h) dst[size_t(m) * dst_stride + h] = bf16_bits(src[size_t(m) * H + h]);
     const auto got = download(dd, dst.size());
     check("copy_rows_bf16", got, mismatches(got, dst), 0);
+  }
+  for (const auto& [K_, name] : {std::pair{4096, "bf16_to_half_rows_4096"}, std::pair{1000, "bf16_to_half_rows_1000"}}) {
+    // Each row scaled by a power of two so its largest magnitude lands in [2^14, 2^15), then rounded to FP16; xinv
+    // undoes the scale exactly. Row 2 is zero (scale 2^15).
+    const int M = 3, Kd = K_;
+    auto xf = r.vec(size_t(M) * Kd, 3.f);
+    for (int k = 0; k < Kd; ++k) xf[size_t(2) * Kd + k] = 0.f;
+    const auto x = to_bits(xf);
+    auto* out = dev_zero<bits16>(x.size());
+    auto* xinv = dev_zero<float>(M);
+    K::bf16_to_half_rows(dev_bf16(x), M, Kd, reinterpret_cast<gpu::half*>(out), xinv, nullptr);
+    const auto h = download(out, x.size());
+    const auto xi = download(xinv, M);
+    std::vector<float> back(x.size()), xi_ref(M);
+    std::vector<double> ref(x.size());
+    for (int m = 0; m < M; ++m) {
+      float mx = 0.f;
+      for (int k = 0; k < Kd; ++k) mx = std::max(mx, std::fabs(bf16_float(x[size_t(m) * Kd + k])));
+      int e = 0;
+      if (mx > 0.f) std::frexp(mx, &e);
+      xi_ref[m] = std::ldexp(1.f, e - 15);
+      for (int k = 0; k < Kd; ++k) {
+        const size_t i = size_t(m) * Kd + k;
+        const uint16_t b = h[i];  // FP16 decode
+        const int ex = (b >> 10) & 0x1f, man = b & 0x3ff;
+        const double mag = ex ? std::ldexp(1.0 + man / 1024.0, ex - 15) : std::ldexp(man / 1024.0, -14);
+        back[i] = static_cast<float>(((b & 0x8000) ? -mag : mag) * xi[m]);
+        ref[i] = bf16_float(x[i]);
+      }
+    }
+    check(name, h, err_of(back, ref) + mismatches(xi, xi_ref), 5e-4);  // FP16's half ulp is 2^-11 relative
   }
 }
 
