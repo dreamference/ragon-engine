@@ -1,4 +1,4 @@
-// The element type of the prefill path's intermediate tensors (CUDA source files only).
+// The element type of the prefill path's intermediate tensors (GPU source files only).
 //
 // The exact path keeps every activation between kernels in FP32. Behind --prefill-bf16 (off by default;
 // specs/DREAMFERENCE_RAGON_ENGINE_MILESTONES.md §14, the exactness policy) the prefill's DeltaNet intermediates
@@ -10,8 +10,8 @@
 
 #include <cstdint>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "backend/device.hpp"  // gpu::bf16, gpu::bf16x2 and floats_to_bf16x2 (BACKEND §3)
+//
 
 namespace ragon::kernels::elem {
 
@@ -20,7 +20,7 @@ __device__ __forceinline__ float load(const T* p) {
   return *p;
 }
 template <>
-__device__ __forceinline__ float load<__nv_bfloat16>(const __nv_bfloat16* p) {
+__device__ __forceinline__ float load<gpu::bf16>(const gpu::bf16* p) {
   return __bfloat162float(*p);
 }
 
@@ -29,7 +29,7 @@ __device__ __forceinline__ void store(T* p, float v) {
   *p = v;
 }
 template <>
-__device__ __forceinline__ void store<__nv_bfloat16>(__nv_bfloat16* p, float v) {
+__device__ __forceinline__ void store<gpu::bf16>(gpu::bf16* p, float v) {
   *p = __float2bfloat16(v);
 }
 
@@ -39,10 +39,10 @@ __device__ __forceinline__ float4 load4(const T* base, size_t i) {
   return reinterpret_cast<const float4*>(base)[i];
 }
 template <>
-__device__ __forceinline__ float4 load4<__nv_bfloat16>(const __nv_bfloat16* base, size_t i) {
+__device__ __forceinline__ float4 load4<gpu::bf16>(const gpu::bf16* base, size_t i) {
   const uint2 u = reinterpret_cast<const uint2*>(base)[i];
-  const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
-  const float2 hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+  const float2 lo = __bfloat1622float2(*reinterpret_cast<const gpu::bf16x2*>(&u.x));
+  const float2 hi = __bfloat1622float2(*reinterpret_cast<const gpu::bf16x2*>(&u.y));
   return make_float4(lo.x, lo.y, hi.x, hi.y);
 }
 
@@ -51,8 +51,8 @@ __device__ __forceinline__ void store4(T* base, size_t i, float4 v) {
   reinterpret_cast<float4*>(base)[i] = v;
 }
 template <>
-__device__ __forceinline__ void store4<__nv_bfloat16>(__nv_bfloat16* base, size_t i, float4 v) {
-  const __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+__device__ __forceinline__ void store4<gpu::bf16>(gpu::bf16* base, size_t i, float4 v) {
+  const gpu::bf16x2 lo = gpu::floats_to_bf16x2(v.x, v.y), hi = gpu::floats_to_bf16x2(v.z, v.w);
   uint2 u;
   u.x = *reinterpret_cast<const uint32_t*>(&lo);
   u.y = *reinterpret_cast<const uint32_t*>(&hi);
@@ -65,8 +65,8 @@ __device__ __forceinline__ void store2(T* p, float a, float b) {
   *reinterpret_cast<float2*>(p) = make_float2(a, b);
 }
 template <>
-__device__ __forceinline__ void store2<__nv_bfloat16>(__nv_bfloat16* p, float a, float b) {
-  *reinterpret_cast<__nv_bfloat162*>(p) = __floats2bfloat162_rn(a, b);
+__device__ __forceinline__ void store2<gpu::bf16>(gpu::bf16* p, float a, float b) {
+  *reinterpret_cast<gpu::bf16x2*>(p) = gpu::floats_to_bf16x2(a, b);
 }
 
 // Two consecutive values at p as one packed BF16 pair (an MMA A-fragment register): FP32 values are rounded
@@ -74,11 +74,11 @@ __device__ __forceinline__ void store2<__nv_bfloat16>(__nv_bfloat16* p, float a,
 template <typename T>
 __device__ __forceinline__ uint32_t pack_bf16x2(const T* p) {
   const float2 v = *reinterpret_cast<const float2*>(p);
-  const __nv_bfloat162 h = __floats2bfloat162_rn(v.x, v.y);
+  const gpu::bf16x2 h = gpu::floats_to_bf16x2(v.x, v.y);
   return *reinterpret_cast<const uint32_t*>(&h);
 }
 template <>
-__device__ __forceinline__ uint32_t pack_bf16x2<__nv_bfloat16>(const __nv_bfloat16* p) {
+__device__ __forceinline__ uint32_t pack_bf16x2<gpu::bf16>(const gpu::bf16* p) {
   return *reinterpret_cast<const uint32_t*>(p);
 }
 
