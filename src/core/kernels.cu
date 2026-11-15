@@ -2,8 +2,8 @@
 #include "core/launch.cuh"
 #include "core/attention_body.cuh"
 
-#include <cuda_fp8.h>
-#include <cuda_fp16.h>
+#include "backend/device.hpp"  // the FP8/FP16 helpers and the kernels' runtime calls (BACKEND §3.1)
+// (kept as two lines so the CUDA object's line table stays put)
 
 #include <algorithm>
 #include <cmath>
@@ -17,23 +17,23 @@
 namespace ragon::kernels {
 namespace {
 
-void check(cudaError_t e, const char* what) {
-  if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const char* what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(std::string(what) + ": " + gpu::error_string(e));
 }
 
-#define RAGON_LAUNCH_CHECK(name) check(cudaGetLastError(), name)
+#define RAGON_LAUNCH_CHECK(name) check(gpu::last_error(), name)
 
 // warp_sum and block_sum: core/attention_body.cuh.
 
 __device__ __forceinline__ float fp8_to_float(uint8_t b) {
-  __nv_fp8_e4m3 v;
-  v.__x = b;
-  return static_cast<float>(v);
+  return gpu::e4m3_to_float(b);
+
+
 }
 
 __device__ __forceinline__ float2 fp8x2_to_float2(uint16_t pair) {
-  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(pair), __NV_E4M3);
-  return __half22float2(*reinterpret_cast<__half2*>(&h));
+  return gpu::e4m3x2_to_float2(pair);
+
 }
 
 __device__ __forceinline__ float silu(float x) { return x / (1.f + __expf(-x)); }
@@ -164,7 +164,7 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
     }
 }
 
-__global__ void gemv_bf16_kernel(const float* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w,
+__global__ void gemv_bf16_kernel(const float* __restrict__ x, int M, const gpu::bf16* __restrict__ w,
                                  float* __restrict__ y, int N, int K) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int n = blockIdx.x * kGemvWarps + warp;
@@ -187,9 +187,9 @@ __device__ __forceinline__ void load8(const float* p, float (&v)[8]) {
   const float4 a = *reinterpret_cast<const float4*>(p), b = *reinterpret_cast<const float4*>(p + 4);
   v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
 }
-__device__ __forceinline__ void load8(const __nv_bfloat16* p, float (&v)[8]) {
+__device__ __forceinline__ void load8(const gpu::bf16* p, float (&v)[8]) {
   const uint4 raw = *reinterpret_cast<const uint4*>(p);
-  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+  const gpu::bf16x2* h = reinterpret_cast<const gpu::bf16x2*>(&raw);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     const float2 f = __bfloat1622float2(h[i]);
@@ -200,26 +200,26 @@ __device__ __forceinline__ void load8(const __nv_bfloat16* p, float (&v)[8]) {
 
 template <typename XT>  // the input: FP32 activations, or BF16 (the drafter's target features)
 __global__ void __launch_bounds__(kBf16RowsThreads)
-    bf16_rows_kernel(const XT* __restrict__ x, int M, const __nv_bfloat16* __restrict__ w0, float* __restrict__ y0,
-                     const __nv_bfloat16* __restrict__ w1, float* __restrict__ y1, int N, int K) {
+    bf16_rows_kernel(const XT* __restrict__ x, int M, const gpu::bf16* __restrict__ w0, float* __restrict__ y0,
+                     const gpu::bf16* __restrict__ w1, float* __restrict__ y1, int N, int K) {
   constexpr int MT = 32;
   __shared__ float red[kBf16RowsThreads / 32][MT];
   // Blocks [0, N) take the first matrix, [N, 2N) the second (when given).
   const bool second = static_cast<int>(blockIdx.x) >= N;
-  const __nv_bfloat16* __restrict__ w = second ? w1 : w0;
+  const gpu::bf16* __restrict__ w = second ? w1 : w0;
   float* __restrict__ y = second ? y1 : y0;
   const int n = blockIdx.x - (second ? N : 0), t = threadIdx.x, lane = t & 31, warp = t >> 5;
   float acc[MT];
 #pragma unroll
   for (int m = 0; m < MT; ++m) acc[m] = 0.f;
-  const __nv_bfloat16* wr = w + static_cast<size_t>(n) * K;
+  const gpu::bf16* wr = w + static_cast<size_t>(n) * K;
   // PDL prologue (launch.cuh): the weights never change, so this thread's first 16 bytes of them are
   // requested before waiting for the kernel that writes x.
-  if (t * 8 < K) asm volatile("prefetch.global.L2 [%0];" ::"l"(wr + t * 8));
+  if (t * 8 < K) gpu::prefetch_l2(wr + t * 8);
   pdl_begin();
   for (int k0 = t * 8; k0 < K; k0 += kBf16RowsThreads * 8) {
     const uint4 raw = *reinterpret_cast<const uint4*>(wr + k0);
-    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    const gpu::bf16x2* w2 = reinterpret_cast<const gpu::bf16x2*>(&raw);
     float wf[8];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -254,7 +254,7 @@ __global__ void __launch_bounds__(kBf16RowsThreads)
 }
 
 __global__ void dequant_nvfp4_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws,
-                                     float scale2, __nv_bfloat16* __restrict__ out, size_t total_bytes,
+                                     float scale2, gpu::bf16* __restrict__ out, size_t total_bytes,
                                      int K) {
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < total_bytes;
        i += static_cast<size_t>(gridDim.x) * blockDim.x) {
@@ -266,28 +266,28 @@ __global__ void dequant_nvfp4_kernel(const uint8_t* __restrict__ w, const uint8_
   }
 }
 
-__global__ void dequant_fp8_kernel(const uint8_t* __restrict__ w, float wscale, __nv_bfloat16* __restrict__ out,
+__global__ void dequant_fp8_kernel(const uint8_t* __restrict__ w, float wscale, gpu::bf16* __restrict__ out,
                                    size_t total) {
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < total;
        i += static_cast<size_t>(gridDim.x) * blockDim.x)
     out[i] = __float2bfloat16(fp8_to_float(w[i]) * wscale);
 }
 
-__global__ void to_bf16_kernel(const float* __restrict__ x, __nv_bfloat16* __restrict__ out, int n) {
+__global__ void to_bf16_kernel(const float* __restrict__ x, gpu::bf16* __restrict__ out, int n) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     out[i] = __float2bfloat16(x[i]);
 }
 
-__global__ void embed_kernel(const __nv_bfloat16* __restrict__ table, const int* __restrict__ ids, int H,
+__global__ void embed_kernel(const gpu::bf16* __restrict__ table, const int* __restrict__ ids, int H,
                              float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
   const int m = blockIdx.x;
-  const __nv_bfloat16* row = table + static_cast<size_t>(ids[m]) * H;
+  const gpu::bf16* row = table + static_cast<size_t>(ids[m]) * H;
   for (int h = threadIdx.x; h < H; h += blockDim.x) out[static_cast<size_t>(m) * H + h] = __bfloat162float(row[h]);
 }
 
 // Up to 1024 threads: the bound keeps a Debug (-G) build within the register file at that size.
-__global__ void __launch_bounds__(1024) rmsnorm_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+__global__ void __launch_bounds__(1024) rmsnorm_kernel(const float* __restrict__ x, const gpu::bf16* __restrict__ w,
                                float* __restrict__ out, int H, float eps, bool gemma) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
@@ -318,7 +318,7 @@ __global__ void sigmoid_mul_kernel(float* x, const float* gate, int n) {
     x[i] *= 1.f / (1.f + __expf(-gate[i]));
 }
 
-__global__ void gdn_conv_kernel(float* mixed, float* state, const __nv_bfloat16* __restrict__ w, int M, int C) {
+__global__ void gdn_conv_kernel(float* mixed, float* state, const gpu::bf16* __restrict__ w, int M, int C) {
   pdl_begin();  // first statement: see launch.cuh
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
@@ -341,7 +341,7 @@ __global__ void gdn_conv_kernel(float* mixed, float* state, const __nv_bfloat16*
 // The verify's conv over several sequences (M4 stage 4): sequence blockIdx.y's rows [row0, row0 + rows) of mixed,
 // starting from its own window, which is read and left unwritten (a verify keeps no state). Each output is the
 // same arithmetic as gdn_conv_kernel's over that sequence's rows alone.
-__global__ void gdn_conv_seqs_kernel(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* __restrict__ w,
+__global__ void gdn_conv_seqs_kernel(float* mixed, SeqPtrs<const float> state, const gpu::bf16* __restrict__ w,
                                      SeqBatch b, int C) {
   pdl_begin();  // first statement: see launch.cuh
   const int c = blockIdx.x * blockDim.x + threadIdx.x, sq = blockIdx.y;
@@ -364,7 +364,7 @@ __global__ void gdn_conv_seqs_kernel(float* mixed, SeqPtrs<const float> state, c
 // (rows of its variant's path), or the window `state` before depth 0; read from pre, written to post, the window left
 // unwritten. The same arithmetic as gdn_conv_kernel's for the row's path as a chain.
 __global__ void gdn_conv_tree_kernel(const float* __restrict__ pre, float* __restrict__ post, const float* state,
-                                     const __nv_bfloat16* __restrict__ w, int M, int C, const TreeDesc* __restrict__ td) {
+                                     const gpu::bf16* __restrict__ w, int M, int C, const TreeDesc* __restrict__ td) {
   pdl_begin();  // first statement: see launch.cuh
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
@@ -383,8 +383,8 @@ __global__ void gdn_conv_tree_kernel(const float* __restrict__ pre, float* __res
   }
 }
 
-__global__ void gdn_gating_kernel(const float* a, const float* b, const __nv_bfloat16* A_log,
-                                  const __nv_bfloat16* dt_bias, float* g, float* beta, int n, int HV) {
+__global__ void gdn_gating_kernel(const float* a, const float* b, const gpu::bf16* A_log,
+                                  const gpu::bf16* dt_bias, float* g, float* beta, int n, int HV) {
   pdl_begin();  // first statement: see launch.cuh
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -414,8 +414,8 @@ __device__ __forceinline__ void gdn_recurrent_rows(float (&S)[kGdnDk], float* qs
     float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-      qn += __shfl_xor_sync(0xffffffffu, qn, o);
-      kn += __shfl_xor_sync(0xffffffffu, kn, o);
+      qn += __shfl_xor_sync(gpu::kWarpMask, qn, o);
+      kn += __shfl_xor_sync(gpu::kWarpMask, kn, o);
     }
     const float qr = rsqrtf(qn + 1e-6f) * scale, kr = rsqrtf(kn + 1e-6f);
     __syncwarp();
@@ -529,8 +529,8 @@ __global__ void kv_table_set_kernel(uint64_t* __restrict__ table, KvTableEntries
 
 // kv_pages_copy: block (i, lkv) moves position from + i of layer-and-K/V lkv, every KV head, 16 bytes a thread.
 // hs: the pool's head stride (set_kv_layout), so a layer-and-K/V block is Hkv * hs elements in either page layout.
-__global__ void kv_pages_copy_kernel(__nv_bfloat16* __restrict__ pool, const uint64_t* __restrict__ pages, int Hkv, int D,
-                                     size_t hs, __nv_bfloat16* __restrict__ buf, int buf_start, int buf_len, int from,
+__global__ void kv_pages_copy_kernel(gpu::bf16* __restrict__ pool, const uint64_t* __restrict__ pages, int Hkv, int D,
+                                     size_t hs, gpu::bf16* __restrict__ buf, int buf_start, int buf_len, int from,
                                      bool to_buf) {
   pdl_begin();  // first statement: see launch.cuh
   const int p = from + blockIdx.x, lkv = blockIdx.y, per_head = D / 8;
@@ -548,7 +548,7 @@ __global__ void kv_pages_copy_kernel(__nv_bfloat16* __restrict__ pool, const uin
 // A joint commit (Engine::step_batch): the conv above, over each sequence's rows, its window written back. The same
 // arithmetic as gdn_conv_kernel's.
 __global__ void gdn_conv_commit_seqs_kernel(float* __restrict__ mixed, SeqPtrs<float> state,
-                                            const __nv_bfloat16* __restrict__ w, SeqBatch b, int C) {
+                                            const gpu::bf16* __restrict__ w, SeqBatch b, int C) {
   pdl_begin();  // first statement: see launch.cuh
   const int c = blockIdx.x * blockDim.x + threadIdx.x, sq = blockIdx.y;
   if (c >= C) return;
@@ -629,7 +629,7 @@ __global__ void __launch_bounds__(32)
 }
 
 __global__ void gated_rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ z,
-                                     const __nv_bfloat16* __restrict__ w, float* __restrict__ out, int D,
+                                     const gpu::bf16* __restrict__ w, float* __restrict__ out, int D,
                                      float eps) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
@@ -653,11 +653,11 @@ __device__ __forceinline__ void kv_unseal_row(uint8_t* sealed, const uint64_t* p
 }
 
 __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
-                                    const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
-                                    const __nv_bfloat16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
+                                    const float* __restrict__ v, const gpu::bf16* __restrict__ q_norm,
+                                    const gpu::bf16* __restrict__ k_norm, DevPos pos0, int Hq, int Hkv, int D,
                                     int rot, float theta, float eps, float* __restrict__ q,
-                                    float* __restrict__ gate, __nv_bfloat16* __restrict__ kcache,
-                                    __nv_bfloat16* __restrict__ vcache, size_t hs, size_t ps,
+                                    float* __restrict__ gate, gpu::bf16* __restrict__ kcache,
+                                    gpu::bf16* __restrict__ vcache, size_t hs, size_t ps,
                                     const TreeDesc* __restrict__ td, const int* __restrict__ mrope,
                                     const uint64_t* __restrict__ pages, uint8_t* __restrict__ sealed,
                                     unsigned long long unit) {
@@ -682,10 +682,10 @@ __global__ void attn_prepare_kernel(const float* __restrict__ q_gate, const floa
 // Several sequences' rows in one launch (M4 stage 4): row m belongs to sequence seq_of(m), at that sequence's
 // position, into that sequence's caches.
 __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const float* __restrict__ k,
-                                         const float* __restrict__ v, const __nv_bfloat16* __restrict__ q_norm,
-                                         const __nv_bfloat16* __restrict__ k_norm, SeqBatch b, int Hq, int Hkv, int D,
+                                         const float* __restrict__ v, const gpu::bf16* __restrict__ q_norm,
+                                         const gpu::bf16* __restrict__ k_norm, SeqBatch b, int Hq, int Hkv, int D,
                                          int rot, float theta, float eps, float* __restrict__ q,
-                                         float* __restrict__ gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
+                                         float* __restrict__ gate, SeqPtrs<gpu::bf16> kc, SeqPtrs<gpu::bf16> vc,
                                          size_t hs, size_t ps, SeqPtrs<const uint64_t> pg,
                                          uint8_t* __restrict__ sealed, unsigned long long unit) {
   pdl_begin();  // first statement: see launch.cuh
@@ -696,12 +696,13 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                     ps, pg.p[sq], p, blockIdx.y);
 }
 
+#if !defined(RAGON_BACKEND_HIP)  // W1 (attention, KV seal): CUDA only until the W1 port (BACKEND §7)
 // The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh.
 
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
-    attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
-                         const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
+    attention_mma_kernel(const float* __restrict__ q, const gpu::bf16* __restrict__ kcache,
+                         const gpu::bf16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
                          int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
                          const TreeDesc* __restrict__ td, const uint64_t* __restrict__ pages, KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
@@ -718,8 +719,8 @@ struct AttnBlocks {
 };
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
-    attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
-                              SeqPtrs<const __nv_bfloat16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
+    attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc,
+                              SeqPtrs<const gpu::bf16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
                               int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
                               SeqPtrs<const uint64_t> pg, KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
@@ -742,7 +743,7 @@ struct AttnGroups {
 };
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
-    attention_shared_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+    attention_shared_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
                             SeqBatch b, AttnGroups gr, int Hq, int Hkv, int splits, int chunk,
                             float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg,
                             KvQ8 q8) {
@@ -765,7 +766,7 @@ struct AttnCuts {
 };
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
-    attention_suffix_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+    attention_suffix_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
                             SeqBatch b, AttnBlocks blocks, AttnCuts cuts, int Hq, int Hkv, int splits, int chunk,
                             float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg,
                             KvQ8 q8) {
@@ -789,6 +790,7 @@ __global__ void attention_combine_kernel(const float* __restrict__ scratch, int 
   const int mh = blockIdx.x, d = threadIdx.x;
   out[static_cast<size_t>(mh) * D + d] = attention_combine_body<false>(scratch, splits, D, mh, d);
 }
+#endif  // !RAGON_BACKEND_HIP
 
 int grid_for(size_t n, int threads) {
   return static_cast<int>(std::min<size_t>((n + threads - 1) / threads, 65535 * 4));
@@ -853,21 +855,21 @@ void set_kv_layout(size_t head_stride, size_t pos_stride) {
 // 235 GB/s NVFP4 and 263 GB/s FP8 at M = 1, against 262 GB/s for a plain read); more rows need the registers.
 template <int MT, int R>
 void launch_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, float scale2, float* y, int N,
-                  int K, cudaStream_t s) {
+                  int K, gpu::Stream s) {
   const int rows_per_block = kGemvWarps * R;
   gemv_nvfp4_kernel<MT, R><<<(N + rows_per_block - 1) / rows_per_block, kGemvWarps * 32, 0, s>>>(x, M, w, wscale,
                                                                                                scale2, y, N, K);
 }
 
 template <int MT, int R>
-void launch_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K, cudaStream_t s) {
+void launch_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K, gpu::Stream s) {
   const int rows_per_block = kGemvWarps * R;
   gemv_fp8_kernel<MT, R><<<(N + rows_per_block - 1) / rows_per_block, kGemvWarps * 32, 0, s>>>(x, M, w, wscale, y,
                                                                                              N, K);
 }
 
 void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, float scale2, float* y, int N,
-                int K, cudaStream_t s) {
+                int K, gpu::Stream s) {
   if (K % kFp4Tile != 0) throw std::runtime_error("gemv_nvfp4: K must be a multiple of 1024");
   if (M <= 1) launch_nvfp4<1, 2>(x, M, w, wscale, scale2, y, N, K, s);
   else if (M <= 2) launch_nvfp4<2, 2>(x, M, w, wscale, scale2, y, N, K, s);
@@ -877,7 +879,7 @@ void gemv_nvfp4(const float* x, int M, const uint8_t* w, const uint8_t* wscale, 
   RAGON_LAUNCH_CHECK("gemv_nvfp4");
 }
 
-void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K, cudaStream_t s) {
+void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, int N, int K, gpu::Stream s) {
   if (K % kFp8Tile != 0) throw std::runtime_error("gemv_fp8: K must be a multiple of 512");
   if (M <= 1) launch_fp8<1, 2>(x, M, w, wscale, y, N, K, s);
   else if (M <= 2) launch_fp8<2, 2>(x, M, w, wscale, y, N, K, s);
@@ -887,13 +889,13 @@ void gemv_fp8(const float* x, int M, const uint8_t* w, float wscale, float* y, i
   RAGON_LAUNCH_CHECK("gemv_fp8");
 }
 
-void gemv_bf16(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
+void gemv_bf16(const float* x, int M, const gpu::bf16* w, float* y, int N, int K, gpu::Stream s) {
   gemv_bf16_kernel<<<(N + kGemvWarps - 1) / kGemvWarps, kGemvWarps * 32, 0, s>>>(x, M, w, y, N, K);
   RAGON_LAUNCH_CHECK("gemv_bf16");
 }
 
-void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s,
-               const __nv_bfloat16* w2, float* y2) {
+void bf16_rows(const float* x, int M, const gpu::bf16* w, float* y, int N, int K, gpu::Stream s,
+               const gpu::bf16* w2, float* y2) {
   if (M < 1 || M > kMaxStreamRows || K % (kBf16RowsThreads * 8) != 0)
     throw std::runtime_error("bf16_rows: M <= 64, K % 1024 == 0");
   if (M > 32) {  // two launches, the first 32 rows and the rest: each row's arithmetic is the same whatever M is
@@ -905,7 +907,7 @@ void bf16_rows(const float* x, int M, const __nv_bfloat16* w, float* y, int N, i
                 w2, y2, N, K);
 }
 
-void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, float* y, int N, int K, cudaStream_t s) {
+void bf16_rows_bf16in(const gpu::bf16* x, int M, const gpu::bf16* w, float* y, int N, int K, gpu::Stream s) {
   if (M < 1 || M > kMaxStreamRows || K % (kBf16RowsThreads * 8) != 0)
     throw std::runtime_error("bf16_rows: M <= 64, K % 1024 == 0");
   if (M > 32) {  // as bf16_rows
@@ -913,87 +915,87 @@ void bf16_rows_bf16in(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, flo
     bf16_rows_bf16in(x + size_t(32) * K, M - 32, w, y + size_t(32) * N, N, K, s);
     return;
   }
-  launch_kernel("bf16_rows_bf16in", bf16_rows_kernel<__nv_bfloat16>, dim3(N), dim3(kBf16RowsThreads), 0, s, x, M, w,
+  launch_kernel("bf16_rows_bf16in", bf16_rows_kernel<gpu::bf16>, dim3(N), dim3(kBf16RowsThreads), 0, s, x, M, w,
                 y, nullptr, nullptr, N, K);
 }
 
-void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, __nv_bfloat16* out, int N, int K,
-                   cudaStream_t s) {
+void dequant_nvfp4(const uint8_t* w, const uint8_t* wscale, float scale2, gpu::bf16* out, int N, int K,
+                   gpu::Stream s) {
   const size_t bytes = static_cast<size_t>(N) * K / 2;
   dequant_nvfp4_kernel<<<grid_for(bytes, 256), 256, 0, s>>>(w, wscale, scale2, out, bytes, K);
   RAGON_LAUNCH_CHECK("dequant_nvfp4");
 }
 
-void dequant_fp8(const uint8_t* w, float wscale, __nv_bfloat16* out, int N, int K, cudaStream_t s) {
+void dequant_fp8(const uint8_t* w, float wscale, gpu::bf16* out, int N, int K, gpu::Stream s) {
   const size_t total = static_cast<size_t>(N) * K;
   dequant_fp8_kernel<<<grid_for(total, 256), 256, 0, s>>>(w, wscale, out, total);
   RAGON_LAUNCH_CHECK("dequant_fp8");
 }
 
-void to_bf16(const float* x, __nv_bfloat16* out, int n, cudaStream_t s) {
+void to_bf16(const float* x, gpu::bf16* out, int n, gpu::Stream s) {
   to_bf16_kernel<<<grid_for(n, 256), 256, 0, s>>>(x, out, n);
   RAGON_LAUNCH_CHECK("to_bf16");
 }
 
-void embed(const __nv_bfloat16* table, const int* ids, int M, int H, float* out, cudaStream_t s) {
+void embed(const gpu::bf16* table, const int* ids, int M, int H, float* out, gpu::Stream s) {
   launch_kernel("embed", embed_kernel, dim3(M), dim3(256), 0, s, table, ids, H, out);
 }
 
-void rmsnorm(const float* x, const __nv_bfloat16* w, float* out, int rows, int H, float eps, bool gemma,
-             cudaStream_t s) {
+void rmsnorm(const float* x, const gpu::bf16* w, float* out, int rows, int H, float eps, bool gemma,
+             gpu::Stream s) {
   launch_kernel("rmsnorm", rmsnorm_kernel, dim3(rows), dim3(H >= 1024 ? 1024 : H), 0, s, x, w, out, H, eps, gemma);
 }
 
-void add_inplace(float* h, const float* d, int n, cudaStream_t s) {
+void add_inplace(float* h, const float* d, int n, gpu::Stream s) {
   launch_kernel("add", add_kernel, dim3(grid_for(n, 256)), dim3(256), 0, s, h, d, n);
 }
 
-void silu_mul(const float* g, const float* u, float* out, int n, cudaStream_t s) {
+void silu_mul(const float* g, const float* u, float* out, int n, gpu::Stream s) {
   launch_kernel("silu_mul", silu_mul_kernel, dim3(grid_for(n, 256)), dim3(256), 0, s, g, u, out, n);
 }
 
-void sigmoid_mul(float* x, const float* gate, int n, cudaStream_t s) {
+void sigmoid_mul(float* x, const float* gate, int n, gpu::Stream s) {
   launch_kernel("sigmoid_mul", sigmoid_mul_kernel, dim3(grid_for(n, 256)), dim3(256), 0, s, x, gate, n);
 }
 
-void gdn_conv(float* mixed, float* conv_state, const __nv_bfloat16* w, int M, int C, cudaStream_t s) {
+void gdn_conv(float* mixed, float* conv_state, const gpu::bf16* w, int M, int C, gpu::Stream s) {
   launch_kernel("gdn_conv", gdn_conv_kernel, dim3((C + 255) / 256), dim3(256), 0, s, mixed, conv_state, w, M, C);
 }
 
-void gdn_gating(const float* a, const float* b, const __nv_bfloat16* A_log, const __nv_bfloat16* dt_bias,
-                float* g, float* beta, int M, int HV, cudaStream_t s) {
+void gdn_gating(const float* a, const float* b, const gpu::bf16* A_log, const gpu::bf16* dt_bias,
+                float* g, float* beta, int M, int HV, gpu::Stream s) {
   const int n = M * HV;
   launch_kernel("gdn_gating", gdn_gating_kernel, dim3((n + 255) / 256), dim3(256), 0, s, a, b, A_log, dt_bias, g, beta,
                 n, HV);
 }
 
 void gdn_recurrent(const float* mixed, const float* g, const float* beta, const float* state_in, float* state_out,
-                   float* out, int M, int H, int HV, cudaStream_t s) {
+                   float* out, int M, int H, int HV, gpu::Stream s) {
   launch_kernel("gdn_recurrent", gdn_recurrent_warp_kernel, dim3(HV * 4), dim3(32), 0, s, mixed, g, beta, state_in,
                 state_out, out, M, H, HV);
 }
 
-void gdn_conv_tree(const float* pre, float* post, const float* state, const __nv_bfloat16* w, int M, int C,
-                   const TreeDesc* td, cudaStream_t s) {
+void gdn_conv_tree(const float* pre, float* post, const float* state, const gpu::bf16* w, int M, int C,
+                   const TreeDesc* td, gpu::Stream s) {
   launch_kernel("gdn_conv_tree", gdn_conv_tree_kernel, dim3((C + 255) / 256), dim3(256), 0, s, pre, post, state, w, M, C,
                 td);
 }
 
 void gdn_recurrent_tree(const float* mixed, const float* g, const float* beta, const float* state_in, float* out,
-                        int H, int HV, const TreeDesc* td, int ngdn, cudaStream_t s) {
+                        int H, int HV, const TreeDesc* td, int ngdn, gpu::Stream s) {
   launch_kernel("gdn_recurrent_tree", gdn_recurrent_tree_kernel, dim3(HV * 4, ngdn), dim3(32), 0, s, mixed, g, beta,
                 state_in, out, H, HV, td);
 }
 
-void kv_pages_copy(__nv_bfloat16* pool, const uint64_t* pages, int layer_kv, int Hkv, int D, __nv_bfloat16* buf,
-                   int buf_start, int buf_len, int from, int to, bool to_buf, cudaStream_t s) {
+void kv_pages_copy(gpu::bf16* pool, const uint64_t* pages, int layer_kv, int Hkv, int D, gpu::bf16* buf,
+                   int buf_start, int buf_len, int from, int to, bool to_buf, gpu::Stream s) {
   if (to <= from) return;
   if (D % 8) throw std::runtime_error("kv_pages_copy: head_dim a multiple of 8");
   launch_kernel("kv_pages_copy", kv_pages_copy_kernel, dim3(to - from, layer_kv), dim3(128), 0, s, pool, pages, Hkv, D,
                 kv_hs(D), buf, buf_start, buf_len, from, to_buf);
 }
 
-void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, cudaStream_t s) {
+void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, gpu::Stream s) {
   for (int at = 0; at < n; at += kKvTableSetMax) {
     const int m = std::min(kKvTableSetMax, n - at);
     KvTableEntries e;
@@ -1005,50 +1007,50 @@ void kv_table_set(uint64_t* table, const int* idx, const uint64_t* val, int n, c
   }
 }
 
-void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, cudaStream_t s, int row0) {
+void tree_gather(const GatherBuf* bufs, int nbufs, const int* rows, int n, DevPos pos, gpu::Stream s, int row0) {
   if (nbufs <= 0 || n <= 1) return;
   launch_kernel("tree_gather", tree_gather_kernel, dim3(nbufs), dim3(256), 0, s, bufs, rows, n, pos, row0);
 }
 
-void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
-                   cudaStream_t s) {
+void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const gpu::bf16* w, const SeqBatch& b, int C,
+                   gpu::Stream s) {
   launch_kernel("gdn_conv_seqs", gdn_conv_seqs_kernel, dim3((C + 255) / 256, b.n), dim3(256), 0, s, mixed, state, w, b, C);
 }
 
 void gdn_recurrent_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<const float> state, float* out,
-                        const SeqBatch& b, int H, int HV, cudaStream_t s) {
+                        const SeqBatch& b, int H, int HV, gpu::Stream s) {
   launch_kernel("gdn_recurrent_seqs", gdn_recurrent_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed, g, beta,
                 state, out, b, H, HV);
 }
 
 void gdn_recurrent_fused_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<float> state, float* out,
                               const SeqBatch& b, int H, int HV, const float* pmixed, const float* pg, const float* pbeta,
-                              const int* pend, float* pout, cudaStream_t s) {
+                              const int* pend, float* pout, gpu::Stream s) {
   launch_kernel("gdn_recurrent_fused_seqs", gdn_recurrent_fused_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed,
                 g, beta, state, out, b, H, HV, pmixed, pg, pbeta, pend, pout);
 }
 
-void gdn_conv_commit_seqs(float* mixed, SeqPtrs<float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
-                          cudaStream_t s) {
+void gdn_conv_commit_seqs(float* mixed, SeqPtrs<float> state, const gpu::bf16* w, const SeqBatch& b, int C,
+                          gpu::Stream s) {
   launch_kernel("gdn_conv_commit_seqs", gdn_conv_commit_seqs_kernel, dim3((C + 255) / 256, b.n), dim3(256), 0, s, mixed,
                 state, w, b, C);
 }
 
 void gdn_recurrent_commit_seqs(const float* mixed, const float* g, const float* beta, SeqPtrs<float> state, float* out,
-                               const SeqBatch& b, int H, int HV, cudaStream_t s) {
+                               const SeqBatch& b, int H, int HV, gpu::Stream s) {
   launch_kernel("gdn_recurrent_commit_seqs", gdn_recurrent_commit_seqs_kernel, dim3(HV * 4, b.n), dim3(32), 0, s, mixed,
                 g, beta, state, out, b, H, HV);
 }
 
-void gated_rmsnorm(const float* x, const float* z, const __nv_bfloat16* w, float* out, int rows, int D,
-                   float eps, cudaStream_t s) {
+void gated_rmsnorm(const float* x, const float* z, const gpu::bf16* w, float* out, int rows, int D,
+                   float eps, gpu::Stream s) {
   launch_kernel("gated_rmsnorm", gated_rmsnorm_kernel, dim3(rows), dim3(D), 0, s, x, z, w, out, D, eps);
 }
 
-void attn_prepare(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
-                  const __nv_bfloat16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
-                  float eps, float* q, float* gate, __nv_bfloat16* kcache, __nv_bfloat16* vcache,
-                  cudaStream_t s, const TreeDesc* td, const int* mrope, const uint64_t* pages, uint8_t* sealed,
+void attn_prepare(const float* q_gate, const float* k, const float* v, const gpu::bf16* q_norm,
+                  const gpu::bf16* k_norm, DevPos pos0, int M, int Hq, int Hkv, int D, int rot, float theta,
+                  float eps, float* q, float* gate, gpu::bf16* kcache, gpu::bf16* vcache,
+                  gpu::Stream s, const TreeDesc* td, const int* mrope, const uint64_t* pages, uint8_t* sealed,
                   unsigned long long unit) {
   dim3 grid(M, Hq + 2 * Hkv);
   launch_kernel("attn_prepare", attn_prepare_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v, q_norm, k_norm,
@@ -1056,16 +1058,17 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
                 sealed, unit);
 }
 
-void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const __nv_bfloat16* q_norm,
-                       const __nv_bfloat16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
-                       float eps, float* q, float* gate, SeqPtrs<__nv_bfloat16> kc, SeqPtrs<__nv_bfloat16> vc,
-                       cudaStream_t s, SeqPtrs<const uint64_t> pages, uint8_t* sealed, unsigned long long unit) {
+void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, const gpu::bf16* q_norm,
+                       const gpu::bf16* k_norm, const SeqBatch& b, int Hq, int Hkv, int D, int rot, float theta,
+                       float eps, float* q, float* gate, SeqPtrs<gpu::bf16> kc, SeqPtrs<gpu::bf16> vc,
+                       gpu::Stream s, SeqPtrs<const uint64_t> pages, uint8_t* sealed, unsigned long long unit) {
   dim3 grid(b.row0[b.n], Hq + 2 * Hkv);
   launch_kernel("attn_prepare_seqs", attn_prepare_seqs_kernel, grid, dim3(D), D * sizeof(float), s, q_gate, k, v,
                 q_norm, k_norm, b, Hq, Hkv, D, rot, theta, eps, q, gate, kc, vc, kv_hs(D), kv_ps(Hkv, D), pages, sealed,
                 unit);
 }
 
+#if !defined(RAGON_BACKEND_HIP)  // W1 (attention, KV seal): CUDA only until the W1 port (BACKEND §7)
 // Fixed key ranges at fixed positions (row invariance); RAGON_ATTN_CHUNK picks the size for experiments.
 int attention_chunk() {
   static const int c = [] {
@@ -1151,7 +1154,7 @@ void prepare_kernels() {
 namespace {
 // RAGON_KV_CALIB: the largest |K| and |V| of positions [p0, p0 + n) of one layer's cache, folded into amax[0..1] (the
 // float bits of non-negative values order as integers).
-__global__ void kv_absmax_kernel(const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
+__global__ void kv_absmax_kernel(const gpu::bf16* __restrict__ kc, const gpu::bf16* __restrict__ vc,
                                  const uint64_t* __restrict__ pages, int p0, int D, size_t hs, size_t ps,
                                  float* __restrict__ amax) {
   const int p = p0 + blockIdx.x, h = blockIdx.y;
@@ -1162,8 +1165,8 @@ __global__ void kv_absmax_kernel(const __nv_bfloat16* __restrict__ kc, const __n
     mv = fmaxf(mv, fabsf(__bfloat162float(vc[off + d])));
   }
   for (int o = 16; o > 0; o >>= 1) {
-    mk = fmaxf(mk, __shfl_xor_sync(0xffffffffu, mk, o));
-    mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, o));
+    mk = fmaxf(mk, __shfl_xor_sync(gpu::kWarpMask, mk, o));
+    mv = fmaxf(mv, __shfl_xor_sync(gpu::kWarpMask, mv, o));
   }
   if ((threadIdx.x & 31) == 0) {
     atomicMax(reinterpret_cast<int*>(amax), __float_as_int(mk));
@@ -1172,8 +1175,8 @@ __global__ void kv_absmax_kernel(const __nv_bfloat16* __restrict__ kc, const __n
 }
 }  // namespace
 
-void kv_absmax(const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, const uint64_t* pages, int p0, int n,
-               int Hkv, int D, float* amax, cudaStream_t s) {
+void kv_absmax(const gpu::bf16* kcache, const gpu::bf16* vcache, const uint64_t* pages, int p0, int n,
+               int Hkv, int D, float* amax, gpu::Stream s) {
   if (n <= 0) return;
   kv_absmax_kernel<<<dim3(n, Hkv), 128, 0, s>>>(kcache, vcache, pages, p0, D, kv_hs(D), kv_ps(Hkv, D), amax);
   check(cudaGetLastError(), "kv_absmax");
@@ -1188,7 +1191,7 @@ struct KvSealArgs {
   float kinv[kMaxKvQ8Slots];
   float vinv[kMaxKvQ8Slots];
 };
-__global__ void kv_seal_kernel(const __nv_bfloat16* __restrict__ pool, uint8_t* __restrict__ mirror, KvSealArgs a,
+__global__ void kv_seal_kernel(const gpu::bf16* __restrict__ pool, uint8_t* __restrict__ mirror, KvSealArgs a,
                                int l0, int Hkv, int D, size_t hs, size_t unit) {
   pdl_begin();  // first statement: see launch.cuh
   const int lkv = blockIdx.y, l = l0 + lkv / 2, kv = lkv % 2, h = blockIdx.z;
@@ -1198,7 +1201,7 @@ __global__ void kv_seal_kernel(const __nv_bfloat16* __restrict__ pool, uint8_t* 
   for (int i = threadIdx.x; i < n16; i += blockDim.x) {
     const uint4* src = reinterpret_cast<const uint4*>(pool + off) + 2 * i;
     uint4 w[2] = {src[0], src[1]};
-    const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(w);
+    const gpu::bf16x2* hv = reinterpret_cast<const gpu::bf16x2*>(w);
     uint4 out;
     uint16_t* o = reinterpret_cast<uint16_t*>(&out);
 #pragma unroll
@@ -1215,8 +1218,8 @@ __global__ void kv_flag_kernel(uint8_t* __restrict__ sealed, KvIds a, int n, uin
 }
 }  // namespace
 
-void kv_seal(const __nv_bfloat16* pool, uint8_t* mirror, uint8_t* sealed, const int* ids, int n, int l0, int l1,
-             int Hkv, int D, size_t page_unit, const float* kinv, const float* vinv, cudaStream_t s) {
+void kv_seal(const gpu::bf16* pool, uint8_t* mirror, uint8_t* sealed, const int* ids, int n, int l0, int l1,
+             int Hkv, int D, size_t page_unit, const float* kinv, const float* vinv, gpu::Stream s) {
   if (l1 > kMaxKvQ8Slots) throw std::runtime_error("kv_seal: too many full-attention layers");
   if (D % 16) throw std::runtime_error("kv_seal: head_dim a multiple of 16");
   for (int at = 0; at < n; at += kKvSealMax) {
@@ -1235,7 +1238,7 @@ void kv_seal(const __nv_bfloat16* pool, uint8_t* mirror, uint8_t* sealed, const 
   }
 }
 
-void kv_unseal(uint8_t* sealed, const int* ids, int n, cudaStream_t s) {
+void kv_unseal(uint8_t* sealed, const int* ids, int n, gpu::Stream s) {
   for (int at = 0; at < n; at += kKvSealMax) {
     const int m = std::min(kKvSealMax, n - at);
     KvIds f{};
@@ -1251,8 +1254,8 @@ void check_q8(const KvQ8& q8, int chunk) {
   if (chunk % kAttnTk) throw std::runtime_error("attention_rows: --kv-fp8 needs RAGON_ATTN_CHUNK on the 32-key grid");
 }
 
-void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
-                    int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx,
+void attention_rows(const float* q, const gpu::bf16* kcache, const gpu::bf16* vcache, DevPos pos0, int M,
+                    int Hq, int Hkv, int D, float* scratch, float* out, gpu::Stream s, int fixed_ctx,
                     const TreeDesc* td, const uint64_t* pages, KvQ8 q8) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   check_q8(q8, attention_chunk());
@@ -1274,8 +1277,8 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     0, s, scratch, splits, D, out);
 }
 
-void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
-                         const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
+void attention_rows_seqs(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
+                         const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, gpu::Stream s,
                          int fixed_ctx, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   check_q8(q8, attention_chunk());
@@ -1302,9 +1305,9 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
 
-void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
+void attention_rows_cascade(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
                             const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out,
-                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
+                            gpu::Stream s, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   check_q8(q8, attention_chunk());
   if (b.pos_dev) throw std::runtime_error("attention_rows_cascade: positions on the host only (no captured graph)");
@@ -1360,5 +1363,6 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
+#endif  // !RAGON_BACKEND_HIP
 
 }  // namespace ragon::kernels
