@@ -90,6 +90,12 @@ struct EngineOptions {
   double draft_off_below = 1.5;
   double draft_on_margin = 0.25;
   bool draft_off_sampled = false;
+  // eng-fanout-policy: the guard's hold. While the server runs the wide regime (set_fanout_wide), the guard keeps its
+  // mean but switches no session off, and a session it held starts afresh when the regime ends (DraftGuard::observe,
+  // release: a fork switched off there runs ~80 one-token passes where its siblings need ~52, the last of them alone;
+  // 32 forks x 32K: span 236 -> 284 tok/s, the outputs the same). draft_off_wide = true: the guard as before, wide or
+  // not. RAGON_DRAFT_OFF_WIDE=0/1 overrides it.
+  bool draft_off_wide = false;
   // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
   // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
   // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
@@ -204,6 +210,13 @@ struct EngineOptions {
   // running mean of tokens per step falls below it.
   int sparse_head_window = 64;
   double sparse_head_hi = 0.15, sparse_head_lo = 0.08, sparse_head_accept_floor = 0;
+  // eng-fanout-policy: when more than sparse_head_batch greedy sequences draft in one batched step, they draft with
+  // the full head: the sparse head's selection, gather and top-K run per sequence (~227 MB read each), the full head
+  // once for the whole batch (635 MB), so from a few forks on the full head is the cheaper (32 forks x 32K: a step
+  // 248 -> 194 ms). Greedy only: the head changes the proposals, never a greedy request's tokens (the target verifies
+  // each), but a sampled request's tokens follow its proposals. Each sequence's fallback state is kept up to date
+  // either way. 0: the sparse head at any batch size. RAGON_SH_BATCH overrides it.
+  int sparse_head_batch = 6;
   // Images (VISION §20.3): the checkpoint's vision tower, loaded with scratch for images of up to vision_max_pixels
   // (the processor's maximum by default), and a cache of encoded images (their embeddings, by image id) of at most
   // vision_cache_mb, reserved at start. Off: an image id in a prompt is an error.
@@ -446,6 +459,15 @@ class Engine {
     for (Session& s : sessions_) s.guard.reset();
   }
   double draft_off_below() const { return opts_.draft_off_below; }
+  // The server's wide regime (serve/main.cpp fanout_regime), called before every step: while it is on, the drafter-off
+  // guard is held (EngineOptions::draft_off_wide); when it goes off, every guard that was held starts afresh.
+  void set_fanout_wide(bool wide) {
+    const bool hold = wide && !opts_.draft_off_wide;
+    if (guard_hold_ && !hold)
+      for (Session& s : sessions_) s.guard.release();
+    guard_hold_ = hold;
+  }
+  bool guard_held() const { return guard_hold_; }
   double draft_on_margin() const { return opts_.draft_on_margin; }
   int draft_block() const { return opts_.draft_block; }
   void set_draft_block(int b);
@@ -1077,6 +1099,11 @@ class Engine {
   bool guarded(const SamplingParams& p) const {
     return guard_cfg_.off_below > 0 && (p.temperature <= 0.f || opts_.draft_off_sampled);
   }
+  // Whether the session's next step is plain: the guard applies, is not held and says so.
+  bool guard_off(const Session& s, const SamplingParams& p) const {
+    return guarded(p) && !guard_hold_ && !s.guard.speculate();
+  }
+  bool guard_hold_ = false;  // set_fanout_wide
 
   // Drafter: target features [rows][layers * hidden] (BF16), its context KV per layer [max_context][kv],
   // and the block's buffers.

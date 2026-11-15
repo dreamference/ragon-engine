@@ -254,6 +254,8 @@ void Engine::alloc_drafter() {
   if (const char* e = std::getenv("RAGON_DRAFT_OFF_BELOW")) opts_.draft_off_below = std::atof(e);
   if (const char* e = std::getenv("RAGON_DRAFT_ON_MARGIN")) opts_.draft_on_margin = std::atof(e);
   if (const char* e = std::getenv("RAGON_DRAFT_OFF_SAMPLED")) opts_.draft_off_sampled = std::atoi(e) != 0;
+  if (const char* e = std::getenv("RAGON_DRAFT_OFF_WIDE")) opts_.draft_off_wide = std::atoi(e) != 0;
+  if (const char* e = std::getenv("RAGON_SH_BATCH")) opts_.sparse_head_batch = std::atoi(e);
   set_draft_guard(opts_.draft_off_below, opts_.draft_on_margin);
   tree_dev_ = reinterpret_cast<kernels::TreeDesc*>(alloc<uint8_t>(kernels::kMaxSeqs * sizeof(kernels::TreeDesc)));
   gather_rows_dev_ = alloc<int>(kernels::kMaxStreamRows);
@@ -1269,7 +1271,7 @@ void Engine::plan_count(StepPlan& sp) {
   s.spec.accept_hist[accepted] += 1;
   // The drafter-off guard (BACKLOG 10) sees every speculative step of the requests it applies to, alone or batched,
   // probes included: the step's tokens per target pass.
-  if (guarded(*sp.p) && s.guard.observe(guard_cfg_, n)) s.spec.drafter_switches += 1;
+  if (guarded(*sp.p) && s.guard.observe(guard_cfg_, n, guard_hold_)) s.spec.drafter_switches += 1;
   if (sp.use_lookup) {
     s.spec.lookup_steps += 1;
     s.spec.lookup_accepted += accepted;
@@ -1304,7 +1306,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   //   - the tokens: the rows path is row-invariant, so a plain row's logits are bit for bit a verify row's, and a
   //     greedy request's tokens are plain decoding's on either path. A sampled request keeps its distribution (the
   //     verify's rejection rule against sample()'s single draw), not its tokens, as speculation already does.
-  const bool off = guarded(p) && !s_->guard.speculate();
+  const bool off = guard_off(*s_, p);
   if (B < 2 || off) {  // no room to draft, or the guard off: one plain step
     step(anchor);
     if (off) {
@@ -1428,7 +1430,7 @@ bool Engine::can_batch(int session, const SamplingParams& p) const {
 
 bool Engine::drafter_off(int session, const SamplingParams& p) const {
   const Session& s = sessions_.at(session);
-  return draft_ && can_speculate(p) && guarded(p) && !s.guard.speculate();
+  return draft_ && can_speculate(p) && guard_off(s, p);
 }
 
 void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
@@ -1590,9 +1592,15 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       for (int j = 1; j < B; ++j) pin_->draft_ids[i * B + j] = draft_->config().mask_token;
     }
     // BACKLOG 19: each sequence takes the head its session takes alone (bit i: the sparse one), and the graph is the
-    // batch's for that combination. Riders do not draft.
+    // batch's for that combination. Riders do not draft. eng-fanout-policy: with more than sparse_head_batch drafting,
+    // a greedy sequence takes the full head (one pass for the batch against a gather per sequence), its fallback
+    // state still synced.
+    const bool batch_full = opts_.sparse_head_batch > 0 && nd > opts_.sparse_head_batch;
     unsigned sparse = 0;
-    for (int i = 0; i < nd; ++i) sparse |= sparse_head_sync(*plans[i].s) ? 1u << i : 0u;
+    for (int i = 0; i < nd; ++i) {
+      const bool si = sparse_head_sync(*plans[i].s) && !(batch_full && plans[i].p->temperature <= 0.f);
+      sparse |= si ? 1u << i : 0u;
+    }
     if (graph)
       run_graph(sparse ? bg->draft_sparse[sparse] : bg->draft, "draft", [&] { draft_batch_launch(drafting, B, sparse); });
     else
