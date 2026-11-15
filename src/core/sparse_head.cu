@@ -12,7 +12,8 @@
 #include "core/kernels.cuh"
 #include "core/launch.cuh"
 
-#include <cub/cub.cuh>
+#include "backend/cub.hpp"     // gpu::cub: CUB or hipCUB (BACKEND §3.1)
+#include "backend/device.hpp"  // the kernels' runtime calls
 #include <thrust/iterator/counting_iterator.h>
 
 #include <algorithm>
@@ -39,6 +40,72 @@ __device__ __forceinline__ bool marked(const SelMasks& ms, int n) {
   return on;
 }
 
+#if defined(RAGON_BACKEND_HIP)
+// Eight products of a BF16 row slice and a BF16 P slice (uint4 = 8 values, low half first), added to acc in index
+// order: exact BF16 to FP32 widening, one rounding per fmaf.
+__device__ __forceinline__ float dot8_bf16(uint4 a, uint4 b, float acc) {
+  const uint32_t av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    acc = fmaf(__uint_as_float(av[i] << 16), __uint_as_float(bv[i] << 16), acc);
+    acc = fmaf(__uint_as_float(av[i] & 0xffff0000u), __uint_as_float(bv[i] & 0xffff0000u), acc);
+  }
+  return acc;
+}
+
+// approx = P . US^T without tensor cores (HIP has no mma.sync; BACKEND §7), under the determinism rule: the CUDA
+// kernel's warp layout (lane (g, t) holds values t * 64 .. t * 64 + 63 of rows g and g + 8, P in shared memory as
+// BF16), each lane's 64 products summed in index order, the row's four lanes joined by a fixed butterfly (xor 1, then
+// xor 2: every lane ends with the same sum), and the maximum over P's M rows as the row's score. No split-K, no
+// atomics. Its bits are not the tensor-core kernel's (another order of the same products: an approximation either
+// way, BACKLOG 19), and a host loop in the same order reproduces them exactly.
+template <int NT>
+__global__ void __launch_bounds__(256) approx_kernel(const float* __restrict__ p, int M, const gpu::bf16* __restrict__ us,
+                                                     int N, SelMasks fixed, uint32_t* __restrict__ keys) {
+  pdl_begin();  // first statement: see launch.cuh
+  constexpr int PS = kRank + 8;  // padded row stride (BF16)
+  __shared__ __align__(16) gpu::bf16 ps[NT * 8 * PS];
+  for (int i = threadIdx.x; i < NT * 8 * kRank; i += blockDim.x) {
+    const int m = i / kRank, c = i % kRank;
+    ps[m * PS + c] = __float2bfloat16(m < M ? p[m * kRank + c] : 0.f);
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int warps = gridDim.x * (blockDim.x / 32), warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+  for (int n0 = warp * 16; n0 < N; n0 += warps * 16) {
+    uint4 a[2][8];  // rows g and g + 8: values t * 64 .. t * 64 + 63
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int n = min(n0 + g + 8 * h, N - 1);
+      const uint4* src = reinterpret_cast<const uint4*>(us + static_cast<size_t>(n) * kRank + t * 64);
+#pragma unroll
+      for (int q = 0; q < 8; ++q) a[h][q] = __ldg(src + q);
+    }
+    float best[2] = {-INFINITY, -INFINITY};
+    for (int m = 0; m < M; ++m) {
+      const uint4* pr = reinterpret_cast<const uint4*>(ps + m * PS + t * 64);
+      float acc[2] = {0.f, 0.f};
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        const uint4 pv = pr[q];
+        acc[0] = dot8_bf16(a[0][q], pv, acc[0]);
+        acc[1] = dot8_bf16(a[1][q], pv, acc[1]);
+      }
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        acc[h] += __shfl_xor_sync(gpu::kWarpMask, acc[h], 1);
+        acc[h] += __shfl_xor_sync(gpu::kWarpMask, acc[h], 2);
+        best[h] = fmaxf(best[h], acc[h]);
+      }
+    }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int n = n0 + g + 8 * h;
+      if (t == 0 && n < N) keys[n] = marked(fixed, n) ? 0u : float_key(best[h]);
+    }
+  }
+}
+#else
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
   asm volatile(
@@ -53,11 +120,11 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 // the rank is the same products in another order, an approximation either way), P (BF16) in shared memory, and the
 // maximum over P's NT * 8 rows (those past M masked) is the row's score.
 template <int NT>
-__global__ void __launch_bounds__(256) approx_kernel(const float* __restrict__ p, int M, const __nv_bfloat16* __restrict__ us,
+__global__ void __launch_bounds__(256) approx_kernel(const float* __restrict__ p, int M, const gpu::bf16* __restrict__ us,
                                                      int N, SelMasks fixed, uint32_t* __restrict__ keys) {
   pdl_begin();  // first statement: see launch.cuh
   constexpr int PS = kRank + 8;  // padded row stride (BF16)
-  __shared__ __align__(16) __nv_bfloat16 ps[NT * 8 * PS];
+  __shared__ __align__(16) gpu::bf16 ps[NT * 8 * PS];
   for (int i = threadIdx.x; i < NT * 8 * kRank; i += blockDim.x) {
     const int m = i / kRank, c = i % kRank;
     ps[m * PS + c] = __float2bfloat16(m < M ? p[m * kRank + c] : 0.f);
@@ -101,13 +168,14 @@ __global__ void __launch_bounds__(256) approx_kernel(const float* __restrict__ p
         }
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-      best[h] = fmaxf(best[h], __shfl_xor_sync(0xffffffffu, best[h], 1));
-      best[h] = fmaxf(best[h], __shfl_xor_sync(0xffffffffu, best[h], 2));
+      best[h] = fmaxf(best[h], __shfl_xor_sync(gpu::kWarpMask, best[h], 1));
+      best[h] = fmaxf(best[h], __shfl_xor_sync(gpu::kWarpMask, best[h], 2));
       const int n = n0 + g + 8 * h;
       if (t == 0 && n < N) keys[n] = marked(fixed, n) ? 0u : float_key(best[h]);
     }
   }
 }
+#endif  // RAGON_BACKEND_HIP
 
 // The key of the `dynamic`-th best, 12 + 12 + 8 bits at a time: each level a histogram of the keys that share the
 // prefix found so far, per block in shared memory and then summed into global memory, and one warp that finds the bin
@@ -185,8 +253,9 @@ __global__ void ids_kernel(const int* __restrict__ rows, int* __restrict__ ids, 
 
 size_t cub_bytes(int N) {
   size_t bytes = 0;
-  cub::DeviceSelect::Flagged(nullptr, bytes, thrust::counting_iterator<int>(0), static_cast<const uint8_t*>(nullptr),
-                             static_cast<int*>(nullptr), static_cast<int*>(nullptr), N);
+  (void)gpu::cub::DeviceSelect::Flagged(nullptr, bytes, thrust::counting_iterator<int>(0),
+                                        static_cast<const uint8_t*>(nullptr), static_cast<int*>(nullptr),
+                                        static_cast<int*>(nullptr), N);
   return bytes;
 }
 
@@ -195,8 +264,8 @@ size_t cub_bytes(int N) {
 // keys [N] u32, flags [N] u8, the threshold and state (64 bytes), the histograms (3 x 4096 bins), then CUB's storage.
 size_t sparse_head_scratch_bytes(int N) { return size_t(N) * 5 + 256 + 3 * 4096 * 4 + cub_bytes(N); }
 
-void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, int R, SelMasks fixed_mask, int dynamic,
-                        int cap, void* scratch, int* rows, int* nrows, cudaStream_t s) {
+void sparse_head_select(const float* p, int M, const gpu::bf16* us, int N, int R, SelMasks fixed_mask, int dynamic,
+                        int cap, void* scratch, int* rows, int* nrows, gpu::Stream s) {
   if (R != kRank) throw std::runtime_error("sparse_head_select: built for rank 256");
   if (fixed_mask.n < 1 || fixed_mask.n > kMaxSeqs) throw std::runtime_error("sparse_head_select: 1 to kMaxSeqs masks");
   if (M < 1 || M > kMaxSeqRows) throw std::runtime_error("sparse_head_select: M must be in [1, 32]");  // one sequence
@@ -212,15 +281,15 @@ void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, i
   // a first wave to finish.
   auto grid = [](auto kernel) {
     static int sms = 0;
-    if (!sms) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    if (!sms) (void)gpu::sm_count(&sms);
     int per = 1;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kernel, 256, 0);
+    (void)gpu::blocks_per_sm(&per, kernel, 256, 0);
     return dim3(sms * std::max(per, 1));
   };
   if (M <= 8) launch_kernel("sparse_head approx", approx_kernel<1>, grid(approx_kernel<1>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
   else if (M <= 16) launch_kernel("sparse_head approx", approx_kernel<2>, grid(approx_kernel<2>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
   else launch_kernel("sparse_head approx", approx_kernel<4>, grid(approx_kernel<4>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
-  if (cudaMemsetAsync(hist, 0, 3 * 4096 * 4, s) != cudaSuccess) throw std::runtime_error("sparse_head_select: memset");
+  if (gpu::memset_async(hist, 0, 3 * 4096 * 4, s) != gpu::kSuccess) throw std::runtime_error("sparse_head_select: memset");
   for (int level = 0; level < 3; ++level) {
     launch_kernel("sparse_head hist", hist_kernel, dim3(96), dim3(512), 0, s, static_cast<const uint32_t*>(keys), N, hist,
                   static_cast<const uint32_t*>(state), level);
@@ -229,20 +298,21 @@ void sparse_head_select(const float* p, int M, const __nv_bfloat16* us, int N, i
   }
   launch_kernel("sparse_head flags", flags_kernel, dim3((N + 255) / 256), dim3(256), 0, s,
                 static_cast<const uint32_t*>(keys), fixed_mask, N, static_cast<const uint32_t*>(thr), flags);
-  if (cub::DeviceSelect::Flagged(temp, temp_bytes, thrust::counting_iterator<int>(0), flags, rows, nrows, N, s) !=
-      cudaSuccess)
+  if (gpu::cub::DeviceSelect::Flagged(temp, temp_bytes, thrust::counting_iterator<int>(0), flags, rows, nrows, N, s) !=
+      gpu::kSuccess)
     throw std::runtime_error("sparse_head_select: compaction");
   launch_kernel("sparse_head clamp", clamp_kernel, dim3(1), dim3(32), 0, s, nrows, cap);
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) throw std::runtime_error(std::string("sparse_head_select: ") + cudaGetErrorString(e));
+  const gpu::Error e = gpu::last_error();
+  if (e != gpu::kSuccess) throw std::runtime_error(std::string("sparse_head_select: ") + gpu::error_string(e));
 }
 
-void sparse_head_ids(const int* rows, int* ids, int n, cudaStream_t s) {
+void sparse_head_ids(const int* rows, int* ids, int n, gpu::Stream s) {
   launch_kernel("sparse_head ids", ids_kernel, dim3((n + 255) / 256), dim3(256), 0, s, rows, ids, n);
 }
 
+#if !defined(RAGON_BACKEND_HIP)  // W1 (the head GEMMs, stream_gemm): CUDA only until the W1 port (BACKEND §7)
 void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
-                     float* vals, int* ids, cudaStream_t s) {
+                     float* vals, int* ids, gpu::Stream s) {
   if (n < 1 || E < 1 || E > kMaxSeqRows) throw std::runtime_error("draft_head_rows: 1 to 32 rows per sequence");
   auto check = [](cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("draft_head_rows: ") + what + ": " + cudaGetErrorString(e));
@@ -286,8 +356,9 @@ void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, cons
     sparse_head_ids(b.rows, ids + o, E * K16, s);
   }
 }
+#endif  // !RAGON_BACKEND_HIP
 
-void sparse_head_mark(uint8_t* mask, const int* ids, int n, cudaStream_t s) {
+void sparse_head_mark(uint8_t* mask, const int* ids, int n, gpu::Stream s) {
   if (n <= 0) return;
   launch_kernel("sparse_head mark", mark_kernel, dim3((n + 255) / 256), dim3(256), 0, s, mask, ids, n);
 }
