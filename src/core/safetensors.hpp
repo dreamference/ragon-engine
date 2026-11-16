@@ -30,7 +30,12 @@ class MappedFile {
   size_t size() const { return size_; }
 
  private:
+#ifdef _WIN32
+  void* file_ = nullptr;     // the file's HANDLE (CreateFileW)
+  void* mapping_ = nullptr;  // its read-only mapping (CreateFileMappingW), viewed whole by MapViewOfFile
+#else
   int fd_ = -1;
+#endif
   const uint8_t* data_ = nullptr;
   size_t size_ = 0;
 };

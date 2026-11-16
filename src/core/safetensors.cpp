@@ -1,9 +1,19 @@
 #include "core/safetensors.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstring>
 #include <fstream>
@@ -20,6 +30,34 @@ int64_t TensorView::numel() const {
   return n;
 }
 
+#ifdef _WIN32
+// Windows: the whole file mapped read-only (MapViewOfFile), the same view mmap gives on Linux. The path is UTF-8.
+MappedFile::MappedFile(const std::string& path) {
+  const int wn = ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+  std::wstring wpath(wn > 0 ? wn - 1 : 0, L'\0');
+  if (wn <= 0 || ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wn) != wn)
+    throw std::runtime_error("cannot open " + path);
+  HANDLE f = ::CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (f == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path);
+  file_ = f;
+  LARGE_INTEGER sz{};
+  if (!::GetFileSizeEx(f, &sz) || sz.QuadPart < 0) throw std::runtime_error("cannot stat " + path);
+  size_ = static_cast<size_t>(sz.QuadPart);
+  if (size_ == 0) return;  // nothing to map (CreateFileMapping refuses an empty file); the caller sees size 0
+  mapping_ = ::CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (!mapping_) throw std::runtime_error("cannot map " + path);
+  const void* p = ::MapViewOfFile(static_cast<HANDLE>(mapping_), FILE_MAP_READ, 0, 0, 0);
+  if (!p) throw std::runtime_error("cannot map " + path);
+  data_ = static_cast<const uint8_t*>(p);
+}
+
+MappedFile::~MappedFile() {
+  if (data_) ::UnmapViewOfFile(data_);
+  if (mapping_) ::CloseHandle(static_cast<HANDLE>(mapping_));
+  if (file_) ::CloseHandle(static_cast<HANDLE>(file_));
+}
+#else
 MappedFile::MappedFile(const std::string& path) {
   fd_ = ::open(path.c_str(), O_RDONLY);
   if (fd_ < 0) throw std::runtime_error("cannot open " + path);
@@ -35,6 +73,7 @@ MappedFile::~MappedFile() {
   if (data_) ::munmap(const_cast<uint8_t*>(data_), size_);
   if (fd_ >= 0) ::close(fd_);
 }
+#endif
 
 Checkpoint::Checkpoint(const std::string& dir) : dir_(dir) {
   // A sharded checkpoint has an index; a small one (the drafter) is a single model.safetensors.
