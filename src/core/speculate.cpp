@@ -48,7 +48,7 @@
 #include <stdexcept>
 #include <string>
 
-#include <nvtx3/nvToolsExt.h>
+#include "backend/trace.hpp"
 
 #include "core/engine.hpp"
 #include "core/kernels.cuh"
@@ -65,12 +65,12 @@ namespace {
 constexpr int kBatchOrderDrafter = -1000000;
 
 struct NvtxRange {
-  explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
-  ~NvtxRange() { nvtxRangePop(); }
+  explicit NvtxRange(const char* name) { gpu::range_push(name); }
+  ~NvtxRange() { gpu::range_pop(); }
 };
 
-void check(cudaError_t e, const char* what) {
-  if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const char* what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(std::string(what) + ": " + gpu::error_string(e));
 }
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
@@ -190,11 +190,11 @@ void Engine::alloc_drafter() {
     feature_layer_[li] = i;
   }
   cap_stride_ = nfeat * H;
-  cap_ = alloc<__nv_bfloat16>(size_t(R) * cap_stride_);
+  cap_ = alloc<gpu::bf16>(size_t(R) * cap_stride_);
   if (const char* e = std::getenv("RAGON_COMMIT_DRAFT_BATCH")) commit_draft_batch_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_TOPK_BATCH")) topk_batch_ = std::atoi(e) != 0;
   if (commit_draft_batch_ && cap_gather_stride_ < cap_stride_) {  // draft_materialize_rows' gathered rows
-    cap_gather_ = alloc<__nv_bfloat16>(size_t(kernels::kMaxStreamRows) * cap_stride_);
+    cap_gather_ = alloc<gpu::bf16>(size_t(kernels::kMaxStreamRows) * cap_stride_);
     cap_gather_stride_ = cap_stride_;
   }
   // Each session's context KV is a ring (M4 §1): the window, kRingSlack positions of slack, and a commit's rows.
@@ -202,11 +202,11 @@ void Engine::alloc_drafter() {
   ring_ = d.sliding_window + kRingSlack + kernels::kMaxSeqRows;
   for (Session& s : sessions_)
     for (int l = 0; l < d.layers; ++l) {
-      s.dkc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
-      s.dvc.push_back(alloc<__nv_bfloat16>(size_t(ring_) * dkv));
+      s.dkc.push_back(alloc<gpu::bf16>(size_t(ring_) * dkv));
+      s.dvc.push_back(alloc<gpu::bf16>(size_t(ring_) * dkv));
     }
   dctx_ = alloc<float>(size_t(R) * H);
-  if (draft_->nvfp4_copies()) xh_fc_ = alloc<__half>(size_t(B) * draft_->fc4().K);
+  if (draft_->nvfp4_copies()) xh_fc_ = alloc<gpu::half>(size_t(B) * draft_->fc4().K);
   dk_ = alloc<float>(size_t(R) * dkv);
   dv_ = alloc<float>(size_t(R) * dkv);
   dres_ = alloc<float>(size_t(B) * H);
@@ -282,7 +282,7 @@ void Engine::alloc_drafter() {
         // P4: a head's run inside each page, rows through the session's page table (in element units); kv_head_stride
         // is the head stride of either layout
         const size_t off = size_t(h) * kernels::kv_head_stride(D);
-        const int unit = s.pages ? int(sizeof(__nv_bfloat16)) : 0;
+        const int unit = s.pages ? int(sizeof(gpu::bf16)) : 0;
         g.push_back({reinterpret_cast<char*>(s.kcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
         g.push_back({reinterpret_cast<char*>(s.vcache[l] + off), D * 2, int(D * 2), 1, s.pages, unit});
       }
@@ -290,7 +290,7 @@ void Engine::alloc_drafter() {
       if (b.row_bytes % 16 != 0) throw std::runtime_error("tree gather: a row is not a multiple of 16 bytes");
     s.gather = reinterpret_cast<kernels::GatherBuf*>(alloc<uint8_t>(g.size() * sizeof(kernels::GatherBuf)));
     s.ngather = static_cast<int>(g.size());
-    check(cudaMemcpy(s.gather, g.data(), g.size() * sizeof(kernels::GatherBuf), cudaMemcpyHostToDevice), "tree gather");
+    check(gpu::memcpy_sync(s.gather, g.data(), g.size() * sizeof(kernels::GatherBuf), gpu::kH2D), "tree gather");
   }
   if (opts_.tree_nodes > 0)
     std::fprintf(stderr, "tree verification: %d nodes beyond the chain (chain %d), temperature %.2f, width %d, depth %d\n",
@@ -343,11 +343,11 @@ void Engine::alloc_sparse_head() {
   sh_rank_ = static_cast<int>(us.shape[1]);
   auto put = [&](const TensorView& t) {
     uint8_t* d = alloc<uint8_t>(t.bytes);
-    check(cudaMemcpy(d, t.data, t.bytes, cudaMemcpyHostToDevice), "sparse head upload");
+    check(gpu::memcpy_sync(d, t.data, t.bytes, gpu::kH2D), "sparse head upload");
     return d;
   };
-  sh_us_ = reinterpret_cast<__nv_bfloat16*>(put(us));
-  sh_vt_ = reinterpret_cast<__nv_bfloat16*>(put(vt));
+  sh_us_ = reinterpret_cast<gpu::bf16*>(put(us));
+  sh_vt_ = reinterpret_cast<gpu::bf16*>(put(vt));
   sh_fixed_.assign(V, 0);
   const int nf = static_cast<int>(fixed.numel());
   for (int i = 0; i < nf; ++i) {
@@ -431,9 +431,9 @@ bool Engine::sparse_head_sync(Session& s) {
   }
   s.sh_synced = h.size();
   if (upload || fresh.size() > size_t(kShMarkMax)) {
-    check(cudaMemcpyAsync(s.sh_mask, s.sh_seen.data(), V, cudaMemcpyHostToDevice, stream_), "sparse head mask");
+    check(gpu::memcpy_async(s.sh_mask, s.sh_seen.data(), V, gpu::kH2D, stream_), "sparse head mask");
   } else if (!fresh.empty()) {
-    check(cudaMemcpyAsync(sh_ids_dev_, fresh.data(), fresh.size() * sizeof(int), cudaMemcpyHostToDevice, stream_),
+    check(gpu::memcpy_async(sh_ids_dev_, fresh.data(), fresh.size() * sizeof(int), gpu::kH2D, stream_),
           "sparse head ids");
     kernels::sparse_head_mark(s.sh_mask, sh_ids_dev_, static_cast<int>(fresh.size()), stream_);
   }
@@ -506,62 +506,62 @@ void Engine::set_step_graphs(bool on) {
 }
 
 void Engine::clear_graphs() {
-  if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
+  if (commit_stream_) gpu::stream_sync(commit_stream_);  // a replay may still run there
   for (Session& s : sessions_) clear_session_graphs(s);
   for (auto& [order, bg] : batch_graphs_) {
-    if (bg.draft) cudaGraphExecDestroy(bg.draft);
-    for (auto& [k, g] : bg.draft_sparse) cudaGraphExecDestroy(g);
-    for (auto& [k, g] : bg.verify) cudaGraphExecDestroy(g);
+    if (bg.draft) gpu::graph_exec_destroy(bg.draft);
+    for (auto& [k, g] : bg.draft_sparse) gpu::graph_exec_destroy(g);
+    for (auto& [k, g] : bg.verify) gpu::graph_exec_destroy(g);
   }
   batch_graphs_.clear();
 }
 
 void Engine::clear_session_graphs(Session& s) {
-  if (commit_stream_) cudaStreamSynchronize(commit_stream_);  // a replay may still run there
-  if (s.draft_graph) cudaGraphExecDestroy(s.draft_graph);
+  if (commit_stream_) gpu::stream_sync(commit_stream_);  // a replay may still run there
+  if (s.draft_graph) gpu::graph_exec_destroy(s.draft_graph);
   s.draft_graph = nullptr;
-  if (s.draft_graph_sparse) cudaGraphExecDestroy(s.draft_graph_sparse);
+  if (s.draft_graph_sparse) gpu::graph_exec_destroy(s.draft_graph_sparse);
   s.draft_graph_sparse = nullptr;
-  for (auto& [k, g] : s.verify_graphs) cudaGraphExecDestroy(g);
+  for (auto& [k, g] : s.verify_graphs) gpu::graph_exec_destroy(g);
   s.verify_graphs.clear();
-  for (auto& [k, g] : s.tree_verify_graphs) cudaGraphExecDestroy(g);
+  for (auto& [k, g] : s.tree_verify_graphs) gpu::graph_exec_destroy(g);
   s.tree_verify_graphs.clear();
-  for (auto& [k, g] : s.masked_verify_graphs) cudaGraphExecDestroy(g);
+  for (auto& [k, g] : s.masked_verify_graphs) gpu::graph_exec_destroy(g);
   s.masked_verify_graphs.clear();
-  for (cudaGraphExec_t g : s.commit_graphs)
-    if (g) cudaGraphExecDestroy(g);
+  for (gpu::GraphExec g : s.commit_graphs)
+    if (g) gpu::graph_exec_destroy(g);
   s.commit_graphs.clear();
-  for (auto& [k, g] : s.batch_commit_graphs) cudaGraphExecDestroy(g);
+  for (auto& [k, g] : s.batch_commit_graphs) gpu::graph_exec_destroy(g);
   s.batch_commit_graphs.clear();
-  for (auto& [k, g] : s.state_commit_graphs) cudaGraphExecDestroy(g);
+  for (auto& [k, g] : s.state_commit_graphs) gpu::graph_exec_destroy(g);
   s.state_commit_graphs.clear();
 }
 
-cudaGraphExec_t Engine::capture(const std::function<void()>& body, cudaStream_t st) {
-  cudaGraph_t graph = nullptr;
+gpu::GraphExec Engine::capture(const std::function<void()>& body, gpu::Stream st) {
+  gpu::Graph graph = nullptr;
   // Thread-local: ragon-serve's other threads may make CUDA calls while the worker captures.
-  check(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
+  check(gpu::capture_begin(st, gpu::kCaptureThreadLocal), "begin capture");
   use_dev_pos_ = true;
   try {
     body();
   } catch (...) {
     use_dev_pos_ = false;
-    cudaStreamEndCapture(st, &graph);  // ends the invalidated capture
-    if (graph) cudaGraphDestroy(graph);
-    cudaGetLastError();
+    gpu::capture_end(st, &graph);  // ends the invalidated capture
+    if (graph) gpu::graph_destroy(graph);
+    gpu::last_error();
     throw;
   }
   use_dev_pos_ = false;
-  check(cudaStreamEndCapture(st, &graph), "end capture");
-  cudaGraphExec_t exec = nullptr;
-  const cudaError_t e = cudaGraphInstantiate(&exec, graph, fork_ >= 2 ? cudaGraphInstantiateFlagUseNodePriority : 0);
-  cudaGraphDestroy(graph);
+  check(gpu::capture_end(st, &graph), "end capture");
+  gpu::GraphExec exec = nullptr;
+  const gpu::Error e = gpu::graph_instantiate(&exec, graph, fork_ >= 2 ? gpu::kGraphNodePriority : 0);
+  gpu::graph_destroy(graph);
   check(e, "graph instantiate");
   return exec;
 }
 
-void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body,
-                       cudaStream_t st) {
+void Engine::run_graph(gpu::GraphExec& slot, const char* what, const std::function<void()>& body,
+                       gpu::Stream st) {
   if (!st) st = stream_;
   if (graphs_ && !slot) {
     try {
@@ -574,13 +574,13 @@ void Engine::run_graph(cudaGraphExec_t& slot, const char* what, const std::funct
   }
   if (graphs_ && slot) {
     NvtxRange range(what);  // the same names as the eager ranges, so a trace attributes graph kernels alike
-    check(cudaGraphLaunch(slot, st), what);
+    check(gpu::graph_launch(slot, st), what);
     return;
   }
   body();
 }
 
-void Engine::commit(int row0, int n, cudaStream_t st, float* out) {
+void Engine::commit(int row0, int n, gpu::Stream st, float* out) {
   const ModelConfig& c = model_->config();
   const size_t C = c.lin_conv_channels(), r0 = row0;
   for (int li = 0; li < c.layers; ++li) {
@@ -595,9 +595,9 @@ void Engine::commit(int row0, int n, cudaStream_t st, float* out) {
   }
 }
 
-void Engine::draft_context(int rows, int cap_row0, const __nv_bfloat16* src) {
+void Engine::draft_context(int rows, int cap_row0, const gpu::bf16* src) {
   const DraftConfig& d = draft_->config();
-  const __nv_bfloat16* x = src ? src : cap_ + size_t(cap_row0) * cap_stride_;  // src: rows gathered elsewhere
+  const gpu::bf16* x = src ? src : cap_ + size_t(cap_row0) * cap_stride_;  // src: rows gathered elsewhere
   // fc over the concatenated target features (already BF16), then the hidden norm. The context goes
   // straight to each layer's K and V: no input norm, no convolution (SGLang's prepare_context_hidden_for_kv).
   // A prefill's rows (quantized_) always take the BF16 GEMM, as the target's projections take the prefill path
@@ -664,7 +664,7 @@ void Engine::draft_materialize_seqs(std::span<Session* const> seqs) {
     linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, n);
     lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, n, kv);
     kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
-    kernels::SeqPtrs<__nv_bfloat16> kc, vc;
+    kernels::SeqPtrs<gpu::bf16> kc, vc;
     for (int i = 0; i < n; ++i) {
       kc.p[i] = seqs[static_cast<size_t>(i)]->dkc[l];
       vc.p[i] = seqs[static_cast<size_t>(i)]->dvc[l];
@@ -705,9 +705,9 @@ bool Engine::draft_materialize_rows(std::span<Session* const> seqs, std::span<co
   for (int i = 0; i < n;) {
     int j = i + 1;
     while (j < n && row0[j] == row0[j - 1] + rows[j - 1]) ++j;
-    check(cudaMemcpyAsync(cap_gather_ + size_t(sb.row0[i]) * cap_stride_, cap_ + size_t(row0[i]) * cap_stride_,
-                          size_t(sb.row0[j] - sb.row0[i]) * cap_stride_ * sizeof(__nv_bfloat16),
-                          cudaMemcpyDeviceToDevice, stream_),
+    check(gpu::memcpy_async(cap_gather_ + size_t(sb.row0[i]) * cap_stride_, cap_ + size_t(row0[i]) * cap_stride_,
+                          size_t(sb.row0[j] - sb.row0[i]) * cap_stride_ * sizeof(gpu::bf16),
+                          gpu::kD2D, stream_),
           "commit gather");
     i = j;
   }
@@ -724,7 +724,7 @@ bool Engine::draft_materialize_rows(std::span<Session* const> seqs, std::span<co
     linear_fp4_multi({{&L.k, dk_}, {&L.v, dv_}}, dctx_, K);
     lora_draft_site(lrows, l, LoraSite::Qkv, dctx_, d.hidden, K, kv);
     kernels::draft_qk_rope_seqs(dk_, d.kv_heads, dkv, L.k_norm, sb, d.rope_theta, d.eps, stream_);
-    kernels::SeqPtrs<__nv_bfloat16> kc, vc;
+    kernels::SeqPtrs<gpu::bf16> kc, vc;
     for (int i = 0; i < n; ++i) {
       kc.p[i] = seqs[static_cast<size_t>(i)]->dkc[l];
       vc.p[i] = seqs[static_cast<size_t>(i)]->dvc[l];
@@ -736,7 +736,7 @@ bool Engine::draft_materialize_rows(std::span<Session* const> seqs, std::span<co
   if (commit_draft_batch_ < 2) return true;
   // RAGON_COMMIT_DRAFT_BATCH=2: the ring slots just written, then each sequence's own commit over them; they must match
   // byte for byte.
-  const size_t slot_bytes = size_t(dkv) * sizeof(__nv_bfloat16);
+  const size_t slot_bytes = size_t(dkv) * sizeof(gpu::bf16);
   auto ring_rows = [&](std::vector<unsigned char>& out) {
     out.resize(size_t(K) * d.layers * 2 * slot_bytes);
     size_t o = 0;
@@ -744,13 +744,13 @@ bool Engine::draft_materialize_rows(std::span<Session* const> seqs, std::span<co
       for (int l = 0; l < d.layers; ++l)
         for (int r = 0; r < rows[i]; ++r) {
           const size_t slot = size_t((sb.pos[i] + r) % ring_) * dkv;
-          check(cudaMemcpyAsync(out.data() + o, seqs[static_cast<size_t>(i)]->dkc[l] + slot, slot_bytes,
-                                cudaMemcpyDeviceToHost, stream_), "commit check");
-          check(cudaMemcpyAsync(out.data() + o + slot_bytes, seqs[static_cast<size_t>(i)]->dvc[l] + slot, slot_bytes,
-                                cudaMemcpyDeviceToHost, stream_), "commit check");
+          check(gpu::memcpy_async(out.data() + o, seqs[static_cast<size_t>(i)]->dkc[l] + slot, slot_bytes,
+                                gpu::kD2H, stream_), "commit check");
+          check(gpu::memcpy_async(out.data() + o + slot_bytes, seqs[static_cast<size_t>(i)]->dvc[l] + slot, slot_bytes,
+                                gpu::kD2H, stream_), "commit check");
           o += 2 * slot_bytes;
         }
-    check(cudaStreamSynchronize(stream_), "commit check");
+    check(gpu::stream_sync(stream_), "commit check");
   };
   std::vector<unsigned char> batched, own;
   ring_rows(batched);
@@ -790,7 +790,7 @@ void Engine::draft_launch(int B, bool sparse) {
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
   const int K16 = d.selector_top_k;
-  check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, B * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
+  check(gpu::memcpy_async(ids_dev_, pin_->draft_ids, B * sizeof(int), gpu::kH2D, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, B, H, dres_, stream_);
   Session* const self[1] = {s_};
   const int nrows[1] = {B};
@@ -839,9 +839,9 @@ void Engine::draft_launch(int B, bool sparse) {
   linear_bf16_drafter(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
-  check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(E) * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+  check(gpu::memcpy_async(pin_->cand, dcand_, size_t(E) * K16 * sizeof(int), gpu::kD2H, stream_),
         "draft candidates");
-  check(cudaMemcpyAsync(pin_->scores, dscores_, size_t(E) * K16 * K16 * sizeof(float), cudaMemcpyDeviceToHost,
+  check(gpu::memcpy_async(pin_->scores, dscores_, size_t(E) * K16 * K16 * sizeof(float), gpu::kD2H,
                         stream_),
         "draft scores");
 }
@@ -861,7 +861,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
     sb.pos[i] = plans[i].s->pos;
   }
   if (use_dev_pos_) sb.pos_dev = pos_dev_;
-  check(cudaMemcpyAsync(ids_dev_, pin_->draft_ids, R * sizeof(int), cudaMemcpyHostToDevice, stream_), "draft ids");
+  check(gpu::memcpy_async(ids_dev_, pin_->draft_ids, R * sizeof(int), gpu::kH2D, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, R, H, dres_, stream_);
   Session* seqs[kernels::kMaxSeqs] = {};
   int nrows[kernels::kMaxSeqs] = {};
@@ -881,7 +881,7 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
   o.ld[0] = H;
   for (int l = 0; l < d.layers; ++l) {
     const DraftLayer& L = draft_->layers()[l];
-    kernels::SeqPtrs<const __nv_bfloat16> kc, vc;
+    kernels::SeqPtrs<const gpu::bf16> kc, vc;
     for (int i = 0; i < n; ++i) {
       kc.p[i] = plans[i].s->dkc[l];
       vc.p[i] = plans[i].s->dvc[l];
@@ -927,9 +927,9 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
     kernels::selector_lattice(dhp_ + size_t(i) * E * rank, dcand_ + size_t(i) * E * K16, dunary_ + size_t(i) * E * K16,
                               draft_->predecessor_codebook(), draft_->successor_codebook(), pin_->draft_ids[i * B], E,
                               dscores_ + size_t(i) * E * K16 * K16, stream_, ids_dev_ + i * B);
-  check(cudaMemcpyAsync(pin_->cand, dcand_, size_t(n) * E * K16 * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+  check(gpu::memcpy_async(pin_->cand, dcand_, size_t(n) * E * K16 * sizeof(int), gpu::kD2H, stream_),
         "draft candidates");
-  check(cudaMemcpyAsync(pin_->scores, dscores_, size_t(n) * E * K16 * K16 * sizeof(float), cudaMemcpyDeviceToHost,
+  check(gpu::memcpy_async(pin_->scores, dscores_, size_t(n) * E * K16 * K16 * sizeof(float), gpu::kD2H,
                         stream_),
         "draft scores");
 }
@@ -942,7 +942,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
   else draft_launch(B, sparse);
   s_->sh_last_sparse = sparse;
   if (sparse) ++s_->spec.sparse_steps;
-  check(cudaStreamSynchronize(stream_), "draft");
+  check(gpu::stream_sync(stream_), "draft");
   // BACKLOG 19's offline input (bench/sparse_head): RAGON_DUMP_DRAFT_H=FILE appends each one-stream draft's rows' final
   // hidden states (E x hidden floats, the LM head's input) and their top-16 candidates (E x 16 ints).
   static FILE* dump = [] { const char* f = std::getenv("RAGON_DUMP_DRAFT_H"); return f ? std::fopen(f, "ab") : nullptr; }();
@@ -950,7 +950,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
   if (dump && dump_left-- > 0) {
     const int E = B - 1, H = draft_->config().hidden, K16 = draft_->config().selector_top_k;
     std::vector<float> h(size_t(E) * H);
-    check(cudaMemcpy(h.data(), dh_, h.size() * sizeof(float), cudaMemcpyDeviceToHost), "dump");
+    check(gpu::memcpy_sync(h.data(), dh_, h.size() * sizeof(float), gpu::kD2H), "dump");
     const int hdr[3] = {E, H, K16};
     std::fwrite(hdr, sizeof(int), 3, dump);
     std::fwrite(h.data(), sizeof(float), h.size(), dump);
@@ -962,7 +962,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
 void Engine::verify_launch(int V, int K, bool tree, bool masked) {
   const ModelConfig& c = model_->config();
   if (tree) {  // the tree's description (BACKLOG 26), read by the attention and DeltaNet kernels of this pass
-    check(cudaMemcpyAsync(tree_dev_, &pin_->tree[0], sizeof(kernels::TreeDesc), cudaMemcpyHostToDevice, stream_), "tree");
+    check(gpu::memcpy_async(tree_dev_, &pin_->tree[0], sizeof(kernels::TreeDesc), gpu::kH2D, stream_), "tree");
     tree_ = tree_dev_;
   }
   try {
@@ -973,7 +973,7 @@ void Engine::verify_launch(int V, int K, bool tree, bool masked) {
   }
   tree_ = nullptr;
   if (masked) {  // structured output: each row's mask (plan_walk wrote mask_pin_'s first V rows)
-    check(cudaMemcpyAsync(mask_dev_, mask_pin_, size_t(V) * mask_words_ * sizeof(int32_t), cudaMemcpyHostToDevice,
+    check(gpu::memcpy_async(mask_dev_, mask_pin_, size_t(V) * mask_words_ * sizeof(int32_t), gpu::kH2D,
                           stream_),
           "masks");
     kernels::topk_rows_masked(logits_dev_, V, c.vocab, K, mask_dev_, mask_words_, topk_scratch_, vals_dev_,
@@ -982,9 +982,9 @@ void Engine::verify_launch(int V, int K, bool tree, bool masked) {
     kernels::topk_rows(logits_dev_, V, c.vocab, K, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
   }
   // The values too when greedy (V floats): the host checks them for NaN and inf after the step.
-  check(cudaMemcpyAsync(pin_->topk_vals, vals_dev_, size_t(V) * K * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+  check(gpu::memcpy_async(pin_->topk_vals, vals_dev_, size_t(V) * K * sizeof(float), gpu::kD2H, stream_),
         "topk");
-  check(cudaMemcpyAsync(pin_->topk_ids, ids_out_dev_, size_t(V) * K * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+  check(gpu::memcpy_async(pin_->topk_ids, ids_out_dev_, size_t(V) * K * sizeof(int), gpu::kD2H, stream_),
         "topk");
 }
 
@@ -995,7 +995,7 @@ void Engine::commit_launch(int row0, int n) {
   draft_materialize(n, dpos(), row0);  // the verify's target features of those rows
 }
 
-void Engine::commit_state_launch(int row0, int n, cudaStream_t st) {
+void Engine::commit_state_launch(int row0, int n, gpu::Stream st) {
   NvtxRange range("commit state");
   commit(row0, n, st, commit_core_);
 }
@@ -1008,7 +1008,7 @@ void Engine::commit_state_async(int row0, int n, bool graph) {
   if (graph) run_graph(s_->state_commit_graphs[{row0, n}], "commit state", [&] { commit_state_launch(row0, n, commit_stream_); },
                        commit_stream_);
   else commit_state_launch(row0, n, commit_stream_);
-  check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
+  check(gpu::event_record(commit_done_, commit_stream_), "commit event");
   commit_pending_ = true;
 }
 
@@ -1049,8 +1049,8 @@ void Engine::plan_draft(StepPlan& sp, int B, bool graph) {
     const int E = B - 1;
     sp.hidden.resize(size_t(E) * d.hidden);
     sp.sel.resize(size_t(E) * d.selector_rank);
-    check(cudaMemcpy(sp.hidden.data(), dh_, sp.hidden.size() * sizeof(float), cudaMemcpyDeviceToHost), "hidden dump");
-    check(cudaMemcpy(sp.sel.data(), dhp_, sp.sel.size() * sizeof(float), cudaMemcpyDeviceToHost), "selector dump");
+    check(gpu::memcpy_sync(sp.hidden.data(), dh_, sp.hidden.size() * sizeof(float), gpu::kD2H), "hidden dump");
+    check(gpu::memcpy_sync(sp.sel.data(), dhp_, sp.sel.size() * sizeof(float), gpu::kD2H), "selector dump");
   }
   plan_walk(sp, B, pin_->cand, pin_->scores);
 }
@@ -1151,10 +1151,10 @@ void Engine::plan_gather(StepPlan& sp) {
   for (int j = 0; j < n; ++j) moved = moved || sp.path[j] != j;
   if (moved) {
     std::copy(sp.path.begin(), sp.path.end(), pin_->gather_rows);
-    check(cudaMemcpyAsync(gather_rows_dev_, pin_->gather_rows, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+    check(gpu::memcpy_async(gather_rows_dev_, pin_->gather_rows, n * sizeof(int), gpu::kH2D, stream_),
           "tree path");
     kernels::tree_gather(sp.s->gather, sp.s->ngather, gather_rows_dev_, n, kernels::DevPos(sp.s->pos), stream_, sp.row0);
-    check(cudaStreamSynchronize(stream_), "tree gather");
+    check(gpu::stream_sync(stream_), "tree gather");
   }
   std::vector<int> toks(n);
   for (int j = 0; j < n; ++j) toks[j] = sp.tr.token[sp.path[j]];
@@ -1339,12 +1339,12 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   plan_fixed(sp);  // structured output: the lookup chain's masks (pad rows included)
   if (graph) {  // the position every graph of this step reads
     pin_->pos = s_->pos;
-    check(cudaMemcpyAsync(pos_dev_, &pin_->pos, sizeof(int), cudaMemcpyHostToDevice, stream_), "position");
+    check(gpu::memcpy_async(pos_dev_, &pin_->pos, sizeof(int), gpu::kH2D, stream_), "position");
     pin_->rdelta = s_->rope_delta;  // the rope delta after the prompt's images (VISION §20.3 (b))
-    check(cudaMemcpyAsync(rdelta_dev_, &pin_->rdelta, sizeof(int), cudaMemcpyHostToDevice, stream_), "rope delta");
+    check(gpu::memcpy_async(rdelta_dev_, &pin_->rdelta, sizeof(int), gpu::kH2D, stream_), "rope delta");
     if (lora_seq_dev_) {  // and its adapter's slot (LORA §3)
       pin_->lora_slot[0] = s_->lora_slot;
-      check(cudaMemcpyAsync(lora_seq_dev_, pin_->lora_slot, sizeof(int), cudaMemcpyHostToDevice, stream_), "lora slot");
+      check(gpu::memcpy_async(lora_seq_dev_, pin_->lora_slot, sizeof(int), gpu::kH2D, stream_), "lora slot");
     }
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
@@ -1358,13 +1358,13 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
   join_commit();  // the previous step's DeltaNet replay, beside this step's draft until here
   if (graph) {
-    cudaGraphExec_t& g = sp.masked ? s_->masked_verify_graphs[2 * K + (sp.tree ? 1 : 0)]
+    gpu::GraphExec& g = sp.masked ? s_->masked_verify_graphs[2 * K + (sp.tree ? 1 : 0)]
                                    : (sp.tree ? s_->tree_verify_graphs : s_->verify_graphs)[K];
     run_graph(g, "verify", [&] { verify_launch(V, K, sp.tree, sp.masked); });
   } else {
     verify_launch(V, K, sp.tree, sp.masked);
   }
-  check(cudaStreamSynchronize(stream_), "verify");
+  check(gpu::stream_sync(stream_), "verify");
   plan_accept(sp, pin_->topk_vals, pin_->topk_ids);  // 3. accept
   if (sp.tree) plan_gather(sp);
   if (std::FILE* f = dump_file(); f && !sp.use_lookup && !sp.tree) {
@@ -1394,10 +1394,10 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   if (row_logits) {  // the rows the returned tokens were chosen from: row i chose rows[i + 1], row accepted chose next
     const size_t vocab = model_->config().vocab;
     row_logits->resize(size_t(n) * vocab);
-    check(cudaMemcpyAsync(row_logits->data(), logits_dev_, size_t(n) * vocab * sizeof(float), cudaMemcpyDeviceToHost,
+    check(gpu::memcpy_async(row_logits->data(), logits_dev_, size_t(n) * vocab * sizeof(float), gpu::kD2H,
                           stream_),
           "row logits");
-    check(cudaStreamSynchronize(stream_), "row logits");
+    check(gpu::stream_sync(stream_), "row logits");
   }
   if (commit_overlap_) commit_state_async(0, n, graph);
   if (graph) {
@@ -1408,7 +1408,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   }
   s_->history.insert(s_->history.end(), sp.rows.begin(), sp.rows.begin() + n);
   s_->pos += n;
-  check(cudaStreamSynchronize(stream_), "commit");
+  check(gpu::stream_sync(stream_), "commit");
   s_->spec.commit_seconds += seconds_since(t2);
   plan_count(sp);
 
@@ -1439,7 +1439,7 @@ void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
   for (size_t i = 0; i < plans.size(); ++i) {
     const StepPlan& sp = plans[i];
     if (sp.tree)  // read by the state kernels of this pass, as verify_launch's is
-      check(cudaMemcpyAsync(tree_dev_ + i, &pin_->tree[i], sizeof(kernels::TreeDesc), cudaMemcpyHostToDevice, stream_),
+      check(gpu::memcpy_async(tree_dev_ + i, &pin_->tree[i], sizeof(kernels::TreeDesc), gpu::kH2D, stream_),
             "tree");
     segs.push_back({sp.s, sp.row0, sp.V, sp.tree ? tree_dev_ + i : nullptr});
   }
@@ -1455,7 +1455,7 @@ void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
     const size_t at = sp.topk_at, n = size_t(rows) * sp.K;
     if (sp.masked) {
       int32_t* dev = mask_dev_ + size_t(sp.row0) * mask_words_;
-      check(cudaMemcpyAsync(dev, sp.mask, size_t(sp.V) * mask_words_ * sizeof(int32_t), cudaMemcpyHostToDevice,
+      check(gpu::memcpy_async(dev, sp.mask, size_t(sp.V) * mask_words_ * sizeof(int32_t), gpu::kH2D,
                             stream_),
             "masks");
       kernels::topk_rows_masked(logits_dev_ + size_t(sp.row0) * c.vocab, sp.V, c.vocab, sp.K, dev, mask_words_,
@@ -1464,9 +1464,9 @@ void Engine::verify_batch_launch(std::span<StepPlan> plans, int V) {
       kernels::topk_rows(logits_dev_ + size_t(sp.row0) * c.vocab, rows, c.vocab, sp.K, topk_scratch_, vals_dev_ + at,
                          ids_out_dev_ + at, stream_);
     }
-    check(cudaMemcpyAsync(pin_->topk_vals + at, vals_dev_ + at, n * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+    check(gpu::memcpy_async(pin_->topk_vals + at, vals_dev_ + at, n * sizeof(float), gpu::kD2H, stream_),
           "topk");
-    check(cudaMemcpyAsync(pin_->topk_ids + at, ids_out_dev_ + at, n * sizeof(int), cudaMemcpyDeviceToHost, stream_),
+    check(gpu::memcpy_async(pin_->topk_ids + at, ids_out_dev_ + at, n * sizeof(int), gpu::kD2H, stream_),
           "topk");
   }
 }
@@ -1575,13 +1575,13 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
   BatchGraphs* bg = graph ? &batch_graphs_[order] : nullptr;
   if (graph) {  // the positions every graph of this step reads
     for (int i = 0; i < n; ++i) pin_->seq_pos[i] = plans[i].s->pos;
-    check(cudaMemcpyAsync(pos_dev_, pin_->seq_pos, n * sizeof(int), cudaMemcpyHostToDevice, stream_), "positions");
+    check(gpu::memcpy_async(pos_dev_, pin_->seq_pos, n * sizeof(int), gpu::kH2D, stream_), "positions");
     for (int i = 0; i < n; ++i) pin_->seq_rdelta[i] = plans[i].s->rope_delta;
-    check(cudaMemcpyAsync(rdelta_dev_, pin_->seq_rdelta, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+    check(gpu::memcpy_async(rdelta_dev_, pin_->seq_rdelta, n * sizeof(int), gpu::kH2D, stream_),
           "rope deltas");
     if (lora_seq_dev_) {
       for (int i = 0; i < n; ++i) pin_->lora_slot[i] = plans[i].s->lora_slot;
-      check(cudaMemcpyAsync(lora_seq_dev_, pin_->lora_slot, n * sizeof(int), cudaMemcpyHostToDevice, stream_),
+      check(gpu::memcpy_async(lora_seq_dev_, pin_->lora_slot, n * sizeof(int), gpu::kH2D, stream_),
             "lora slots");
     }
   }
@@ -1610,7 +1610,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       plans[i].s->sh_last_sparse = si;
       if (si) ++plans[i].s->spec.sparse_steps;
     }
-    check(cudaStreamSynchronize(stream_), "draft");
+    check(gpu::stream_sync(stream_), "draft");
     // BACKLOG 26: each sequence's tree, as it takes one alone, while the rows left hold the sequences after it. At the
     // default shape two trees fit the tier (2 x 16 rows); a batch with a lookup chain verifies chains. RAGON_TREE_BATCH
     // sets the share per batch size (tree_nodes_for).
@@ -1697,7 +1697,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     }
     if (!take) pend = {};
     // From pageable memory: the copy is staged before the call returns, so pend may go.
-    check(cudaMemcpyAsync(pend_dev_, pend.data(), sizeof(pend), cudaMemcpyHostToDevice, stream_), "pending rows");
+    check(gpu::memcpy_async(pend_dev_, pend.data(), sizeof(pend), gpu::kH2D, stream_), "pending rows");
     if (take) {
       gdn_deferred_ = false;  // this verify replays them
       ++gdn_fused_verifies_;
@@ -1718,7 +1718,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     verify_batch_launch(plans, V);
   }
   fused_off.reset();
-  check(cudaStreamSynchronize(stream_), "verify");
+  check(gpu::stream_sync(stream_), "verify");
   for (size_t i = 0; i < plans.size(); ++i) {
     StepPlan& sp = plans[i];
     const size_t at = sp.topk_at;
@@ -1748,8 +1748,8 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     if (sp.failed || !seqs[i].row_logits) continue;
     const int k = sp.accepted + 1;
     seqs[i].row_logits->resize(size_t(k) * vocab);
-    check(cudaMemcpyAsync(seqs[i].row_logits->data(), logits_dev_ + size_t(sp.row0) * vocab,
-                          size_t(k) * vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+    check(gpu::memcpy_async(seqs[i].row_logits->data(), logits_dev_ + size_t(sp.row0) * vocab,
+                          size_t(k) * vocab * sizeof(float), gpu::kD2H, stream_),
           "row logits");
   }
   // With the commit beside the next draft, every sequence's DeltaNet replay in one launch per kernel and layer: one
@@ -1796,7 +1796,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
       // Slot i's commit reads its position from pos_dev_[i] and its rows from row0 (which depends on whether the
       // sequences before it took trees); slot 0's is the one-row step's own commit graph (the same rows, the same
       // position slot).
-      cudaGraphExec_t* g = nullptr;
+      gpu::GraphExec* g = nullptr;
       if (i == 0) {
         const size_t count = size_t(std::max(B, sp.V)) + 1;
         if (s_->commit_graphs.size() < count) s_->commit_graphs.resize(count, nullptr);
@@ -1818,7 +1818,7 @@ void Engine::speculate_batch(std::span<SeqStep> seqs) {
     sp.s->history.insert(sp.s->history.end(), sp.rows.begin(), sp.rows.begin() + k);
     sp.s->pos += k;
   }
-  check(cudaStreamSynchronize(stream_), "commit");
+  check(gpu::stream_sync(stream_), "commit");
   const double draft_s = std::chrono::duration<double>(t1 - t0).count();
   const double verify_s = std::chrono::duration<double>(t2 - t1).count(), commit_s = seconds_since(t2);
   for (size_t i = 0; i < plans.size(); ++i) {

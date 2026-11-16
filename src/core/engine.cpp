@@ -1,7 +1,10 @@
 #include "core/engine.hpp"
 
-#include <cuda.h>
-#include <nvtx3/nvToolsExt.h>
+#if !defined(RAGON_BACKEND_HIP)
+#include <cuda.h>  // the driver API, for the green contexts only (gpu::kGreenContexts)
+#endif
+
+#include "backend/trace.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -18,15 +21,16 @@
 namespace ragon {
 namespace {
 
-void check(cudaError_t e, const char* what) {
-  if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const char* what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(std::string(what) + ": " + gpu::error_string(e));
 }
 
 struct NvtxRange {
-  explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
-  ~NvtxRange() { nvtxRangePop(); }
+  explicit NvtxRange(const char* name) { gpu::range_push(name); }
+  ~NvtxRange() { gpu::range_pop(); }
 };
 
+#if !defined(RAGON_BACKEND_HIP)
 void check_cu(CUresult r, const char* what) {
   if (r != CUDA_SUCCESS) {
     const char* m = nullptr;
@@ -34,15 +38,25 @@ void check_cu(CUresult r, const char* what) {
     throw std::runtime_error(std::string(what) + ": " + (m ? m : "?"));
   }
 }
+#endif
 
 // The side pass's stream (EngineOptions::side_prefill): on a green context of `sms` SMs (its kernels then run on
 // those SMs only, while the main stream's work takes any SM), or a plain non-blocking stream when sms < 0.
-cudaStream_t make_side_stream(int sms, void** green) {
+gpu::Stream make_side_stream(int sms, void** green) {
   if (sms < 0) {
-    cudaStream_t st;
-    check(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "side stream");
+    gpu::Stream st;
+    check(gpu::stream_create(&st, gpu::kStreamNonBlocking), "side stream");
     return st;
   }
+#if defined(RAGON_BACKEND_HIP)
+  // No green contexts on HIP (BACKEND §4, kGreenContexts false): one context, so the side pass runs on a plain
+  // non-blocking stream, as with sms < 0. The outputs are the same; only the SM split is gone.
+  *green = nullptr;
+  std::fprintf(stderr, "side stream: no green contexts on %s; a plain stream instead of %d SMs\n", gpu::kName, sms);
+  gpu::Stream st;
+  check(gpu::stream_create(&st, gpu::kStreamNonBlocking), "side stream");
+  return st;
+#else
   CUdevice dev;
   CUdevResource all, part, rest;
   unsigned groups = 1;
@@ -58,12 +72,17 @@ cudaStream_t make_side_stream(int sms, void** green) {
   check_cu(cuGreenCtxStreamCreate(&st, g, CU_STREAM_NON_BLOCKING, 0), "cuGreenCtxStreamCreate");
   *green = g;
   std::fprintf(stderr, "side stream: green context of %u of %u SMs\n", part.sm.smCount, all.sm.smCount);
-  return reinterpret_cast<cudaStream_t>(st);
+  return reinterpret_cast<gpu::Stream>(st);
+#endif
 }
 
-void destroy_side_stream(cudaStream_t st, void* green) {
-  cudaStreamDestroy(st);
+void destroy_side_stream(gpu::Stream st, void* green) {
+  gpu::stream_destroy(st);
+#if !defined(RAGON_BACKEND_HIP)
   if (green) cuGreenCtxDestroy(static_cast<CUgreenCtx>(green));
+#else
+  (void)green;
+#endif
 }
 
 }  // namespace
@@ -71,15 +90,15 @@ void destroy_side_stream(cudaStream_t st, void* green) {
 template <typename T>
 T* Engine::alloc(size_t count) {
   void* p = nullptr;
-  check(cudaMalloc(&p, std::max<size_t>(count, 1) * sizeof(T)), "cudaMalloc buffer");
-  check(cudaMemset(p, 0, std::max<size_t>(count, 1) * sizeof(T)), "cudaMemset buffer");
+  check(gpu::device_alloc(&p, std::max<size_t>(count, 1) * sizeof(T)), "cudaMalloc buffer");
+  check(gpu::memset_sync(p, 0, std::max<size_t>(count, 1) * sizeof(T)), "cudaMemset buffer");
   buffers_.push_back(p);
   return static_cast<T*>(p);
 }
 template float* Engine::alloc<float>(size_t);
 template int* Engine::alloc<int>(size_t);
-template __half* Engine::alloc<__half>(size_t);
-template __nv_bfloat16* Engine::alloc<__nv_bfloat16>(size_t);
+template gpu::half* Engine::alloc<gpu::half>(size_t);
+template gpu::bf16* Engine::alloc<gpu::bf16>(size_t);
 template uint8_t* Engine::alloc<uint8_t>(size_t);
 template uint64_t* Engine::alloc<uint64_t>(size_t);
 
@@ -114,20 +133,20 @@ void Engine::alloc_scratch() {
   attn_scratch_ = alloc<float>(kernels::attention_rows_scratch_floats(std::max(kAttnSlice, kernels::kMaxStreamRows),
                                                                       c.heads, c.head_dim, opts_.max_context));
   logits_dev_ = alloc<float>(size_t(kernels::kMaxStreamRows) * c.vocab);
-  xh_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, std::max(c.hidden, std::max(C, qsize))));
+  xh_ = alloc<gpu::half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, std::max(c.hidden, std::max(C, qsize))));
   xinv_ = alloc<float>(kernels::kMaxStreamRows);
-  x_bf16_ = alloc<__nv_bfloat16>(M * std::max(c.intermediate, std::max(c.hidden, C)));
+  x_bf16_ = alloc<gpu::bf16>(M * std::max(c.intermediate, std::max(c.hidden, C)));
   const size_t widest = std::max<size_t>(c.intermediate, std::max(c.hidden, std::max(C, 2 * qsize)));
   xq_ = alloc<uint8_t>(M * widest);         // FP8 activations, or NVFP4 in the first half
   xsf_ = alloc<uint8_t>(M * widest / 16);  // NVFP4 block scales
   xq2_ = alloc<uint8_t>(M * c.intermediate / 2);  // the FFN's fused gate/up output (the down projection's input)
   xsf2_ = alloc<uint8_t>(M * c.intermediate / 16);
   // --prefill-bf16's tensors live in the FP32 buffers they replace (each BF16 [M][n] fits its FP32 [M][n]).
-  xn_bf16_ = reinterpret_cast<__nv_bfloat16*>(xn_);
-  t2_bf16_ = reinterpret_cast<__nv_bfloat16*>(t2_);
-  z_bf16_ = reinterpret_cast<__nv_bfloat16*>(z_);
-  mixed_bf16_ = reinterpret_cast<__nv_bfloat16*>(mixed_);
-  core_bf16_ = reinterpret_cast<__nv_bfloat16*>(core_);
+  xn_bf16_ = reinterpret_cast<gpu::bf16*>(xn_);
+  t2_bf16_ = reinterpret_cast<gpu::bf16*>(t2_);
+  z_bf16_ = reinterpret_cast<gpu::bf16*>(z_);
+  mixed_bf16_ = reinterpret_cast<gpu::bf16*>(mixed_);
+  core_bf16_ = reinterpret_cast<gpu::bf16*>(core_);
   ids_dev_ = alloc<int>(M);
 }
 
@@ -138,38 +157,38 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     opts_.prefill_chunk = std::max(kResumeAlign, std::atoi(e) - std::atoi(e) % kResumeAlign);
   model_ = std::make_unique<Model>(model_dir);
   const ModelConfig& c = model_->config();
-  check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
+  check(gpu::stream_create(&stream_, gpu::kStreamNonBlocking), "stream");
 
   const int C = c.lin_conv_channels(), Vs = c.lin_value_size();
   const int kvsize = c.kv_heads * c.head_dim;
   alloc_scratch();
   pos_dev_ = alloc<int>(kernels::kMaxSeqs);
   rdelta_dev_ = alloc<int>(kernels::kMaxSeqs);
-  check(cudaMemset(rdelta_dev_, 0, kernels::kMaxSeqs * sizeof(int)), "rope deltas");
+  check(gpu::memset_sync(rdelta_dev_, 0, kernels::kMaxSeqs * sizeof(int)), "rope deltas");
   if (opts_.lora_slots > 0) lora_alloc();
   mrope_dev_ = alloc<int>(size_t(std::max(opts_.prefill_chunk, kernels::kMaxStreamRows)) * 3);
   // The vision tower and the embedding cache's reserve (VISION §20.4), before the prefix KV store sizes itself.
   if (opts_.vision) {
     const int max_patches = static_cast<int>(std::min<long>(opts_.vision_max_pixels / 256, 1 << 20)) & ~3;
     vision_ = std::make_unique<VisionTower>(model_dir, max_patches);
-    cudaMemPoolProps props{};
-    props.allocType = cudaMemAllocationTypePinned;
-    props.location.type = cudaMemLocationTypeDevice;
-    check(cudaGetDevice(&props.location.id), "device");
-    check(cudaMemPoolCreate(&emb_pool_, &props), "embedding cache");
+    gpu::MemPoolProps props{};
+    props.allocType = gpu::kAllocPinned;
+    props.location.type = gpu::kLocationDevice;
+    check(gpu::get_device(&props.location.id), "device");
+    check(gpu::pool_create(&emb_pool_, &props), "embedding cache");
     uint64_t keep_all = ~uint64_t(0);
-    check(cudaMemPoolSetAttribute(emb_pool_, cudaMemPoolAttrReleaseThreshold, &keep_all), "embedding cache");
+    check(gpu::pool_set_attribute(emb_pool_, gpu::kPoolReleaseThreshold, &keep_all), "embedding cache");
     emb_cap_ = size_t(std::max(opts_.vision_cache_mb, 0)) << 20;
     if (emb_cap_) {  // reserve it now: the pool keeps what was freed
       void* p = nullptr;
-      check(cudaMallocFromPoolAsync(&p, emb_cap_, emb_pool_, stream_), "embedding cache");
-      check(cudaFreeAsync(p, stream_), "embedding cache");
-      check(cudaStreamSynchronize(stream_), "embedding cache");
+      check(gpu::pool_alloc_async(&p, emb_cap_, emb_pool_, stream_), "embedding cache");
+      check(gpu::free_async(p, stream_), "embedding cache");
+      check(gpu::stream_sync(stream_), "embedding cache");
     }
     std::fprintf(stderr, "vision: tower %zu MB, scratch %zu MB for %d patches, embedding cache %zu MB\n",
                  vision_->weight_bytes() >> 20, vision_->scratch_bytes() >> 20, max_patches, emb_cap_ >> 20);
   }
-  check(cudaHostAlloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), cudaHostAllocDefault), "pinned step buffers");
+  check(gpu::host_alloc(reinterpret_cast<void**>(&pin_), sizeof(StepPinned), gpu::kHostAllocDefault), "pinned step buffers");
   kernels::prepare_kernels();  // attributes are set here, never inside a graph capture
 
   // The prefix KV store's arena (BACKLOG 35): one allocation made at start, so the store's footprint is fixed and never
@@ -186,14 +205,14 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   auto alloc_store_arena = [&] {
     if (!store_asked) return;
     size_t total_b = 0;
-    check(cudaMemGetInfo(&store_free, &total_b), "memory info");
+    check(gpu::mem_info(&store_free, &total_b), "memory info");
     const size_t want = size_t(store_mb) << 20, avail = store_free > store_reserve ? store_free - store_reserve : 0;
     size_t size = std::min(want, avail);
     size -= size % (size_t(2) << 20);
-    if (size >= (size_t(512) << 20) && cudaMalloc(&kv_arena_base_, size) == cudaSuccess) {
+    if (size >= (size_t(512) << 20) && gpu::device_alloc(&kv_arena_base_, size) == gpu::kSuccess) {
       store_size = size;
     } else {
-      cudaGetLastError();
+      gpu::last_error();
       kv_arena_base_ = nullptr;
     }
   };
@@ -225,10 +244,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     kv_head_stride_ = kv_head_major_ ? (size_t(pool_pages) + 1) * PT * c.head_dim : size_t(PT) * c.head_dim;
     kv_page_unit_ = kv_head_major_ ? size_t(PT) * c.head_dim : kv_page_elems_;
     kernels::set_kv_layout(kv_head_stride_, c.head_dim);
-    kv_pool_ = alloc<__nv_bfloat16>(kv_page_elems_ * (size_t(pool_pages) + 1));
-    check(cudaMemset(kv_pool_, 0, kv_page_elems_ * (size_t(pool_pages) + 1) * sizeof(__nv_bfloat16)), "KV pool");
+    kv_pool_ = alloc<gpu::bf16>(kv_page_elems_ * (size_t(pool_pages) + 1));
+    check(gpu::memset_sync(kv_pool_, 0, kv_page_elems_ * (size_t(pool_pages) + 1) * sizeof(gpu::bf16)), "KV pool");
     kv_book_ = std::make_unique<KvPool>(pool_pages + 1);
-    for (cudaEvent_t& ev : kv_release_ev_) check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "KV release");
+    for (gpu::Event& ev : kv_release_ev_) check(gpu::event_create_flags(&ev, gpu::kEventDisableTiming), "KV release");
     std::fprintf(stderr,
                  "KV pool: %.2f GB, %d pages of %d positions (%.1f MB each), %ld positions; %d pages map one session at "
                  "max_context\n",
@@ -249,11 +268,11 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       // Every entry at page 0 until a pass maps the page (kv_ensure).
       s.page_host.assign(pages_per_session, 0);
       s.pages = alloc<uint64_t>(pages_per_session);
-      check(cudaMemset(s.pages, 0, pages_per_session * sizeof(uint64_t)), "KV page table");
+      check(gpu::memset_sync(s.pages, 0, pages_per_session * sizeof(uint64_t)), "KV page table");
     } else {
       for (int i = 0; i < n_full; ++i) {
-        s.kcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
-        s.vcache.push_back(alloc<__nv_bfloat16>(size_t(opts_.max_context) * kvsize));
+        s.kcache.push_back(alloc<gpu::bf16>(size_t(opts_.max_context) * kvsize));
+        s.vcache.push_back(alloc<gpu::bf16>(size_t(opts_.max_context) * kvsize));
       }
     }
     for (int i = 0; i < n_linear_; ++i) {
@@ -323,7 +342,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
         const size_t pages = size_t(kv_book_->capacity()) + 1;  // ids 1..capacity (page 0 reserved)
         kv_mirror_ = alloc<uint8_t>(kv_page_elems_ * pages);
         kv_sealed_ = alloc<uint8_t>(pages);
-        check(cudaMemset(kv_sealed_, 0, pages), "KV seal flags");
+        check(gpu::memset_sync(kv_sealed_, 0, pages), "KV seal flags");
         kv_sealed_host_.assign(pages, 0);
         const size_t lkv = size_t(c.kv_heads) * kv_head_stride_;
         for (int i = 0; i < n_full; ++i) {
@@ -343,7 +362,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
       kv_calib_path_ = e;
       kv_amax_slots_ = n_full;
       kv_amax_ = alloc<float>(size_t(n_full) * 2);
-      check(cudaMemset(kv_amax_, 0, size_t(n_full) * 2 * sizeof(float)), "KV calibration");
+      check(gpu::memset_sync(kv_amax_, 0, size_t(n_full) * 2 * sizeof(float)), "KV calibration");
       std::fprintf(stderr, "kv-calib: recording the per-layer K/V maxima into %s\n", e);
     }
   }
@@ -357,8 +376,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("RAGON_COMMIT_OVERLAP")) commit_overlap_ = draft_ != nullptr && std::atoi(e) != 0;
   if (const char* e = std::getenv("RAGON_COMMIT_STATE_BATCH")) commit_state_batch_ = std::atoi(e) != 0;
   if (commit_overlap_) {
-    check(cudaStreamCreateWithFlags(&commit_stream_, cudaStreamNonBlocking), "commit stream");
-    check(cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming), "commit event");
+    check(gpu::stream_create(&commit_stream_, gpu::kStreamNonBlocking), "commit stream");
+    check(gpu::event_create_flags(&commit_done_, gpu::kEventDisableTiming), "commit event");
     commit_core_ = alloc<float>(size_t(kernels::kMaxStreamRows) * Vs);
     std::fprintf(stderr, "commit beside the next draft\n");
   }
@@ -366,8 +385,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("RAGON_MK_GDN_FUSED")) gdn_fused_ = commit_overlap_ && commit_state_batch_ && std::atoi(e);
   if (gdn_fused_) {
     pend_dev_ = alloc<int>(2 * kernels::kMaxSeqs);
-    check(cudaMemset(pend_dev_, 0, 2 * kernels::kMaxSeqs * sizeof(int)), "pending rows");
-    check(cudaEventCreateWithFlags(&pend_free_, cudaEventDisableTiming), "pending event");
+    check(gpu::memset_sync(pend_dev_, 0, 2 * kernels::kMaxSeqs * sizeof(int)), "pending rows");
+    check(gpu::event_create_flags(&pend_free_, gpu::kEventDisableTiming), "pending event");
     const size_t B = kernels::kMaxStreamRows;
     for (size_t i = 0; i < s_->gdn.size(); ++i) {  // the commit's kept rows, as v_post_, v_g_ and v_beta_
       p_post_.push_back(alloc<float>(B * c.lin_conv_channels()));
@@ -382,9 +401,9 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("RAGON_MK_LAYERS")) mk_layers_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_SPAN")) mk_span_ = std::atoi(e);
   if (mk_span_ > 0) {  // the spanning kernel's own FP16 copies (see kernels::gdn_ffn_persistent)
-    xh3_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.hidden);
+    xh3_ = alloc<gpu::half>(size_t(kernels::kMaxStreamRows) * c.hidden);
     xinv3_ = alloc<float>(kernels::kMaxStreamRows);
-    xh4_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * c.intermediate);
+    xh4_ = alloc<gpu::half>(size_t(kernels::kMaxStreamRows) * c.intermediate);
     xinv4_ = alloc<float>(kernels::kMaxStreamRows);
     std::fprintf(stderr, "megakernel stage 4: a verify's DeltaNet mixer and FFN in one launch (RAGON_MK_SPAN=%d)\n",
                  mk_span_);
@@ -393,31 +412,31 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     std::fprintf(stderr, "megakernel stage 4: the residual adds and the next norms inside the persistent kernels "
                          "(RAGON_MK_LAYERS=%d)\n", mk_layers_);
   if (mk_ffn_ > 0 || mk_gdn_ > 0 || mk_attn_ > 0) {
-    xh2_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, Vs));
+    xh2_ = alloc<gpu::half>(size_t(kernels::kMaxStreamRows) * std::max(c.intermediate, Vs));
     xinv2_ = alloc<float>(kernels::kMaxStreamRows);
   }
   if (mk_ffn_ > 0) {
     const size_t words = size_t(c.layers) * kernels::kMkFfnWords;
     mk_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
-    check(cudaMemset(mk_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    check(gpu::memset_sync(mk_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
     std::fprintf(stderr, "megakernel stage 1: the rows path's FFN as one persistent kernel (RAGON_MK_FFN=%d)\n", mk_ffn_);
   }
   if ((mk_ffn_ > 0 || mk_gdn_ > 0) && std::getenv("RAGON_MK_TIMES") && std::atoi(std::getenv("RAGON_MK_TIMES")) != 0) {
     const size_t n = size_t(c.layers) * kMkTimesBlocks * kernels::kMkTimesPerBlock;
     for (unsigned long long** t : {&mk_ffn_times_, &mk_gdn_times_}) {
       *t = reinterpret_cast<unsigned long long*>(alloc<uint8_t>(n * sizeof(unsigned long long)));
-      check(cudaMemset(*t, 0, n * sizeof(unsigned long long)), "megakernel timings");
+      check(gpu::memset_sync(*t, 0, n * sizeof(unsigned long long)), "megakernel timings");
     }
   }
   if (mk_attn_ > 0) {
     const size_t words = size_t(c.layers) * kernels::kMkAttnWords;
     mk_attn_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
-    check(cudaMemset(mk_attn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    check(gpu::memset_sync(mk_attn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
     kernels::attn_persistent_prepare();
     if (std::getenv("RAGON_MK_TIMES") && std::atoi(std::getenv("RAGON_MK_TIMES")) != 0) {
       const size_t n = size_t(c.layers) * kernels::kMkAttnEvents;
       mk_attn_times_ = reinterpret_cast<unsigned long long*>(alloc<uint8_t>(n * sizeof(unsigned long long)));
-      check(cudaMemset(mk_attn_times_, 0, n * sizeof(unsigned long long)), "megakernel timings");
+      check(gpu::memset_sync(mk_attn_times_, 0, n * sizeof(unsigned long long)), "megakernel timings");
     }
     std::fprintf(stderr, "megakernel stage 3: a verify's attention layer as one persistent kernel (RAGON_MK_ATTN=%d)\n",
                  mk_attn_);
@@ -425,16 +444,16 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (mk_gdn_ > 0) {
     const size_t words = size_t(c.layers) * kernels::kMkGdnWords;
     mk_gdn_counters_ = reinterpret_cast<unsigned*>(alloc<int>(words));
-    check(cudaMemset(mk_gdn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
+    check(gpu::memset_sync(mk_gdn_counters_, 0, words * sizeof(unsigned)), "megakernel counters");
     std::fprintf(stderr, "megakernel stage 2: a verify's DeltaNet mixer as one persistent kernel (RAGON_MK_GDN=%d)\n", mk_gdn_);
   }
   if (const char* e = std::getenv("RAGON_GDN_FORK")) fork_ = std::atoi(e);
   if (fork_ > 0) {
     int lo = 0, hi = 0;
-    check(cudaDeviceGetStreamPriorityRange(&lo, &hi), "priority range");
-    check(cudaStreamCreateWithPriority(&fork_stream_, cudaStreamNonBlocking, fork_ >= 2 ? hi : lo), "fork stream");
-    for (cudaEvent_t* ev : {&fork_xn_, &fork_qkv_, &fork_done_})
-      check(cudaEventCreateWithFlags(ev, cudaEventDisableTiming), "fork event");
+    check(gpu::stream_priority_range(&lo, &hi), "priority range");
+    check(gpu::stream_create_priority(&fork_stream_, gpu::kStreamNonBlocking, fork_ >= 2 ? hi : lo), "fork stream");
+    for (gpu::Event* ev : {&fork_xn_, &fork_qkv_, &fork_done_})
+      check(gpu::event_create_flags(ev, gpu::kEventDisableTiming), "fork event");
     std::fprintf(stderr, "probe: the DeltaNet chain beside the in_z projection (RAGON_GDN_FORK=%d)\n", fork_);
   }
   if (const char* e = std::getenv("RAGON_SIDE_PREFILL")) opts_.side_prefill = std::atoi(e);
@@ -446,20 +465,20 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     if (draft_) {
       const DraftConfig& d = draft_->config();
       const size_t R = std::max(opts_.prefill_chunk, kernels::kMaxStreamRows);
-      cap_ = alloc<__nv_bfloat16>(R * cap_stride_);
+      cap_ = alloc<gpu::bf16>(R * cap_stride_);
       dctx_ = alloc<float>(R * d.hidden);
       dk_ = alloc<float>(R * d.kv_heads * d.head_dim);
       dv_ = alloc<float>(R * d.kv_heads * d.head_dim);
       conv_tmp_ = alloc<float>(size_t(C) * (c.conv_kernel - 1));
-      if (draft_->nvfp4_copies()) xh_fc_ = alloc<__half>(size_t(kernels::kMaxStreamRows) * draft_->fc4().K);
+      if (draft_->nvfp4_copies()) xh_fc_ = alloc<gpu::half>(size_t(kernels::kMaxStreamRows) * draft_->fc4().K);
     }
-    check(cudaHostAlloc(reinterpret_cast<void**>(&logits_host_), size_t(c.vocab) * sizeof(float), cudaHostAllocDefault),
+    check(gpu::host_alloc(reinterpret_cast<void**>(&logits_host_), size_t(c.vocab) * sizeof(float), gpu::kHostAllocDefault),
           "side logits");
     s_ = &sessions_[0];
     stream_ = make_side_stream(opts_.side_prefill, &side_green_);
     swap_side();
-    check(cudaEventCreateWithFlags(&side_done_, cudaEventDisableTiming), "side event");
-    check(cudaEventCreateWithFlags(&side_after_main_, cudaEventDisableTiming), "side event");
+    check(gpu::event_create_flags(&side_done_, gpu::kEventDisableTiming), "side event");
+    check(gpu::event_create_flags(&side_after_main_, gpu::kEventDisableTiming), "side event");
     std::fprintf(stderr, "prefill beside a decode: a second stream%s\n",
                  opts_.side_prefill > 0 ? (" on a green context of " + std::to_string(opts_.side_prefill) + " SMs").c_str() : "");
   }
@@ -471,7 +490,7 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
     const char* when = kv_pages_ ? "before the page pool" : "after the engine's own memory";
     if (kv_arena_base_) {
       kv_arena_ = std::make_unique<ArenaAlloc>(size, size_t(2) << 20);
-      const size_t per_token = size_t(c.layers - n_linear_) * 2 * c.kv_heads * c.head_dim * sizeof(__nv_bfloat16);
+      const size_t per_token = size_t(c.layers - n_linear_) * 2 * c.kv_heads * c.head_dim * sizeof(gpu::bf16);
       const size_t state = size_t(n_linear_) * (size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim +
                                                size_t(c.lin_conv_channels()) * (c.conv_kernel - 1)) * sizeof(float);
       PrefixKvTree::Ops ops;
@@ -528,7 +547,7 @@ void Engine::join_commit() {
   // A wait on an event recorded outside a capture cannot be captured: every captured body runs with nothing
   // pending (speculate joins before the verify; the draft and the drafter's context KV never join).
   if (use_dev_pos_) throw std::runtime_error("join_commit inside a step graph's capture");
-  if (commit_pending_) check(cudaStreamWaitEvent(stream_, commit_done_, 0), "join commit");
+  if (commit_pending_) check(gpu::stream_wait_event(stream_, commit_done_, 0), "join commit");
   commit_pending_ = false;
   gdn_flush();  // RAGON_MK_GDN_FUSED: a deferred recurrence the next verify did not take
 }
@@ -563,7 +582,7 @@ void Engine::mk_times_report() {
   std::vector<unsigned long long> h(size_t(c.layers) * kMkTimesBlocks * S);
   for (int kind = 0; kind < 2; ++kind) {
     unsigned long long* d = kind == 0 ? mk_ffn_times_ : mk_gdn_times_;
-    if (!d || cudaMemcpy(h.data(), d, h.size() * sizeof(h[0]), cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+    if (!d || gpu::memcpy_sync(h.data(), d, h.size() * sizeof(h[0]), gpu::kD2H) != gpu::kSuccess) continue;
     const int chain = kind == 1 ? (std::getenv("RAGON_MK_CHAIN") ? std::atoi(std::getenv("RAGON_MK_CHAIN")) : 24) : 0;
     double sum[2][16] = {}, cnt[2][16] = {}, endmax = 0, nl = 0;
     for (int l = 0; l < c.layers; ++l) {
@@ -599,7 +618,7 @@ void Engine::mk_times_report() {
   // Stage 3: each counter's completion, the mean over the attention layers of its offset from the start, in us.
   std::vector<unsigned long long> e(size_t(c.layers) * kernels::kMkAttnEvents);
   if (mk_attn_times_ &&
-      cudaMemcpy(e.data(), mk_attn_times_, e.size() * sizeof(e[0]), cudaMemcpyDeviceToHost) == cudaSuccess) {
+      gpu::memcpy_sync(e.data(), mk_attn_times_, e.size() * sizeof(e[0]), gpu::kD2H) == gpu::kSuccess) {
     constexpr int E = kernels::kMkAttnEvents;
     double sum[E] = {}, cnt[E] = {};
     int nl = 0;
@@ -650,7 +669,7 @@ void Engine::load_kv_fp8_scales(const std::string& path, int n_full) {
 
 void Engine::dump_kv_calib() {
   std::vector<float> a(size_t(kv_amax_slots_) * 2);
-  if (cudaMemcpy(a.data(), kv_amax_, a.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+  if (gpu::memcpy_sync(a.data(), kv_amax_, a.size() * sizeof(float), gpu::kD2H) != gpu::kSuccess) return;
   // Merged with what the file holds (one run per prompt): the maxima over every run.
   nlohmann::json j;
   if (std::ifstream in(kv_calib_path_); in) {
@@ -677,29 +696,29 @@ Engine::~Engine() {
     std::fprintf(stderr, "gdn fused: %lld verifies, %lld sequences replayed in them, %lld flushes\n",
                  gdn_fused_verifies_, gdn_fused_seqs_, gdn_fused_flushes_);
   if (mk_ffn_times_ || mk_gdn_times_ || mk_attn_times_) {
-    cudaDeviceSynchronize();
+    gpu::device_sync();
     mk_times_report();
   }
-  if (commit_stream_) cudaStreamSynchronize(commit_stream_);
-  if (stream_) cudaStreamSynchronize(stream_);
+  if (commit_stream_) gpu::stream_sync(commit_stream_);
+  if (stream_) gpu::stream_sync(stream_);
   if (kv_amax_) dump_kv_calib();
   kv_tree_.reset();
-  if (kv_arena_base_) cudaFree(kv_arena_base_);
-  for (auto& e : emb_) cudaFreeAsync(e.second.p, stream_);
+  if (kv_arena_base_) gpu::device_free(kv_arena_base_);
+  for (auto& e : emb_) gpu::free_async(e.second.p, stream_);
   emb_.clear();
-  if (stream_) cudaStreamSynchronize(stream_);
-  if (emb_pool_) cudaMemPoolDestroy(emb_pool_);
+  if (stream_) gpu::stream_sync(stream_);
+  if (emb_pool_) gpu::pool_destroy(emb_pool_);
   vision_.reset();
   if (side_.stream_) {
-    cudaStreamSynchronize(side_.stream_);
-    if (side_.logits_host_) cudaFreeHost(side_.logits_host_);
+    gpu::stream_sync(side_.stream_);
+    if (side_.logits_host_) gpu::host_free(side_.logits_host_);
     destroy_side_stream(side_.stream_, side_green_);
-    if (side_done_) cudaEventDestroy(side_done_);
-    if (side_after_main_) cudaEventDestroy(side_after_main_);
+    if (side_done_) gpu::event_destroy(side_done_);
+    if (side_after_main_) gpu::event_destroy(side_after_main_);
   }
   clear_graphs();
-  if (pin_) cudaFreeHost(pin_);
-  if (mask_pin_) cudaFreeHost(mask_pin_);
+  if (pin_) gpu::host_free(pin_);
+  if (mask_pin_) gpu::host_free(mask_pin_);
   if (profile_) {
     for (const auto& [phase, sec] : phase_seconds_) std::fprintf(stderr, "profile %-24s %8.3f s\n", phase.c_str(), sec);
   }
@@ -710,16 +729,16 @@ Engine::~Engine() {
   if (topk_batch_)
     std::fprintf(stderr, "topk batch: %ld shared launches covering %ld sequences\n", topk_batch_launches_,
                  topk_batch_seqs_);
-  for (void* p : buffers_) cudaFree(p);
-  if (commit_done_) cudaEventDestroy(commit_done_);
-  if (pend_free_) cudaEventDestroy(pend_free_);
-  for (cudaEvent_t ev : kv_release_ev_)
-    if (ev) cudaEventDestroy(ev);
-  if (commit_stream_) cudaStreamDestroy(commit_stream_);
-  for (cudaEvent_t ev : {fork_xn_, fork_qkv_, fork_done_})
-    if (ev) cudaEventDestroy(ev);
-  if (fork_stream_) cudaStreamDestroy(fork_stream_);
-  if (stream_) cudaStreamDestroy(stream_);
+  for (void* p : buffers_) gpu::device_free(p);
+  if (commit_done_) gpu::event_destroy(commit_done_);
+  if (pend_free_) gpu::event_destroy(pend_free_);
+  for (gpu::Event ev : kv_release_ev_)
+    if (ev) gpu::event_destroy(ev);
+  if (commit_stream_) gpu::stream_destroy(commit_stream_);
+  for (gpu::Event ev : {fork_xn_, fork_qkv_, fork_done_})
+    if (ev) gpu::event_destroy(ev);
+  if (fork_stream_) gpu::stream_destroy(fork_stream_);
+  if (stream_) gpu::stream_destroy(stream_);
 }
 
 void Engine::reset() {
@@ -730,7 +749,7 @@ void Engine::reset() {
 
 void Engine::reset_session() {
   reset_state();
-  check(cudaStreamSynchronize(stream_), "reset");
+  check(gpu::stream_sync(stream_), "reset");
   s_->history.clear();
   s_->sh_dirty = true;  // the sparse head's context vocabulary goes with the history (BACKLOG 19)
   s_->constraint.reset();  // structured output: a constraint belongs to one request
@@ -1022,10 +1041,10 @@ int Engine::kv_step_need(int session, bool spec, const KvGone* gone) const {
 
 void Engine::kv_record_release() {
   // Every stream that could still read a released page: whatever is queued on it now finishes before retire().
-  const cudaStream_t streams[3] = {main_stream(), side_stream(), commit_stream_};
+  const gpu::Stream streams[3] = {main_stream(), side_stream(), commit_stream_};
   for (int i = 0; i < 3; ++i)
     if (streams[i]) {
-      check(cudaEventRecord(kv_release_ev_[i], streams[i]), "KV release");
+      check(gpu::event_record(kv_release_ev_[i], streams[i]), "KV release");
       kv_release_rec_[i] = true;
     }
 }
@@ -1035,10 +1054,10 @@ bool Engine::kv_retire(bool wait) {
   for (int i = 0; i < 3; ++i) {
     if (!kv_release_rec_[i]) continue;
     if (wait) {
-      check(cudaEventSynchronize(kv_release_ev_[i]), "KV release");
+      check(gpu::event_sync(kv_release_ev_[i]), "KV release");
     } else {
-      const cudaError_t e = cudaEventQuery(kv_release_ev_[i]);
-      if (e == cudaErrorNotReady) return false;
+      const gpu::Error e = gpu::event_query(kv_release_ev_[i]);
+      if (e == gpu::kNotReady) return false;
       check(e, "KV release");
     }
   }
@@ -1046,7 +1065,7 @@ bool Engine::kv_retire(bool wait) {
   return true;
 }
 
-void Engine::kv_table_sync(Session& s, cudaStream_t st) {
+void Engine::kv_table_sync(Session& s, gpu::Stream st) {
   std::vector<int> idx;
   std::vector<uint64_t> val;
   for (size_t j = 0; j < s.page_host.size(); ++j) {
@@ -1061,7 +1080,7 @@ void Engine::kv_table_sync(Session& s, cudaStream_t st) {
 
 // M2: the session's pages from from's page on lose their flags (host first: a device flag is never set without the
 // host bit), and every full page below from without one is encoded into the mirror and flagged, in stream order.
-void Engine::kv_seal_pages(Session& s, int from, cudaStream_t st) {
+void Engine::kv_seal_pages(Session& s, int from, gpu::Stream st) {
   if (kv_mirror_ == nullptr || use_dev_pos_) return;
   std::vector<int> clear, seal;
   const int first_open = std::max(from, 0) / kernels::kKvPageTokens;
@@ -1086,7 +1105,7 @@ void Engine::kv_seal_pages(Session& s, int from, cudaStream_t st) {
                      kv_q8_vinv_.data(), st);
 }
 
-void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
+void Engine::kv_ensure(Session& s, int from, int to, gpu::Stream st) {
   if (!kv_book_) return;
   kv_seal_pages(s, from, st);
   to = std::min(to, opts_.max_context);
@@ -1106,12 +1125,12 @@ void Engine::kv_ensure(Session& s, int from, int to, cudaStream_t st) {
                           std::to_string(kv_book_->capacity()));
   // Copy-on-write (P4c; no page is shared in P4b): each copy on the writer's stream before its table entry changes.
   // A page is one run (interleaved) or one run per layer, K/V and head, kv_head_stride_ apart (head-major).
-  const size_t unit_bytes = kv_page_unit_ * sizeof(__nv_bfloat16);
-  const size_t pitch = kv_head_major_ ? kv_head_stride_ * sizeof(__nv_bfloat16) : unit_bytes;
+  const size_t unit_bytes = kv_page_unit_ * sizeof(gpu::bf16);
+  const size_t pitch = kv_head_major_ ? kv_head_stride_ * sizeof(gpu::bf16) : unit_bytes;
   const size_t runs = kv_page_elems_ / kv_page_unit_;
   for (const KvPool::Copy& c : copies)
-    check(cudaMemcpy2DAsync(kv_pool_ + size_t(c.dst) * kv_page_unit_, pitch, kv_pool_ + size_t(c.src) * kv_page_unit_,
-                            pitch, unit_bytes, runs, cudaMemcpyDeviceToDevice, st),
+    check(gpu::memcpy_2d_async(kv_pool_ + size_t(c.dst) * kv_page_unit_, pitch, kv_pool_ + size_t(c.src) * kv_page_unit_,
+                            pitch, unit_bytes, runs, gpu::kD2D, st),
           "KV page copy");
   kv_table_sync(s, st);
   kv_seal_pages(s, from, st);  // the pages just mapped (a copy's destination among them) start unsealed
@@ -1163,23 +1182,23 @@ void Engine::adopt_prefix(const Session& from, int n) {
   join_commit();
   const ModelConfig& c = model_->config();
   // Head-major caches: each KV head's positions [0, n) are one contiguous run, max_context positions apart.
-  const size_t row = size_t(c.head_dim) * sizeof(__nv_bfloat16), pitch = size_t(opts_.max_context) * row;
+  const size_t row = size_t(c.head_dim) * sizeof(gpu::bf16), pitch = size_t(opts_.max_context) * row;
   if (kv_pages_) kv_pages_adopt(from, n);
   for (size_t l = 0; l < (kv_pages_ ? 0 : s_->kcache.size()); ++l) {
-    check(cudaMemcpy2DAsync(s_->kcache[l], pitch, from.kcache[l], pitch, size_t(n) * row, c.kv_heads,
-                            cudaMemcpyDeviceToDevice, stream_),
+    check(gpu::memcpy_2d_async(s_->kcache[l], pitch, from.kcache[l], pitch, size_t(n) * row, c.kv_heads,
+                            gpu::kD2D, stream_),
           "session KV copy");
-    check(cudaMemcpy2DAsync(s_->vcache[l], pitch, from.vcache[l], pitch, size_t(n) * row, c.kv_heads,
-                            cudaMemcpyDeviceToDevice, stream_),
+    check(gpu::memcpy_2d_async(s_->vcache[l], pitch, from.vcache[l], pitch, size_t(n) * row, c.kv_heads,
+                            gpu::kD2D, stream_),
           "session KV copy");
   }
   const bool same_drafter = from.drafter == s_->drafter;  // another drafter's ring is nothing this one can read
   if (draft_ && same_drafter) {
     const DraftConfig& d = draft_->config();
-    const size_t ring_bytes = size_t(ring_) * d.kv_heads * d.head_dim * sizeof(__nv_bfloat16);
+    const size_t ring_bytes = size_t(ring_) * d.kv_heads * d.head_dim * sizeof(gpu::bf16);
     for (size_t l = 0; l < s_->dkc.size(); ++l) {
-      check(cudaMemcpyAsync(s_->dkc[l], from.dkc[l], ring_bytes, cudaMemcpyDeviceToDevice, stream_), "ring copy");
-      check(cudaMemcpyAsync(s_->dvc[l], from.dvc[l], ring_bytes, cudaMemcpyDeviceToDevice, stream_), "ring copy");
+      check(gpu::memcpy_async(s_->dkc[l], from.dkc[l], ring_bytes, gpu::kD2D, stream_), "ring copy");
+      check(gpu::memcpy_async(s_->dvc[l], from.dvc[l], ring_bytes, gpu::kD2D, stream_), "ring copy");
     }
   }
   // The copied ring holds what `from`'s holds: positions [dkv_from(from), from.history.size()); the
@@ -1197,9 +1216,9 @@ void Engine::reset_state() {
   join_commit();
   const ModelConfig& c = model_->config();
   for (float* s : s_->gdn)
-    check(cudaMemsetAsync(s, 0, size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float), stream_), "reset");
+    check(gpu::memset_async(s, 0, size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float), stream_), "reset");
   for (float* s : s_->conv)
-    check(cudaMemsetAsync(s, 0, size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float), stream_),
+    check(gpu::memset_async(s, 0, size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float), stream_),
           "reset");
 }
 
@@ -1209,12 +1228,12 @@ uint64_t Engine::state_hash() {
   std::vector<float> host(gdn);
   uint64_t h = 1469598103934665603ull;
   auto mix = [&](const float* d, size_t n) {
-    check(cudaMemcpy(host.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost), "state_hash");
+    check(gpu::memcpy_sync(host.data(), d, n * sizeof(float), gpu::kD2H), "state_hash");
     const unsigned char* b = reinterpret_cast<const unsigned char*>(host.data());
     for (size_t i = 0; i < n * sizeof(float); ++i) h = (h ^ b[i]) * 1099511628211ull;
   };
   join_commit();
-  check(cudaStreamSynchronize(stream_), "state_hash");
+  check(gpu::stream_sync(stream_), "state_hash");
   for (size_t i = 0; i < s_->gdn.size(); ++i) {
     mix(s_->gdn[i], gdn);
     mix(s_->conv[i], conv);
@@ -1227,16 +1246,16 @@ uint64_t Engine::draft_hash() {
   const DraftConfig& d = draft_->config();
   const size_t dkv = size_t(d.kv_heads) * d.head_dim;
   join_commit();
-  check(cudaStreamSynchronize(stream_), "draft_hash");
-  std::vector<__nv_bfloat16> host(size_t(ring_) * dkv);
+  check(gpu::stream_sync(stream_), "draft_hash");
+  std::vector<gpu::bf16> host(size_t(ring_) * dkv);
   uint64_t h = 1469598103934665603ull;
   const int hi = static_cast<int>(s_->history.size());
   for (int l = 0; l < d.layers; ++l)
-    for (const __nv_bfloat16* ring : {s_->dkc[l], s_->dvc[l]}) {
-      check(cudaMemcpy(host.data(), ring, host.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost), "draft_hash");
+    for (const gpu::bf16* ring : {s_->dkc[l], s_->dvc[l]}) {
+      check(gpu::memcpy_sync(host.data(), ring, host.size() * sizeof(gpu::bf16), gpu::kD2H), "draft_hash");
       for (int p = dkv_from(*s_); p < hi; ++p) {
         const unsigned char* b = reinterpret_cast<const unsigned char*>(host.data() + size_t(p % ring_) * dkv);
-        for (size_t i = 0; i < dkv * sizeof(__nv_bfloat16); ++i) h = (h ^ b[i]) * 1099511628211ull;
+        for (size_t i = 0; i < dkv * sizeof(gpu::bf16); ++i) h = (h ^ b[i]) * 1099511628211ull;
       }
     }
   return h;
@@ -1264,11 +1283,11 @@ void Engine::copy_state(const StateSlot& slot, bool save) {
   const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
   const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
   for (size_t i = 0; i < s_->gdn.size(); ++i) {
-    check(cudaMemcpyAsync(save ? slot.gdn[i] : s_->gdn[i], save ? s_->gdn[i] : slot.gdn[i], gdn_bytes,
-                          cudaMemcpyDeviceToDevice, stream_),
+    check(gpu::memcpy_async(save ? slot.gdn[i] : s_->gdn[i], save ? s_->gdn[i] : slot.gdn[i], gdn_bytes,
+                          gpu::kD2D, stream_),
           "state copy");
-    check(cudaMemcpyAsync(save ? slot.conv[i] : s_->conv[i], save ? s_->conv[i] : slot.conv[i], conv_bytes,
-                          cudaMemcpyDeviceToDevice, stream_),
+    check(gpu::memcpy_async(save ? slot.conv[i] : s_->conv[i], save ? s_->conv[i] : slot.conv[i], conv_bytes,
+                          gpu::kD2D, stream_),
           "state copy");
   }
 }
@@ -1326,9 +1345,9 @@ Engine::StateSlot Engine::state_view(const void* p) const {
 
 void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bool to_buf) {
   const ModelConfig& c = model_->config();
-  const size_t D = c.head_dim, row = D * sizeof(__nv_bfloat16), cache_pitch = size_t(opts_.max_context) * row;
+  const size_t D = c.head_dim, row = D * sizeof(gpu::bf16), cache_pitch = size_t(opts_.max_context) * row;
   const size_t buf_pitch = size_t(buf_len) * row, width = size_t(to - from) * row;
-  auto* b = static_cast<__nv_bfloat16*>(buf);
+  auto* b = static_cast<gpu::bf16*>(buf);
   if (kv_pages_) {  // P4: one launch over the positions, through the page table
     if (!to_buf && kv_mirror_ != nullptr && to > from) {  // M2: the pages written lose their flags
       std::vector<int> ids;
@@ -1345,10 +1364,10 @@ void Engine::kv_copy(void* buf, int buf_start, int buf_len, int from, int to, bo
   }
   for (size_t l = 0; l < s_->kcache.size(); ++l)
     for (int kv = 0; kv < 2; ++kv) {
-      __nv_bfloat16* cache = (kv == 0 ? s_->kcache : s_->vcache)[l] + size_t(from) * D;
-      __nv_bfloat16* run = b + (l * 2 + kv) * size_t(c.kv_heads) * buf_len * D + size_t(from - buf_start) * D;
-      check(to_buf ? cudaMemcpy2DAsync(run, buf_pitch, cache, cache_pitch, width, c.kv_heads, cudaMemcpyDeviceToDevice, stream_)
-                   : cudaMemcpy2DAsync(cache, cache_pitch, run, buf_pitch, width, c.kv_heads, cudaMemcpyDeviceToDevice, stream_),
+      gpu::bf16* cache = (kv == 0 ? s_->kcache : s_->vcache)[l] + size_t(from) * D;
+      gpu::bf16* run = b + (l * 2 + kv) * size_t(c.kv_heads) * buf_len * D + size_t(from - buf_start) * D;
+      check(to_buf ? gpu::memcpy_2d_async(run, buf_pitch, cache, cache_pitch, width, c.kv_heads, gpu::kD2D, stream_)
+                   : gpu::memcpy_2d_async(cache, cache_pitch, run, buf_pitch, width, c.kv_heads, gpu::kD2D, stream_),
             "prefix KV copy");
     }
 }
@@ -1388,8 +1407,8 @@ void Engine::copy_slot(const StateSlot& dst, const StateSlot& src) {
   const size_t gdn_bytes = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim * sizeof(float);
   const size_t conv_bytes = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1) * sizeof(float);
   for (size_t i = 0; i < src.gdn.size(); ++i) {
-    check(cudaMemcpyAsync(dst.gdn[i], src.gdn[i], gdn_bytes, cudaMemcpyDeviceToDevice, stream_), "slot copy");
-    check(cudaMemcpyAsync(dst.conv[i], src.conv[i], conv_bytes, cudaMemcpyDeviceToDevice, stream_), "slot copy");
+    check(gpu::memcpy_async(dst.gdn[i], src.gdn[i], gdn_bytes, gpu::kD2D, stream_), "slot copy");
+    check(gpu::memcpy_async(dst.conv[i], src.conv[i], conv_bytes, gpu::kD2D, stream_), "slot copy");
   }
 }
 
@@ -1523,7 +1542,7 @@ void Engine::linear_fp8_residual(const Fp8Weight& w, const float* x, int M, bool
     kernels::prefill_gemm_fp8(xq_, M, w.w, w.in_scale * w.scale, h_, H, w.N, w.K, true, stream_);
 }
 
-bool Engine::norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M, float in_scale, bool nvfp4, bool f32) {
+bool Engine::norm_rows(const float* x, const gpu::bf16* w, float* out, int M, float in_scale, bool nvfp4, bool f32) {
   const ModelConfig& c = model_->config();
   if (!quantized(M)) {
     kernels::rmsnorm_half(x, w, out, xh_, xinv_, M, c.hidden, c.eps, true, stream_);
@@ -1651,7 +1670,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   if (profile_) phase_seconds_[std::string(kind) + "passes"] += 1;
   auto mark = [&](const char* phase) {
     if (!profile_) return;
-    check(cudaStreamSynchronize(stream_), phase);
+    check(gpu::stream_sync(stream_), phase);
     auto now = std::chrono::steady_clock::now();
     phase_seconds_[std::string(kind) + phase] += std::chrono::duration<double>(now - t_last).count();
     t_last = now;
@@ -1662,7 +1681,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   static const size_t hint_gdn = std::getenv("RAGON_L2_HINT_GDN") ? size_t(std::atof(std::getenv("RAGON_L2_HINT_GDN")) * 1e6) : 0;
   static const size_t hint_mlp = std::getenv("RAGON_L2_HINT_MLP") ? size_t(std::atof(std::getenv("RAGON_L2_HINT_MLP")) * 1e6) : 0;
   static const size_t hint_attn = std::getenv("RAGON_L2_HINT_ATTN") ? size_t(std::atof(std::getenv("RAGON_L2_HINT_ATTN")) * 1e6) : 0;
-  check(cudaMemcpyAsync(ids_dev_, ids, M * sizeof(int), cudaMemcpyHostToDevice, stream_), "ids");
+  check(gpu::memcpy_async(ids_dev_, ids, M * sizeof(int), gpu::kH2D, stream_), "ids");
   kernels::embed(model_->embed(), ids_dev_, M, H, h_, stream_);
   if (pass == Pass::Prefill)  // an image's rows: its embedding, BF16 to FP32 (VISION §20.3 (b))
     for (const ImgRows& g : chunk_img_)
@@ -1770,8 +1789,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // attention over it.
       const int kvsize = c.kv_heads * c.head_dim;
       if (joint) {
-        kernels::SeqPtrs<__nv_bfloat16> kc, vc;
-        kernels::SeqPtrs<const __nv_bfloat16> kcr, vcr;
+        kernels::SeqPtrs<gpu::bf16> kc, vc;
+        kernels::SeqPtrs<const gpu::bf16> kcr, vcr;
         kernels::SeqPtrs<const uint64_t> pg;
         for (int i = 0; i < sb.n; ++i) {
           kcr.p[i] = kc.p[i] = segs[i].s->kcache[slot];
@@ -1790,9 +1809,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
       // RAGON_KV_CALIB: the K and V the eager passes cached, by layer (tree rows and captured passes skipped).
       auto calib = [&](const Seg& g) {
         if (!kv_amax_ || seg_tree(g)) return;
-        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        check(cudaStreamIsCapturing(stream_, &cs), "capture status");
-        if (cs == cudaStreamCaptureStatusNone)
+        gpu::CaptureStatus cs = gpu::kCaptureNone;
+        check(gpu::is_capturing(stream_, &cs), "capture status");
+        if (cs == gpu::kCaptureNone)
           kernels::kv_absmax(g.s->kcache[slot], g.s->vcache[slot], g.s->pages, g.s->pos, g.rows, c.kv_heads,
                              c.head_dim, kv_amax_ + 2 * slot, stream_);
       };
@@ -1970,25 +1989,25 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         // The overlap probe (RAGON_GDN_FORK): in_qkv alone, then in_z on stream_ while the chain runs on fork_stream_
         // (a matrix's result does not depend on its launch companions, so splitting the launch changes no bit).
         const Seg& sg = segs[0];
-        cudaStream_t fs = fork_stream_;
-        check(cudaEventRecord(fork_xn_, stream_), "fork");
-        check(cudaStreamWaitEvent(fs, fork_xn_), "fork");
+        gpu::Stream fs = fork_stream_;
+        check(gpu::event_record(fork_xn_, stream_), "fork");
+        check(gpu::stream_wait_event(fs, fork_xn_, 0), "fork");
         kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, fs, L.in_b.w, b_);
         kernels::gdn_gating(a_, b_, L.A_log, L.dt_bias, g, beta, M, c.lin_v_heads, fs);
         linear_fp8_multi({{&L.in_qkv, v_pre_[slot]}}, xn_, M, xn_half);
-        check(cudaEventRecord(fork_qkv_, stream_), "fork");
+        check(gpu::event_record(fork_qkv_, stream_), "fork");
         linear_fp8_multi({{&L.in_z, z_}}, xn_, M, true);
         kernels::l2_prefetch_weights(L.out.w, L.out.fp4, L.out.table != nullptr, L.out.N, L.out.K, hint_gdn, stream_);
-        check(cudaStreamWaitEvent(fs, fork_qkv_), "fork");
-        check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, fs),
+        check(gpu::stream_wait_event(fs, fork_qkv_, 0), "fork");
+        check(gpu::memcpy_async(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), gpu::kD2D, fs),
               "verify inputs");
-        check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
-                              cudaMemcpyDeviceToDevice, fs),
+        check(gpu::memcpy_async(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                              gpu::kD2D, fs),
               "verify conv");
         kernels::gdn_conv(mixed, conv_tmp_, L.conv, M, C, fs);
         kernels::gdn_recurrent(mixed, g, beta, sg.s->gdn[slot], nullptr, core_, M, c.lin_k_heads, c.lin_v_heads, fs);
-        check(cudaEventRecord(fork_done_, fs), "fork");
-        check(cudaStreamWaitEvent(stream_, fork_done_), "fork");
+        check(gpu::event_record(fork_done_, fs), "fork");
+        check(gpu::stream_wait_event(stream_, fork_done_, 0), "fork");
         kernels::gated_rmsnorm(core_, z_, L.lin_norm, normed_, M * c.lin_v_heads, c.lin_v_dim, c.eps, stream_);
         linear_fp8_residual(L.out, normed_, M, false);
         mark("gdn_proj");
@@ -2025,7 +2044,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
         kernels::gdn_conv_commit_seqs(mixed, st, L.conv, sb, C, stream_);
       } else if (verify && joint) {  // per sequence (M4 §2), from its own conv window, left unwritten
-        check(cudaMemcpyAsync(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
+        check(gpu::memcpy_async(mixed, v_pre_[slot], size_t(M) * C * sizeof(float), gpu::kD2D, stream_),
               "verify inputs");
         kernels::SeqPtrs<const float> st;
         for (int i = 0; i < sb.n; ++i) st.p[i] = segs[i].s->conv[slot];
@@ -2037,11 +2056,11 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
             kernels::gdn_conv_tree(v_pre_[slot] + r0 * C, mixed + r0 * C, sg.s->conv[slot], L.conv, sg.rows, C, td, stream_);
             continue;
           }
-          check(cudaMemcpyAsync(mixed + r0 * C, v_pre_[slot] + r0 * C, size_t(sg.rows) * C * sizeof(float),
-                                cudaMemcpyDeviceToDevice, stream_),
+          check(gpu::memcpy_async(mixed + r0 * C, v_pre_[slot] + r0 * C, size_t(sg.rows) * C * sizeof(float),
+                                gpu::kD2D, stream_),
                 "verify inputs");
-          check(cudaMemcpyAsync(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
-                                cudaMemcpyDeviceToDevice, stream_),
+          check(gpu::memcpy_async(conv_tmp_, sg.s->conv[slot], size_t(C) * (c.conv_kernel - 1) * sizeof(float),
+                                gpu::kD2D, stream_),
                 "verify conv");
           kernels::gdn_conv(mixed + r0 * C, conv_tmp_, L.conv, sg.rows, C, stream_);
         }
@@ -2185,9 +2204,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         for (int k = 0; k < n; ++k) linear_fp4(lm, xn_ + size_t(k) * H, 1, logits_dev_ + size_t(k) * V);
       else
         linear_fp4(lm, xn_, n, logits_dev_);
-      check(cudaMemcpyAsync(joint_dst_, logits_dev_, size_t(n) * V * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+      check(gpu::memcpy_async(joint_dst_, logits_dev_, size_t(n) * V * sizeof(float), gpu::kD2H, stream_),
             "logits");
-      check(cudaStreamSynchronize(stream_), "forward");
+      check(gpu::stream_sync(stream_), "forward");
       mark("lm_head");
       for (const Seg& sg : segs) sg.s->pos += sg.rows;
       return;
@@ -2196,10 +2215,10 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     kernels::rmsnorm(last, model_->final_norm(), xn_, 1, H, c.eps, true, stream_);
     linear_fp4(lm, xn_, 1, logits_dev_);
   }
-  check(cudaMemcpyAsync(logits_host_, logits_dev_, logits_.size() * sizeof(float), cudaMemcpyDeviceToHost,
+  check(gpu::memcpy_async(logits_host_, logits_dev_, logits_.size() * sizeof(float), gpu::kD2H,
                         stream_),
         "logits");
-  if (!side_active_) check(cudaStreamSynchronize(stream_), "forward");  // a side pass is waited for by its event
+  if (!side_active_) check(gpu::stream_sync(stream_), "forward");  // a side pass is waited for by its event
   mark("lm_head");
   s_->pos += M;
 }
@@ -2574,7 +2593,7 @@ int Engine::rope_delta_after(const PrefillCursor& cur) {
   return delta;
 }
 
-const __nv_bfloat16* Engine::image_embedding(const PromptImage& im, const std::vector<int>& keep, EngineStats& stats) {
+const gpu::bf16* Engine::image_embedding(const PromptImage& im, const std::vector<int>& keep, EngineStats& stats) {
   auto it = emb_.find(im.token);
   if (it != emb_.end()) {
     it->second.used = ++emb_clock_;
@@ -2583,7 +2602,7 @@ const __nv_bfloat16* Engine::image_embedding(const PromptImage& im, const std::v
   if (!vision_) throw std::runtime_error("the vision tower is off");
   if (!im.patches || im.patches->size() != size_t(im.grid_h) * im.grid_w * vision_->config().patch_dim())
     throw std::runtime_error("an image's patches are missing or the wrong size");
-  const size_t bytes = size_t(im.tokens()) * vision_->config().out * sizeof(__nv_bfloat16);
+  const size_t bytes = size_t(im.tokens()) * vision_->config().out * sizeof(gpu::bf16);
   // Make room: least recently used first, never an image of the current prompt. The stream finishes what reads the
   // evicted entries before they are freed.
   while (emb_bytes_ + bytes > emb_cap_) {
@@ -2593,29 +2612,29 @@ const __nv_bfloat16* Engine::image_embedding(const PromptImage& im, const std::v
           (victim == emb_.end() || e->second.used < victim->second.used))
         victim = e;
     if (victim == emb_.end()) break;  // everything cached is this prompt's: the pool grows past its reserve
-    check(cudaStreamSynchronize(stream_), "embedding cache");
-    check(cudaFreeAsync(victim->second.p, stream_), "embedding cache");
+    check(gpu::stream_sync(stream_), "embedding cache");
+    check(gpu::free_async(victim->second.p, stream_), "embedding cache");
     emb_bytes_ -= victim->second.bytes;
     emb_.erase(victim);
   }
   void* p = nullptr;
-  check(cudaMallocFromPoolAsync(&p, bytes, emb_pool_, stream_), "embedding cache");
-  cudaEvent_t e0 = nullptr, e1 = nullptr;
-  check(cudaEventCreate(&e0), "vision timing");
-  check(cudaEventCreate(&e1), "vision timing");
-  check(cudaEventRecord(e0, stream_), "vision timing");
-  vision_->forward(im.patches->data(), im.grid_h, im.grid_w, static_cast<__nv_bfloat16*>(p), stream_);
-  check(cudaEventRecord(e1, stream_), "vision timing");
-  check(cudaEventSynchronize(e1), "vision");
+  check(gpu::pool_alloc_async(&p, bytes, emb_pool_, stream_), "embedding cache");
+  gpu::Event e0 = nullptr, e1 = nullptr;
+  check(gpu::event_create(&e0), "vision timing");
+  check(gpu::event_create(&e1), "vision timing");
+  check(gpu::event_record(e0, stream_), "vision timing");
+  vision_->forward(im.patches->data(), im.grid_h, im.grid_w, static_cast<gpu::bf16*>(p), stream_);
+  check(gpu::event_record(e1, stream_), "vision timing");
+  check(gpu::event_sync(e1), "vision");
   float ms = 0;
-  check(cudaEventElapsedTime(&ms, e0, e1), "vision timing");
-  cudaEventDestroy(e0);
-  cudaEventDestroy(e1);
+  check(gpu::event_elapsed(&ms, e0, e1), "vision timing");
+  gpu::event_destroy(e0);
+  gpu::event_destroy(e1);
   stats.vision_seconds += ms / 1e3;
   stats.images_encoded += 1;
-  emb_[im.token] = EmbEntry{static_cast<__nv_bfloat16*>(p), bytes, ++emb_clock_};
+  emb_[im.token] = EmbEntry{static_cast<gpu::bf16*>(p), bytes, ++emb_clock_};
   emb_bytes_ += bytes;
-  return static_cast<const __nv_bfloat16*>(p);
+  return static_cast<const gpu::bf16*>(p);
 }
 
 bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
@@ -2796,7 +2815,7 @@ Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
       for (const PrefillCursor::Span& sp : cur.spans) {
         const int a = std::max(sp.start, i), b = std::min(sp.start + sp.len, end);
         if (a >= b) continue;
-        const __nv_bfloat16* emb = image_embedding(cur.images[sp.image], keep, cur.stats);
+        const gpu::bf16* emb = image_embedding(cur.images[sp.image], keep, cur.stats);
         chunk_img_.push_back({a - i, b - a, emb + size_t(a - sp.start) * model_->config().hidden});
       }
       ids.assign(prompt.begin() + i, prompt.begin() + end);
@@ -2805,7 +2824,7 @@ Engine::ChunkRun Engine::chunk_begin(PrefillCursor& cur, int max_tokens) {
       chunk_ids = ids.data();
       std::vector<int> table;
       rope_rows(cur, i, end, table);
-      check(cudaMemcpyAsync(mrope_dev_, table.data(), table.size() * sizeof(int), cudaMemcpyHostToDevice, stream_),
+      check(gpu::memcpy_async(mrope_dev_, table.data(), table.size() * sizeof(int), gpu::kH2D, stream_),
             "rope table");
     }
     forward(chunk_ids, r.n, Pass::Prefill, keep_at);
@@ -2857,7 +2876,7 @@ bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
     return false;
   }
   if (kv_tree_ && cur.kv_q > 0) kv_insert(cur);
-  check(cudaStreamSynchronize(stream_), "prefill");
+  check(gpu::stream_sync(stream_), "prefill");
   s_->prompt_len = L;
   s_->turn_start = L;  // a raw prompt without message boundaries is bound only when extended whole
   for (int k = L - 1; k >= 0; --k)
@@ -2878,13 +2897,13 @@ void Engine::prefill_chunk_launch(PrefillCursor& cur, int max_tokens) {
   Session* main_s = s_;
   // The chunk starts after everything queued on the main stream so far: begin_prefill's reset, state copy and
   // donor KV for this session ran there, and the previous chunk's finish may have been followed by main-stream work.
-  check(cudaEventRecord(side_after_main_, stream_), "side order");
+  check(gpu::event_record(side_after_main_, stream_), "side order");
   swap_side();
   try {
-    check(cudaStreamWaitEvent(stream_, side_after_main_, 0), "side order");
+    check(gpu::stream_wait_event(stream_, side_after_main_, 0), "side order");
     select_session(cur.session);
     side_run_ = chunk_begin(cur, max_tokens);
-    check(cudaEventRecord(side_done_, stream_), "side chunk");
+    check(gpu::event_record(side_done_, stream_), "side chunk");
   } catch (...) {
     swap_side();
     bind_session(main_s);
@@ -2897,8 +2916,8 @@ void Engine::prefill_chunk_launch(PrefillCursor& cur, int max_tokens) {
 
 bool Engine::side_ready() {
   if (!side_cur_) return true;
-  const cudaError_t e = cudaEventQuery(side_done_);
-  if (e == cudaErrorNotReady) return false;
+  const gpu::Error e = gpu::event_query(side_done_);
+  if (e == gpu::kNotReady) return false;
   check(e, "side chunk");
   return true;
 }
@@ -2907,7 +2926,7 @@ bool Engine::prefill_chunk_finish() {
   if (!side_cur_) throw std::runtime_error("prefill_chunk_finish without a side chunk");
   PrefillCursor& cur = *side_cur_;
   side_cur_ = nullptr;
-  check(cudaEventSynchronize(side_done_), "side chunk");
+  check(gpu::event_sync(side_done_), "side chunk");
   bool last = false;
   swap_side();
   try {
@@ -2924,13 +2943,13 @@ bool Engine::prefill_chunk_finish() {
 }
 
 void Engine::side_join() {
-  if (side_cur_) check(cudaEventSynchronize(side_done_), "side chunk");
-  if (side_.stream_ && !side_active_) check(cudaStreamSynchronize(side_.stream_), "side stream");
+  if (side_cur_) check(gpu::event_sync(side_done_), "side chunk");
+  if (side_.stream_ && !side_active_) check(gpu::stream_sync(side_.stream_), "side stream");
 }
 
 void Engine::side_abandon() {
   if (!side_cur_) return;
-  check(cudaEventSynchronize(side_done_), "side chunk");
+  check(gpu::event_sync(side_done_), "side chunk");
   side_cur_ = nullptr;
 }
 
@@ -2970,7 +2989,7 @@ void Engine::set_constraint(int i, std::shared_ptr<TokenConstraint> c, int arm_t
     if (!mask_pin_) {  // once, between steps (never inside a capture); kept for the engine's lifetime
       // A batch's walks may write a block past kMaxStreamRows before its row count is checked (plan_mask_rows).
       const size_t rows = size_t(kernels::kMaxStreamRows) + kernels::kMaxSeqRows;
-      check(cudaHostAlloc(reinterpret_cast<void**>(&mask_pin_), rows * words * sizeof(int32_t), cudaHostAllocDefault),
+      check(gpu::host_alloc(reinterpret_cast<void**>(&mask_pin_), rows * words * sizeof(int32_t), gpu::kHostAllocDefault),
             "mask rows");
       mask_dev_ = reinterpret_cast<int32_t*>(alloc<int>(rows * words));
       mask_words_ = words;

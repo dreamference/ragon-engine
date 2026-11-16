@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include <cuda_bf16.h>
+#include "backend/backend.hpp"  // gpu::bf16
 
 namespace ragon {
 
@@ -38,7 +38,7 @@ struct Nvfp4Host {
   float scale2 = 0.f;           // g
   double rel_sq_error = 0;      // sum (dequantized - w)^2 / sum w^2
 };
-Nvfp4Host quantize_nvfp4(const __nv_bfloat16* w, int N, int K);
+Nvfp4Host quantize_nvfp4(const gpu::bf16* w, int N, int K);
 
 struct ModelConfig {
   int hidden = 0;            // 5120
@@ -90,26 +90,26 @@ struct Fp8Weight {
 };
 
 struct Bf16Weight {
-  const __nv_bfloat16* w = nullptr;
+  const gpu::bf16* w = nullptr;
   int N = 0, K = 0;
 };
 
 struct LayerWeights {
   bool full = false;
-  const __nv_bfloat16* input_norm = nullptr;
-  const __nv_bfloat16* post_norm = nullptr;
+  const gpu::bf16* input_norm = nullptr;
+  const gpu::bf16* post_norm = nullptr;
   Fp4Weight gate, up, down;
   // Gated DeltaNet
   Fp8Weight in_qkv, in_z, out;
   Bf16Weight in_a, in_b;
-  const __nv_bfloat16* conv = nullptr;   // [C][4]
-  const __nv_bfloat16* A_log = nullptr;
-  const __nv_bfloat16* dt_bias = nullptr;
-  const __nv_bfloat16* lin_norm = nullptr;
+  const gpu::bf16* conv = nullptr;   // [C][4]
+  const gpu::bf16* A_log = nullptr;
+  const gpu::bf16* dt_bias = nullptr;
+  const gpu::bf16* lin_norm = nullptr;
   // Full attention
   Fp8Weight q, k, v, o;
-  const __nv_bfloat16* q_norm = nullptr;
-  const __nv_bfloat16* k_norm = nullptr;
+  const gpu::bf16* q_norm = nullptr;
+  const gpu::bf16* k_norm = nullptr;
 };
 
 class Model {
@@ -122,8 +122,8 @@ class Model {
 
   const ModelConfig& config() const { return cfg_; }
   const std::vector<LayerWeights>& layers() const { return layers_; }
-  const __nv_bfloat16* embed() const { return embed_; }
-  const __nv_bfloat16* final_norm() const { return final_norm_; }
+  const gpu::bf16* embed() const { return embed_; }
+  const gpu::bf16* final_norm() const { return final_norm_; }
   const Fp4Weight& lm_head() const { return lm_head_; }
   size_t device_bytes() const { return bytes_; }
   const std::string& dir() const { return dir_; }
@@ -140,8 +140,8 @@ class Model {
   std::string prefix_;  // "model.language_model." (the served checkpoint) or "model." (a text-only one)
   ModelConfig cfg_;
   std::vector<LayerWeights> layers_;
-  const __nv_bfloat16* embed_ = nullptr;
-  const __nv_bfloat16* final_norm_ = nullptr;
+  const gpu::bf16* embed_ = nullptr;
+  const gpu::bf16* final_norm_ = nullptr;
   Fp4Weight lm_head_;
   std::vector<void*> allocations_;
   size_t bytes_ = 0;

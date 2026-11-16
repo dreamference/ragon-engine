@@ -18,8 +18,8 @@ namespace {
 // The shortest shared run worth a launch of its own (a range of attention_chunk()'s default size).
 constexpr int kCascadeMinKeys = 4096;
 
-void check(cudaError_t e, const char* what) {
-  if (e != cudaSuccess) throw std::runtime_error(std::string("fan-out: ") + what + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const char* what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(std::string("fan-out: ") + what + ": " + gpu::error_string(e));
 }
 
 // The top K a row's token needs: 1 for greedy, its top_k when the GPU's top K covers it, 0 when the host must see every
@@ -46,7 +46,7 @@ void Engine::alloc_verify_rows() {
   }
 }
 
-void Engine::commit_seqs(std::span<Session* const> rows, cudaStream_t st, float* out) {
+void Engine::commit_seqs(std::span<Session* const> rows, gpu::Stream st, float* out) {
   const ModelConfig& c = model_->config();
   kernels::SeqBatch sb;
   sb.n = static_cast<int>(rows.size());
@@ -83,8 +83,8 @@ void Engine::commit_state_seqs(std::span<Session* const> ss, std::span<const int
   for (int i = 1; i < sb.n; ++i) lo = std::min(lo, sb.row0[i]), hi = std::max(hi, sb.row1[i]);
   if (defer) {
     if (gdn_deferred_) throw std::logic_error("commit_state_seqs: a recurrence still pending");
-    check(cudaEventRecord(pend_free_, stream_), "pending event");
-    check(cudaStreamWaitEvent(commit_stream_, pend_free_, 0), "pending wait");
+    check(gpu::event_record(pend_free_, stream_), "pending event");
+    check(gpu::stream_wait_event(commit_stream_, pend_free_, 0), "pending wait");
   }
   const int C = c.lin_conv_channels(), HV = c.lin_v_heads;
   for (int li = 0; li < c.layers; ++li) {
@@ -99,8 +99,8 @@ void Engine::commit_state_seqs(std::span<Session* const> ss, std::span<const int
     kernels::gdn_conv_commit_seqs(v_pre_[slot], conv, L.conv, sb, C, commit_stream_);
     if (defer) {
       const auto keep = [&](float* to, const float* from, int w) {
-        check(cudaMemcpyAsync(to + size_t(lo) * w, from + size_t(lo) * w, size_t(hi - lo) * w * sizeof(float),
-                              cudaMemcpyDeviceToDevice, commit_stream_),
+        check(gpu::memcpy_async(to + size_t(lo) * w, from + size_t(lo) * w, size_t(hi - lo) * w * sizeof(float),
+                              gpu::kD2D, commit_stream_),
               "pending rows");
       };
       keep(p_post_[slot], v_post_[slot], C);
@@ -111,10 +111,10 @@ void Engine::commit_state_seqs(std::span<Session* const> ss, std::span<const int
     kernels::gdn_recurrent_commit_seqs(v_post_[slot], v_g_[slot], v_beta_[slot], gdn, commit_core_, sb, c.lin_k_heads,
                                        HV, commit_stream_);
   }
-  check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
+  check(gpu::event_record(commit_done_, commit_stream_), "commit event");
   commit_pending_ = true;
   if (profile_) {  // RAGON_PROFILE: the commit alone (no longer beside the draft), its GPU time to the host
-    check(cudaStreamSynchronize(commit_stream_), "commit profile");
+    check(gpu::stream_sync(commit_stream_), "commit profile");
     phase_seconds_["commit/state"] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prof).count();
     phase_seconds_["commit/passes"] += 1;
   }
@@ -204,7 +204,7 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
   auto t_prof = std::chrono::steady_clock::now();
   auto prof = [&](const char* phase) {
     if (!profile_) return;
-    check(cudaStreamSynchronize(stream_), phase);
+    check(gpu::stream_sync(stream_), phase);
     const auto now = std::chrono::steady_clock::now();
     phase_seconds_[std::string("fanout/") + phase] += std::chrono::duration<double>(now - t_prof).count();
     t_prof = now;
@@ -217,8 +217,8 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
   prof("forward");
   kernels::topk_rows(logits_dev_, n, static_cast<int>(vocab), kmax, topk_scratch_, vals_dev_, ids_out_dev_, stream_);
   const size_t top = size_t(n) * kmax;
-  check(cudaMemcpyAsync(pin_->topk_vals, vals_dev_, top * sizeof(float), cudaMemcpyDeviceToHost, stream_), "topk");
-  check(cudaMemcpyAsync(pin_->topk_ids, ids_out_dev_, top * sizeof(int), cudaMemcpyDeviceToHost, stream_), "topk");
+  check(gpu::memcpy_async(pin_->topk_vals, vals_dev_, top * sizeof(float), gpu::kD2H, stream_), "topk");
+  check(gpu::memcpy_async(pin_->topk_ids, ids_out_dev_, top * sizeof(int), gpu::kD2H, stream_), "topk");
   // A row chosen on the host from every logit, and a row whose logits were asked for.
   std::vector<std::vector<float>> full(n);
   for (int i = 0; i < n; ++i) {
@@ -226,11 +226,11 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
     if (!to && ks[i] != 0) continue;
     if (!to) to = &full[i];
     to->resize(vocab);
-    check(cudaMemcpyAsync(to->data(), logits_dev_ + size_t(i) * vocab, vocab * sizeof(float), cudaMemcpyDeviceToHost,
+    check(gpu::memcpy_async(to->data(), logits_dev_ + size_t(i) * vocab, vocab * sizeof(float), gpu::kD2H,
                           stream_),
           "row logits");
   }
-  check(cudaStreamSynchronize(stream_), "step");
+  check(gpu::stream_sync(stream_), "step");
   prof("topk");
   // Every row's token, as sample() after step() draws it: the history holds the anchor, the seed counts it.
   std::vector<Session*> ok;
@@ -268,7 +268,7 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
   if (n == 1 && !ok.empty()) {
     if (commit_overlap_) {
       commit_seqs(ok, commit_stream_, commit_core_);
-      check(cudaEventRecord(commit_done_, commit_stream_), "commit event");
+      check(gpu::event_record(commit_done_, commit_stream_), "commit event");
       commit_pending_ = true;
     } else {
       commit_seqs(ok, stream_, core_);
@@ -312,7 +312,7 @@ void Engine::step_batch(std::span<SeqStep> seqs) {
     s.pos += 1;
     if (!seqs[i].drafter_off) s.spec.fanout_steps += 1;
   }
-  check(cudaStreamSynchronize(stream_), "commit");
+  check(gpu::stream_sync(stream_), "commit");
   prof("materialize");
   if (profile_) fanout_last_ = std::chrono::steady_clock::now();
 }
@@ -371,7 +371,7 @@ void Engine::fork_session(int from) {
     kv_ensure(*s_, L, target, stream_);
   }
   // The parent's state is read only until here: its next pass or commit may run on another stream.
-  check(cudaStreamSynchronize(stream_), "fork");
+  check(gpu::stream_sync(stream_), "fork");
 }
 
 }  // namespace ragon

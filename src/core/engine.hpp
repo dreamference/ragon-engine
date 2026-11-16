@@ -27,9 +27,7 @@
 #include <string>
 #include <vector>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "backend/runtime.hpp"  // gpu::Stream, Event, GraphExec, MemPool, bf16, half and the runtime calls (BACKEND §5.2)
 
 #include "core/constraint.hpp"
 #include "core/draft_guard.hpp"
@@ -650,7 +648,7 @@ class Engine {
   bool quantized_ = false;                // set by forward(): the pass is a prefill
   bool verify_commits_ = false;           // set by step_batch: a joint verify writes each sequence's state as it goes
   bool kv_pages_ = false;                 // opts_.kv_pages or RAGON_KV_PAGES (P4)
-  __nv_bfloat16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
+  gpu::bf16* kv_pool_ = nullptr;      // P4: the pool, [page][layer][K, V][kv head][kKvPageTokens][D]; page 0 unused
   size_t kv_page_elems_ = 0;              // P4: elements per page (all full-attention layers' K and V)
   bool kv_head_major_ = true;             // the pool [layer][K, V][kv head][page][PT][D] (RAGON_KV_HEAD_MAJOR=0: not)
   size_t kv_head_stride_ = 0;             // P4: elements between a page's KV heads (set_kv_layout's head stride)
@@ -663,10 +661,10 @@ class Engine {
   // Deferred frees: an event recorded on each stream that may read a page (the main stream, the side prefill's stream,
   // the commit stream) at every release; retire() runs once all three have passed them. A later record on a stream
   // covers the earlier releases too, so one event per stream suffices.
-  cudaEvent_t kv_release_ev_[3] = {};
+  gpu::Event kv_release_ev_[3] = {};
   bool kv_release_rec_[3] = {};
-  cudaStream_t main_stream() const { return side_active_ ? side_.stream_ : stream_; }
-  cudaStream_t side_stream() const { return side_active_ ? stream_ : side_.stream_; }
+  gpu::Stream main_stream() const { return side_active_ ? side_.stream_ : stream_; }
+  gpu::Stream side_stream() const { return side_active_ ? stream_ : side_.stream_; }
   int kv_target(size_t prompt_len) const;  // a prompt's end plus kKvGrowthPages pages, within max_context
   // Rows the next step of s may write: 1, or a speculative step's verify rows (the tree's included).
   int kv_step_rows(const Session& s, bool spec) const;
@@ -674,11 +672,11 @@ class Engine {
   // asks for (copy-on-write; none in P4b, where no page is shared) and writes the changed table entries, all on st.
   // Throws KvPoolExhausted, with nothing changed, when the pool is short even after waiting for the deferred frees.
   // Never inside a graph capture (a captured table update would replay stale entries): there it only checks.
-  void kv_ensure(Session& s, int from, int to, cudaStream_t st);
+  void kv_ensure(Session& s, int from, int to, gpu::Stream st);
   // s's pages wholly at or past position n released (their table entries back to page 0 on the main stream), and
   // the release recorded on every stream.
   void kv_release(Session& s, int n);
-  void kv_table_sync(Session& s, cudaStream_t st);  // the device table to s.kv_ids, the changed entries only
+  void kv_table_sync(Session& s, gpu::Stream st);  // the device table to s.kv_ids, the changed entries only
   void kv_record_release();
   // Runs a prefix KV store call that may drop page references, recording the release when it did.
   void kv_store_dropped(const std::function<void()>& op);
@@ -693,7 +691,7 @@ class Engine {
   uint8_t* kv_sealed_ = nullptr;
   std::vector<uint8_t> kv_sealed_host_;
   std::vector<float> kv_q8_kinv_, kv_q8_vinv_;
-  void kv_seal_pages(Session& s, int from, cudaStream_t st);
+  void kv_seal_pages(Session& s, int from, gpu::Stream st);
   std::string kv_calib_path_;             // RAGON_KV_CALIB: where the destructor merges the K/V maxima
   float* kv_amax_ = nullptr;              // [n_full][2] absolute maxima (float bits, atomicMax), calibration only
   int kv_amax_slots_ = 0;
@@ -701,7 +699,7 @@ class Engine {
   // RMSNorm; on the rows path it also leaves the FP16 copy for the next linear call (x_ready).
   // On the prefill path it writes the quantized input of the next GEMMs instead (input scale `in_scale`,
   // NVFP4 or FP8), and `out` only when `f32`.
-  bool norm_rows(const float* x, const __nv_bfloat16* w, float* out, int M, float in_scale, bool nvfp4, bool f32);
+  bool norm_rows(const float* x, const gpu::bf16* w, float* out, int M, float in_scale, bool nvfp4, bool f32);
   // What xq_ holds: the quantization of the current input with this input scale and encoding (0: nothing
   // reusable). x_ready on the prefill path means "xq_ holds it".
   float xq_scale_ = 0.f;
@@ -732,7 +730,7 @@ class Engine {
   // Speculation (speculate.cpp).
   // Advance the active session's recurrent state over a verify's rows row0 .. row0 + n - 1 (its anchor and
   // accepted drafts; row0 is the sequence's first row in a batch).
-  void commit(int row0, int n, cudaStream_t st, float* out);
+  void commit(int row0, int n, gpu::Stream st, float* out);
   // The commit beside the next draft (EngineOptions::commit_overlap): the DeltaNet replay runs on commit_stream_
   // and records commit_done_; join_commit() makes stream_ wait for it. Everything that reads or writes the
   // recurrent state, the verify's saved inputs or commit_core_ on stream_ (every forward pass, the state copies,
@@ -742,14 +740,14 @@ class Engine {
   // RAGON_COMMIT_DRAFT_BATCH: 0 off, 1 (default) speculate_batch's drafter commit in one pass (draft_materialize_rows),
   // 2 the same, then each sequence's own commit over it and a byte compare of the ring slots (a check: throws).
   int commit_draft_batch_ = 1;
-  __nv_bfloat16* cap_gather_ = nullptr;
+  gpu::bf16* cap_gather_ = nullptr;
   int cap_gather_stride_ = 0;
   long commit_draft_passes_ = 0, commit_draft_rows_ = 0, commit_draft_fallbacks_ = 0, commit_draft_checked_ = 0;
   bool topk_batch_ = true;  // RAGON_TOPK_BATCH (default on, 0 off): one top-K launch per run of joint-verify sequences with the same K
   long topk_batch_launches_ = 0, topk_batch_seqs_ = 0;
   bool commit_pending_ = false;
-  cudaStream_t commit_stream_ = nullptr;
-  cudaEvent_t commit_done_ = nullptr;
+  gpu::Stream commit_stream_ = nullptr;
+  gpu::Event commit_done_ = nullptr;
   float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)
   void join_commit();
   // RAGON_MK_GDN_FUSED (on by default, =0 turns it off; needs the batched commit beside the draft): speculate_batch's commit runs
@@ -763,7 +761,7 @@ class Engine {
   bool verify_fused_ = false;  // forward_rows: this joint verify runs the fused recurrence
   std::vector<float*> p_post_, p_g_, p_beta_;
   int* pend_dev_ = nullptr;  // the fused kernel's [kMaxSeqs] first pending row and [kMaxSeqs] pending rows per sequence
-  cudaEvent_t pend_free_ = nullptr;  // stream_ is done with p_* (the commit's copies wait for it)
+  gpu::Event pend_free_ = nullptr;  // stream_ is done with p_* (the commit's copies wait for it)
   std::vector<Session*> pend_s_;
   std::vector<int> pend_r0_, pend_n_;
   long long gdn_fused_verifies_ = 0, gdn_fused_seqs_ = 0, gdn_fused_flushes_ = 0;
@@ -786,9 +784,9 @@ class Engine {
   unsigned* mk_attn_counters_ = nullptr;
   unsigned long long* mk_attn_times_ = nullptr;  // RAGON_MK_TIMES: [layer][kernels::kMkAttnEvents]
   int mk_span_ = 0;  // stage 4 (RAGON_MK_SPAN=1): a verify's DeltaNet mixer and FFN in one persistent launch
-  __half* xh3_ = nullptr;  // its post-attention norm's FP16 copy and the FFN's down input (not the mixer's buffers)
+  gpu::half* xh3_ = nullptr;  // its post-attention norm's FP16 copy and the FFN's down input (not the mixer's buffers)
   float* xinv3_ = nullptr;
-  __half* xh4_ = nullptr;
+  gpu::half* xh4_ = nullptr;
   float* xinv4_ = nullptr;
   int mk_layers_ = 0;  // stage 4 (RAGON_MK_LAYERS=1): the residual adds and the next norms inside the persistent kernels
   // RAGON_MK_TIMES=1: the persistent kernels' timings store ([layer][kMkTimesBlocks][kMkTimesPerBlock] globaltimer
@@ -797,19 +795,19 @@ class Engine {
   unsigned long long* mk_ffn_times_ = nullptr;
   unsigned long long* mk_gdn_times_ = nullptr;
   void mk_times_report();
-  __half* xh2_ = nullptr;
+  gpu::half* xh2_ = nullptr;
   float* xinv2_ = nullptr;
-  cudaStream_t fork_stream_ = nullptr;
-  cudaEvent_t fork_xn_ = nullptr, fork_qkv_ = nullptr, fork_done_ = nullptr;
+  gpu::Stream fork_stream_ = nullptr;
+  gpu::Event fork_xn_ = nullptr, fork_qkv_ = nullptr, fork_done_ = nullptr;
   // The commit's two halves: the DeltaNet replay (on commit_stream_ when overlapped) and the drafter's context KV.
-  void commit_state_launch(int row0, int n, cudaStream_t st);
+  void commit_state_launch(int row0, int n, gpu::Stream st);
   void commit_state_async(int row0, int n, bool graph);  // the replay on commit_stream_, then commit_done_
   // Target features -> the drafter's context KV at positions pos0 .. pos0 + rows - 1.
   void draft_materialize(int rows, kernels::DevPos pos0, int cap_row0);
   // The plain fan-out step's upkeep (BATCHING §5.8): sequence i's one row (cap_ row i) at its own position, into its own
   // rings, all rows in one pass; the rings come out as draft_materialize(1, pos, i) for each leaves them.
   void draft_materialize_seqs(std::span<Session* const> seqs);
-  void draft_context(int rows, int cap_row0, const __nv_bfloat16* src = nullptr);  // fc + hidden norm, into dctx_
+  void draft_context(int rows, int cap_row0, const gpu::bf16* src = nullptr);  // fc + hidden norm, into dctx_
   // A wide step's drafter commit in one pass (RAGON_COMMIT_DRAFT_BATCH): sequence i's rows cap_ row0[i] ..
   // row0[i] + rows[i] - 1 at its positions pos .. pos + rows[i] - 1 into its own rings. False (nothing launched) when
   // they do not fit one pass (> 32 sequences, > 64 rows, two drafters); the caller then commits per sequence.
@@ -818,7 +816,7 @@ class Engine {
   void alloc_drafter();
   void alloc_verify_rows();  // the buffers a Verify pass keeps its rows in: with a drafter, or for step_batch
   // step_batch's commit: rows 0 .. n - 1 into their sessions' DeltaNet state, in one launch per kernel and layer.
-  void commit_seqs(std::span<Session* const> rows, cudaStream_t st, float* out);
+  void commit_seqs(std::span<Session* const> rows, gpu::Stream st, float* out);
   // speculate_batch's commit beside the next draft: sequence i's rows row0[i] .. row0[i] + rows[i] - 1 into its
   // session's DeltaNet state on commit_stream_, in one launch per kernel and layer (the per-sequence replay's
   // arithmetic, sequence by sequence), then commit_done_.
@@ -871,9 +869,9 @@ class Engine {
   // are keyed by each sequence's top K; each sequence's commit graph is its session's, keyed by its slot in the
   // batch and its accepted count (slot 0 is the one-row step's own commit graph).
   struct BatchGraphs {
-    cudaGraphExec_t draft = nullptr;
-    std::map<unsigned, cudaGraphExec_t> draft_sparse;  // with the sparse head, by which sequences take it (BACKLOG 19)
-    std::map<std::vector<int>, cudaGraphExec_t> verify;
+    gpu::GraphExec draft = nullptr;
+    std::map<unsigned, gpu::GraphExec> draft_sparse;  // with the sparse head, by which sequences take it (BACKLOG 19)
+    std::map<std::vector<int>, gpu::GraphExec> verify;
   };
   std::map<std::vector<int>, BatchGraphs> batch_graphs_;
 
@@ -897,9 +895,9 @@ class Engine {
   // state pointers into their kernels' arguments.
   // Runs `body` as the graph in `slot` (captured on first use), or eagerly when graphs are off. A failed
   // capture turns graphs off for the engine's lifetime, says why, and runs `body` eagerly.
-  void run_graph(cudaGraphExec_t& slot, const char* what, const std::function<void()>& body,
-                 cudaStream_t st = nullptr);  // st: the stream to capture and launch on (stream_ by default)
-  cudaGraphExec_t capture(const std::function<void()>& body, cudaStream_t st);
+  void run_graph(gpu::GraphExec& slot, const char* what, const std::function<void()>& body,
+                 gpu::Stream st = nullptr);  // st: the stream to capture and launch on (stream_ by default)
+  gpu::GraphExec capture(const std::function<void()>& body, gpu::Stream st);
   void clear_graphs();
   // Page-locked host buffers for every copy inside a step: a graph's memcpy nodes read and write fixed
   // host addresses when they run, so these must stay put and must not be pageable.
@@ -930,7 +928,7 @@ class Engine {
   // The pool: per slot one device buffer of lora_slot_bytes_ for the adapter's A and B, and the descriptor table
   // lora_sites_[(slot * layers + layer) * kLoraSites + site] (a == nullptr: the slot's adapter skips the site). A step's
   // rows read their sequence's slot from LoraRows; a captured graph from lora_seq_dev_[i], written beside pos_dev_.
-  std::vector<__nv_bfloat16*> lora_pool_;
+  std::vector<gpu::bf16*> lora_pool_;
   size_t lora_slot_bytes_ = 0;
   kernels::LoraSiteDev* lora_sites_ = nullptr;
   std::vector<kernels::LoraSiteDev> lora_table_;  // lora_sites_'s host copy
@@ -943,7 +941,7 @@ class Engine {
   bool lora_mk_ = true;
   // The drafter's pool and table, the same per slot (lora_dsites_[(slot * draft layers + layer) * kLoraSites + site],
   // Qkv and O only): a slot whose adapter has no drafter/ has every entry empty, so the drafter runs as the base.
-  std::vector<__nv_bfloat16*> lora_dpool_;
+  std::vector<gpu::bf16*> lora_dpool_;
   size_t lora_dslot_bytes_ = 0;
   kernels::LoraSiteDev* lora_dsites_ = nullptr;
   void lora_alloc();          // in the constructor, with the other buffers (freed with them)
@@ -968,20 +966,20 @@ class Engine {
   // ---- Images (VISION §20.3). ----
   std::unique_ptr<VisionTower> vision_;
   struct EmbEntry {
-    __nv_bfloat16* p = nullptr;
+    gpu::bf16* p = nullptr;
     size_t bytes = 0;
     uint64_t used = 0;
   };
   std::map<int, EmbEntry> emb_;  // the embedding cache, by image id
   size_t emb_bytes_ = 0, emb_cap_ = 0;
   uint64_t emb_clock_ = 0;
-  cudaMemPool_t emb_pool_ = nullptr;
+  gpu::MemPool emb_pool_ = nullptr;
   // The embedding of `im`, from the cache or the tower (run on stream_); entries of the ids in `keep` are not evicted.
-  const __nv_bfloat16* image_embedding(const PromptImage& im, const std::vector<int>& keep, EngineStats& stats);
+  const gpu::bf16* image_embedding(const PromptImage& im, const std::vector<int>& keep, EngineStats& stats);
   // The current prefill chunk's images (rows of h_ replaced after the embedding) and RoPE table (null: text only).
   struct ImgRows {
     int row, count;
-    const __nv_bfloat16* src;
+    const gpu::bf16* src;
   };
   std::vector<ImgRows> chunk_img_;
   int* mrope_dev_ = nullptr;  // [prefill_chunk][3]
@@ -992,7 +990,7 @@ class Engine {
   std::vector<std::string> drafter_ids_;
   DraftModel* draft_ = nullptr;
   void load_drafters();
-  cudaStream_t stream_ = nullptr;
+  gpu::Stream stream_ = nullptr;
   std::vector<void*> buffers_;
   template <typename T>
   T* alloc(size_t count);
@@ -1002,14 +1000,14 @@ class Engine {
   float *a_ = nullptr, *b_ = nullptr, *g_ = nullptr, *beta_ = nullptr, *core_ = nullptr, *normed_ = nullptr;
   float *q_gate_ = nullptr, *k_ = nullptr, *v_ = nullptr, *q_ = nullptr, *gate_ = nullptr, *attn_ = nullptr;
   float *attn_scratch_ = nullptr, *logits_dev_ = nullptr;
-  __nv_bfloat16* x_bf16_ = nullptr;
+  gpu::bf16* x_bf16_ = nullptr;
   // --prefill-bf16: the BF16 views of xn_, t2_, z_, mixed_ and core_ (the same allocations, half the bytes used),
   // each live only between its producer and its consumer inside one DeltaNet layer of a prefill pass.
-  __nv_bfloat16 *xn_bf16_ = nullptr, *t2_bf16_ = nullptr, *z_bf16_ = nullptr, *mixed_bf16_ = nullptr;
-  __nv_bfloat16* core_bf16_ = nullptr;
+  gpu::bf16 *xn_bf16_ = nullptr, *t2_bf16_ = nullptr, *z_bf16_ = nullptr, *mixed_bf16_ = nullptr;
+  gpu::bf16* core_bf16_ = nullptr;
   uint8_t *xq_ = nullptr, *xsf_ = nullptr;  // the prefill path's quantized activations and their block scales
   uint8_t *xq2_ = nullptr, *xsf2_ = nullptr;
-  __half* xh_ = nullptr;     // the rows path's FP16 activations [32][max K]
+  gpu::half* xh_ = nullptr;     // the rows path's FP16 activations [32][max K]
   float* xinv_ = nullptr;    // and their per-row scales
   int* ids_dev_ = nullptr;
 
@@ -1108,10 +1106,10 @@ class Engine {
   // Drafter: target features [rows][layers * hidden] (BF16), its context KV per layer [max_context][kv],
   // and the block's buffers.
   std::vector<int> feature_layer_;  // target layer -> index of its feature slot, or -1
-  __nv_bfloat16* cap_ = nullptr;
-  __half* xh_fc_ = nullptr;  // BACKLOG 33: the FP16 rows of the fc's input for its NVFP4 copy
+  gpu::bf16* cap_ = nullptr;
+  gpu::half* xh_fc_ = nullptr;  // BACKLOG 33: the FP16 rows of the fc's input for its NVFP4 copy
   int cap_stride_ = 0;
-  std::vector<__nv_bfloat16*> dkc_, dvc_;
+  std::vector<gpu::bf16*> dkc_, dvc_;
   float *dctx_ = nullptr, *dk_ = nullptr, *dv_ = nullptr, *dres_ = nullptr, *dh_ = nullptr, *dh2_ = nullptr;
   float *dout_ = nullptr, *dcoef_ = nullptr, *dq_ = nullptr, *dg_ = nullptr, *du_ = nullptr, *dattn_ = nullptr;
   float *dlogits_ = nullptr, *dunary_ = nullptr, *dhp_ = nullptr, *dscores_ = nullptr;
@@ -1120,7 +1118,7 @@ class Engine {
   // device buffers a session's new context ids are marked through.
   bool sparse_head_ = false;
   int sh_rank_ = 0, sh_cap_ = 0, sh_nfixed_ = 0;
-  __nv_bfloat16 *sh_us_ = nullptr, *sh_vt_ = nullptr;
+  gpu::bf16 *sh_us_ = nullptr, *sh_vt_ = nullptr;
   std::vector<uint8_t> sh_fixed_;
   float* sh_p_ = nullptr;
   void* sh_scratch_ = nullptr;
@@ -1146,7 +1144,7 @@ class Engine {
   // A resident session (M4 §1): everything that belongs to one sequence.
   struct Session {
     // per full-attention layer, [Hkv][max_context][D]; P4 (--kv-pages): the layer's K and V bases in the pool
-    std::vector<__nv_bfloat16*> kcache, vcache;
+    std::vector<gpu::bf16*> kcache, vcache;
     uint64_t* pages = nullptr;           // P4: the device page table (element offsets of its pages), or nullptr: flat
     std::vector<uint64_t> page_host;     // P4: what the device table holds (written only through kv_table_set)
     std::vector<int> kv_ids;             // P4b: its pages' ids, KvPool's table (0: unmapped)
@@ -1157,7 +1155,7 @@ class Engine {
     // The state after history[0, snap_pos) (the end of the last prompt), valid while those tokens stay.
     StateSlot snap;
     int snap_pos = -1;
-    std::vector<__nv_bfloat16*> dkc, dvc;  // the drafter's context KV ring, per drafter layer
+    std::vector<gpu::bf16*> dkc, dvc;  // the drafter's context KV ring, per drafter layer
     // The ring holds positions [dkv_lo, history.size()), and of those only the last ring_ (dkv_from()).
     int dkv_lo = 0;
     int pos = 0;
@@ -1168,8 +1166,8 @@ class Engine {
     SpecStats spec;  // this session's speculative steps
     DraftGuard guard;  // BACKLOG 10: whether its next step drafts (reset with the session)
     std::mt19937_64 rng;
-    cudaGraphExec_t draft_graph = nullptr;
-    cudaGraphExec_t draft_graph_sparse = nullptr;  // the draft with the sparse head (BACKLOG 19)
+    gpu::GraphExec draft_graph = nullptr;
+    gpu::GraphExec draft_graph_sparse = nullptr;  // the draft with the sparse head (BACKLOG 19)
     // The sparse head's per-session state (BACKLOG 19): the device mask of the rows always scored (the fixed list
     // joined with the context vocabulary), its host copy, how much of history it holds, and the fallback's window.
     uint8_t* sh_mask = nullptr;
@@ -1185,10 +1183,10 @@ class Engine {
     long sh_last_steps = -1, sh_last_acc = 0;
     bool sh_last_sparse = false;
     double sh_acc_ema = -1;
-    std::map<int, cudaGraphExec_t> verify_graphs;  // by top-K (1 when greedy)
-    std::map<int, cudaGraphExec_t> tree_verify_graphs;  // a tree verify's, by top-K
+    std::map<int, gpu::GraphExec> verify_graphs;  // by top-K (1 when greedy)
+    std::map<int, gpu::GraphExec> tree_verify_graphs;  // a tree verify's, by top-K
     // Structured output: a verify under token masks, by 2 x top-K + 1 for a tree.
-    std::map<int, cudaGraphExec_t> masked_verify_graphs;
+    std::map<int, gpu::GraphExec> masked_verify_graphs;
     // Structured output (set_constraint): the request's constraint, the token that arms it (-1: armed from the
     // start) and whether it is armed.
     std::shared_ptr<TokenConstraint> constraint;
@@ -1196,11 +1194,12 @@ class Engine {
     bool armed = false;
     kernels::GatherBuf* gather = nullptr;  // the buffers a tree's accepted path is gathered in (device)
     int ngather = 0;
-    std::vector<cudaGraphExec_t> commit_graphs;    // by accepted count + 1
-    std::map<std::tuple<int, int, int>, cudaGraphExec_t> batch_commit_graphs;  // a batched step's: (slot, row0, count), slot > 0
+    std::vector<gpu::GraphExec> commit_graphs;    // by accepted count + 1
+    // a batched step's: (slot, row0, count), slot > 0
+    std::map<std::tuple<int, int, int>, gpu::GraphExec> batch_commit_graphs;
     // With commit_overlap, commit_graphs and batch_commit_graphs hold the drafter's context KV only, and these the
     // DeltaNet replay on commit_stream_, keyed by (first row, count).
-    std::map<std::pair<int, int>, cudaGraphExec_t> state_commit_graphs;
+    std::map<std::pair<int, int>, gpu::GraphExec> state_commit_graphs;
     // The pool's bookkeeping.
     bool owned = false;  // a session has been bound to the slot
     std::string key;     // the prompt_cache_key it was bound with ("" without one)
@@ -1263,8 +1262,8 @@ class Engine {
   SideSet side_;
   bool side_active_ = false;
   void swap_side();
-  cudaEvent_t side_done_ = nullptr;      // recorded after the in-flight chunk's pass
-  cudaEvent_t side_after_main_ = nullptr;  // the main stream's work so far (the side chunk starts after it)
+  gpu::Event side_done_ = nullptr;      // recorded after the in-flight chunk's pass
+  gpu::Event side_after_main_ = nullptr;  // the main stream's work so far (the side chunk starts after it)
   void* side_green_ = nullptr;           // the side stream's green context (CUgreenCtx), when side_prefill > 0
   PrefillCursor* side_cur_ = nullptr;    // the in-flight chunk's cursor
   ChunkRun side_run_;

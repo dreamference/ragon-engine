@@ -1,6 +1,6 @@
 #include "core/drafter.hpp"
 
-#include <cuda_runtime.h>
+#include "backend/runtime.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -14,8 +14,8 @@
 namespace ragon {
 namespace {
 
-void check(cudaError_t e, const std::string& what) {
-  if (e != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const std::string& what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(what + ": " + gpu::error_string(e));
 }
 
 }  // namespace
@@ -58,13 +58,13 @@ DraftModel::DraftModel(const std::string& dir, bool nvfp4_copies) {
     const TensorView& t = ck.get(name);
     if (t.dtype != dtype) throw std::runtime_error(name + " is " + t.dtype + ", expected " + dtype);
     void* p = nullptr;
-    check(cudaMalloc(&p, t.bytes), "cudaMalloc " + name);
-    check(cudaMemcpy(p, t.data, t.bytes, cudaMemcpyHostToDevice), "upload " + name);
+    check(gpu::device_alloc(&p, t.bytes), "cudaMalloc " + name);
+    check(gpu::memcpy_sync(p, t.data, t.bytes, gpu::kH2D), "upload " + name);
     allocations_.push_back(p);
     bytes_ += t.bytes;
     return p;
   };
-  auto bf = [&](const std::string& name) { return static_cast<const __nv_bfloat16*>(upload(name, "BF16")); };
+  auto bf = [&](const std::string& name) { return static_cast<const gpu::bf16*>(upload(name, "BF16")); };
   auto bf_w = [&](const std::string& name) {
     Bf16Weight w;
     const TensorView& t = ck.get(name);
@@ -97,7 +97,7 @@ DraftModel::DraftModel(const std::string& dir, bool nvfp4_copies) {
     Fp4Weight w;
     w.N = static_cast<int>(t.shape[0]);
     w.K = static_cast<int>(t.shape[1]);
-    const Nvfp4Host q = quantize_nvfp4(reinterpret_cast<const __nv_bfloat16*>(t.data), w.N, w.K);
+    const Nvfp4Host q = quantize_nvfp4(reinterpret_cast<const gpu::bf16*>(t.data), w.N, w.K);
     TensorView v, sc;
     v.dtype = "U8", v.shape = {w.N, w.K / 2}, v.data = q.values.data(), v.bytes = q.values.size();
     sc.dtype = "F8_E4M3", sc.shape = {w.N, w.K / 16}, sc.data = q.scales.data(), sc.bytes = q.scales.size();
@@ -156,7 +156,7 @@ DraftModel::DraftModel(const std::string& dir, bool nvfp4_copies) {
 }
 
 DraftModel::~DraftModel() {
-  for (void* p : allocations_) cudaFree(p);
+  for (void* p : allocations_) gpu::device_free(p);
 }
 
 }  // namespace ragon

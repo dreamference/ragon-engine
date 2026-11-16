@@ -69,6 +69,22 @@ if(RAGON_BACKEND STREQUAL "hip")
   add_executable(ragon-w0-tests tests/w0_tests.cu)
   target_link_libraries(ragon-w0-tests PRIVATE ragon_kernels_hip)
   add_test(NAME w0 COMMAND ragon-w0-tests)
+  # The engine's host files through the runtime facade (BACKEND §5.2 tier 2): compiled against HIP, not linked yet
+  # (their kernels' files are still CUDA-only). OFF skips them on a box without the image libraries.
+  option(RAGON_HIP_HOST "compile the engine's host files against HIP" ON)
+  if(RAGON_HIP_HOST)
+    find_package(hip REQUIRED)
+    find_package(nlohmann_json 3 REQUIRED)
+    find_package(JPEG REQUIRED)
+    find_package(PNG REQUIRED)
+    find_package(WebP CONFIG REQUIRED)
+    add_library(ragon_host_hip OBJECT src/core/engine.cpp src/core/speculate.cpp src/core/engine_fanout.cpp
+                src/core/engine_lora.cpp src/core/drafter.cpp src/serve/image_input.cpp)
+    target_include_directories(ragon_host_hip PRIVATE src)
+    target_compile_definitions(ragon_host_hip PRIVATE RAGON_BACKEND_HIP)
+    target_link_libraries(ragon_host_hip PRIVATE hip::host nlohmann_json::nlohmann_json JPEG::JPEG PNG::PNG
+                          WebP::webpdecoder)
+  endif()
   return()
 endif()
 

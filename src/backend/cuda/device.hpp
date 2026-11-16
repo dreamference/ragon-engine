@@ -5,7 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include "backend/cuda/runtime.hpp"  // <cuda_runtime.h> and the runtime calls (Error, memset_async, copy_d2d_async: §5.2)
 
 #include <cstdint>
 
@@ -44,15 +44,7 @@ __device__ __forceinline__ float mul_rn(float x, float y) {
 // A hint that the line at p is read soon (L2). No effect on results.
 __device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 
-// The runtime calls the kernels' own files make (the host files' runtime is tier 2, §5.2).
-using Error = cudaError_t;
-inline constexpr Error kSuccess = cudaSuccess;
-inline Error last_error() { return cudaGetLastError(); }
-inline const char* error_string(Error e) { return cudaGetErrorString(e); }
-inline Error memset_async(void* p, int v, size_t bytes, Stream s) { return cudaMemsetAsync(p, v, bytes, s); }
-inline Error copy_d2d_async(void* dst, const void* src, size_t bytes, Stream s) {
-  return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
-}
+// Launch sizing for the kernels' own files (the runtime calls are in backend/cuda/runtime.hpp, §5.2).
 // Device 0's multiprocessor count into *n; the blocks of `kernel` that fit on one at once into *per.
 inline Error sm_count(int* n) { return cudaDeviceGetAttribute(n, cudaDevAttrMultiProcessorCount, 0); }
 template <typename K>

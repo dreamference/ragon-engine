@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include <cuda_bf16.h>
+#include "backend/backend.hpp"  // gpu::bf16
 
 #include "core/model.hpp"
 
@@ -35,18 +35,18 @@ struct DraftConfig {
 };
 
 struct DraftLayer {
-  const __nv_bfloat16* input_norm = nullptr;
-  const __nv_bfloat16* post_norm = nullptr;
+  const gpu::bf16* input_norm = nullptr;
+  const gpu::bf16* post_norm = nullptr;
   Fp4Weight q, k, v, o, gate, up, down;
-  const __nv_bfloat16* q_norm = nullptr;
-  const __nv_bfloat16* k_norm = nullptr;
+  const gpu::bf16* q_norm = nullptr;
+  const gpu::bf16* k_norm = nullptr;
   Bf16Weight attn_kproj, mlp_kproj;  // [2 * taps * groups][hidden]; w null when the NVFP4 copies replace them
   // BACKLOG 33: the conv kernel projections in NVFP4, rounded at load (w null with the copies off). The block's rows
   // path reads them instead of the BF16 originals, which are then not kept: every drafter pass has at most
   // kMaxStreamRows rows.
   Fp4Weight attn_kproj4, mlp_kproj4;
-  const __nv_bfloat16* attn_base = nullptr;  // [2][taps][hidden]
-  const __nv_bfloat16* mlp_base = nullptr;
+  const gpu::bf16* attn_base = nullptr;  // [2][taps][hidden]
+  const gpu::bf16* mlp_base = nullptr;
 };
 
 class DraftModel {
@@ -65,11 +65,11 @@ class DraftModel {
   const Fp4Weight& fc4() const { return fc4_; }
   bool nvfp4_copies() const { return fc4_.w != nullptr; }
   double nvfp4_rel_sq_error() const { return rel_sq_error_; }  // the largest of the copies' relative squared errors
-  const __nv_bfloat16* hidden_norm() const { return hidden_norm_; }
-  const __nv_bfloat16* norm() const { return norm_; }
+  const gpu::bf16* hidden_norm() const { return hidden_norm_; }
+  const gpu::bf16* norm() const { return norm_; }
   const Bf16Weight& selector_projection() const { return sel_proj_; }  // [rank][hidden]
-  const __nv_bfloat16* predecessor_codebook() const { return pred_; }   // [vocab][rank]
-  const __nv_bfloat16* successor_codebook() const { return succ_; }
+  const gpu::bf16* predecessor_codebook() const { return pred_; }   // [vocab][rank]
+  const gpu::bf16* successor_codebook() const { return succ_; }
   size_t device_bytes() const { return bytes_; }
 
  private:
@@ -78,10 +78,10 @@ class DraftModel {
   Bf16Weight fc_, sel_proj_;
   Fp4Weight fc4_;
   double rel_sq_error_ = 0;
-  const __nv_bfloat16* hidden_norm_ = nullptr;
-  const __nv_bfloat16* norm_ = nullptr;
-  const __nv_bfloat16* pred_ = nullptr;
-  const __nv_bfloat16* succ_ = nullptr;
+  const gpu::bf16* hidden_norm_ = nullptr;
+  const gpu::bf16* norm_ = nullptr;
+  const gpu::bf16* pred_ = nullptr;
+  const gpu::bf16* succ_ = nullptr;
   std::vector<void*> allocations_;
   size_t bytes_ = 0;
 };

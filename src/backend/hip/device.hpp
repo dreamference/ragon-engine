@@ -4,7 +4,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
-#include <hip/hip_runtime.h>
+#include "backend/hip/runtime.hpp"  // <hip/hip_runtime.h> and the runtime calls (Error, memset_async, copy_d2d_async: §5.2)
 
 #include <cstdint>
 
@@ -41,14 +41,7 @@ __device__ __forceinline__ float mul_rn(float x, float y) {
 // No L2 prefetch instruction is used on HIP: the hint is dropped (results unchanged).
 __device__ __forceinline__ void prefetch_l2(const void*) {}
 
-using Error = hipError_t;
-inline constexpr Error kSuccess = hipSuccess;
-inline Error last_error() { return hipGetLastError(); }
-inline const char* error_string(Error e) { return hipGetErrorString(e); }
-inline Error memset_async(void* p, int v, size_t bytes, Stream s) { return hipMemsetAsync(p, v, bytes, s); }
-inline Error copy_d2d_async(void* dst, const void* src, size_t bytes, Stream s) {
-  return hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, s);
-}
+// Launch sizing for the kernels' own files (the runtime calls are in backend/hip/runtime.hpp, §5.2).
 // Device 0's multiprocessor count into *n; the blocks of `kernel` that fit on one at once into *per.
 inline Error sm_count(int* n) { return hipDeviceGetAttribute(n, hipDeviceAttributeMultiprocessorCount, 0); }
 template <typename K>

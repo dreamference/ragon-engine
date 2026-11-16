@@ -1,12 +1,15 @@
 // Images from a request to the tower's input (image_input.hpp).
 #include "serve/image_input.hpp"
 
-#include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <jpeglib.h>
-#include <nvjpeg.h>
 #include <png.h>
 #include <webp/decode.h>
+
+#include "backend/runtime.hpp"
+#if !defined(RAGON_BACKEND_HIP)
+#include <dlfcn.h>
+#include <nvjpeg.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -123,13 +126,14 @@ struct JpegErr {
 };
 void jpeg_fail(j_common_ptr c) { longjmp(reinterpret_cast<JpegErr*>(c->err)->jb, 1); }
 
+#if !defined(RAGON_BACKEND_HIP)
 // ---- JPEG on the GPU (nvJPEG, as torchvision.io.decode_jpeg(device="cuda") in production). ----
 // nvJPEG is opened at run time (libnvjpeg.so.13), so a deployment without it (the CUDA base image has none) decodes
 // JPEGs on the CPU instead of failing to start; the first failure to open it says so once.
 struct Nvjpeg {
   nvjpegHandle_t h = nullptr;
   nvjpegJpegState_t st = nullptr;
-  cudaStream_t stream = nullptr;
+  gpu::Stream stream = nullptr;
   bool ok = false;
   decltype(&nvjpegCreateSimple) create = nullptr;
   decltype(&nvjpegJpegStateCreate) state_create = nullptr;
@@ -149,7 +153,7 @@ struct Nvjpeg {
     if (!create || !state_create || !info || !decode) return;
     if (create(&h) != NVJPEG_STATUS_SUCCESS) return;
     if (state_create(h, &st) != NVJPEG_STATUS_SUCCESS) return;
-    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return;
+    if (gpu::stream_create(&stream, gpu::kStreamNonBlocking) != gpu::kSuccess) return;
     ok = true;
   }
 };
@@ -169,7 +173,7 @@ bool decode_jpeg_gpu(const std::string& bytes, DecodedImage& img) {
   img.height = h[0];
   const size_t plane = size_t(w[0]) * h[0];
   uint8_t* d = nullptr;
-  if (cudaMalloc(&d, plane * 3) != cudaSuccess) return false;
+  if (gpu::device_alloc(&d, plane * 3) != gpu::kSuccess) return false;
   nvjpegImage_t out{};
   for (int c = 0; c < 3; ++c) {
     out.channel[c] = d + plane * c;
@@ -179,16 +183,21 @@ bool decode_jpeg_gpu(const std::string& bytes, DecodedImage& img) {
   std::vector<uint8_t> planar;
   if (good) {
     planar.resize(plane * 3);
-    good = cudaMemcpyAsync(planar.data(), d, plane * 3, cudaMemcpyDeviceToHost, nv.stream) == cudaSuccess &&
-           cudaStreamSynchronize(nv.stream) == cudaSuccess;
+    good = gpu::memcpy_async(planar.data(), d, plane * 3, gpu::kD2H, nv.stream) == gpu::kSuccess &&
+           gpu::stream_sync(nv.stream) == gpu::kSuccess;
   }
-  cudaFree(d);
+  gpu::device_free(d);
   if (!good) return false;
   img.rgb.resize(plane * 3);
   for (size_t i = 0; i < plane; ++i)
     for (int c = 0; c < 3; ++c) img.rgb[i * 3 + c] = planar[plane * c + i];
   return true;
 }
+#else
+// No nvJPEG on HIP (BACKEND §5.2): every JPEG takes the CPU decoder below (libjpeg), as a CUDA deployment without
+// libnvjpeg does.
+bool decode_jpeg_gpu(const std::string&, DecodedImage&) { return false; }
+#endif
 
 uint16_t bf16_bits(float f) {
   uint32_t u;

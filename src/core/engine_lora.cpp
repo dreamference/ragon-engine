@@ -14,8 +14,8 @@
 namespace ragon {
 namespace {
 
-void check(cudaError_t e, const char* what) {
-  if (e != cudaSuccess) throw std::runtime_error(std::string("lora: ") + what + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const char* what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(std::string("lora: ") + what + ": " + gpu::error_string(e));
 }
 
 // Every A and B starts on 256 bytes (128 BF16), so the shrink's paired loads stay aligned.
@@ -39,8 +39,8 @@ void Engine::lora_alloc() {
       elems += aligned(size_t(R) * Vs) + aligned(size_t(H) * R);                      // Out
     }
   }
-  lora_slot_bytes_ = elems * sizeof(__nv_bfloat16);
-  for (int s = 0; s < opts_.lora_slots; ++s) lora_pool_.push_back(alloc<__nv_bfloat16>(elems));
+  lora_slot_bytes_ = elems * sizeof(gpu::bf16);
+  for (int s = 0; s < opts_.lora_slots; ++s) lora_pool_.push_back(alloc<gpu::bf16>(elems));
   lora_sites_ = reinterpret_cast<kernels::LoraSiteDev*>(
       alloc<uint8_t>(size_t(opts_.lora_slots) * c.layers * kLoraSites * sizeof(kernels::LoraSiteDev)));
   lora_table_.assign(size_t(opts_.lora_slots) * c.layers * kLoraSites, kernels::LoraSiteDev{});
@@ -49,7 +49,7 @@ void Engine::lora_alloc() {
   if (const char* e = std::getenv("RAGON_LORA_MK")) lora_mk_ = std::atoi(e) != 0;
   lora_seq_dev_ = alloc<int>(kernels::kMaxSeqs);
   const std::vector<int> base(kernels::kMaxSeqs, -1);
-  check(cudaMemcpy(lora_seq_dev_, base.data(), base.size() * sizeof(int), cudaMemcpyHostToDevice), "slots");
+  check(gpu::memcpy_sync(lora_seq_dev_, base.data(), base.size() * sizeof(int), gpu::kH2D), "slots");
   std::fprintf(stderr, "lora: %d GPU slots of %zu MB (rank %d on every site)\n", opts_.lora_slots,
                lora_slot_bytes_ >> 20, R);
 }
@@ -63,7 +63,7 @@ struct SlotLayout {
   std::vector<size_t> a_at, b_at;
 };
 
-SlotLayout lay_out(const LoraWeights& w, int layers, __nv_bfloat16* pool, size_t slot_bytes, const std::string& name) {
+SlotLayout lay_out(const LoraWeights& w, int layers, gpu::bf16* pool, size_t slot_bytes, const std::string& name) {
   SlotLayout l;
   l.table.resize(size_t(layers) * kLoraSites);
   size_t used = 0;
@@ -77,7 +77,7 @@ SlotLayout lay_out(const LoraWeights& w, int layers, __nv_bfloat16* pool, size_t
     l.b_at.push_back(used);
     used += aligned(sw.b.size());
   }
-  if (used * sizeof(__nv_bfloat16) > slot_bytes) throw std::runtime_error("lora: " + name + " does not fit a GPU slot");
+  if (used * sizeof(gpu::bf16) > slot_bytes) throw std::runtime_error("lora: " + name + " does not fit a GPU slot");
   for (size_t i = 0; i < w.sites.size(); ++i) {
     const LoraSiteWeights& sw = w.sites[i];
     kernels::LoraSiteDev& d = l.table[size_t(sw.layer) * kLoraSites + static_cast<size_t>(sw.site)];
@@ -100,13 +100,13 @@ SlotLayout lay_out(const LoraWeights& w, int layers, __nv_bfloat16* pool, size_t
   return l;
 }
 
-void copy_in(const LoraWeights& w, const SlotLayout& l, __nv_bfloat16* pool, kernels::LoraSiteDev* table_dev) {
+void copy_in(const LoraWeights& w, const SlotLayout& l, gpu::bf16* pool, kernels::LoraSiteDev* table_dev) {
   for (size_t i = 0; i < w.sites.size(); ++i) {
     const LoraSiteWeights& sw = w.sites[i];
-    check(cudaMemcpy(pool + l.a_at[i], sw.a.data(), sw.a.size() * 2, cudaMemcpyHostToDevice), "upload A");
-    check(cudaMemcpy(pool + l.b_at[i], sw.b.data(), sw.b.size() * 2, cudaMemcpyHostToDevice), "upload B");
+    check(gpu::memcpy_sync(pool + l.a_at[i], sw.a.data(), sw.a.size() * 2, gpu::kH2D), "upload A");
+    check(gpu::memcpy_sync(pool + l.b_at[i], sw.b.data(), sw.b.size() * 2, gpu::kH2D), "upload B");
   }
-  check(cudaMemcpy(table_dev, l.table.data(), l.table.size() * sizeof(kernels::LoraSiteDev), cudaMemcpyHostToDevice),
+  check(gpu::memcpy_sync(table_dev, l.table.data(), l.table.size() * sizeof(kernels::LoraSiteDev), gpu::kH2D),
         "upload table");
 }
 
@@ -118,11 +118,11 @@ void Engine::lora_alloc_drafter() {
   size_t elems = 0;
   for (int l = 0; l < d.layers; ++l)
     elems += aligned(size_t(3) * R * H) + aligned(size_t(dq + 2 * dkv) * R) + aligned(size_t(R) * dq) + aligned(size_t(H) * R);
-  lora_dslot_bytes_ = elems * sizeof(__nv_bfloat16);
-  for (int s = 0; s < opts_.lora_slots; ++s) lora_dpool_.push_back(alloc<__nv_bfloat16>(elems));
+  lora_dslot_bytes_ = elems * sizeof(gpu::bf16);
+  for (int s = 0; s < opts_.lora_slots; ++s) lora_dpool_.push_back(alloc<gpu::bf16>(elems));
   const size_t table = size_t(opts_.lora_slots) * d.layers * kLoraSites * sizeof(kernels::LoraSiteDev);
   lora_dsites_ = reinterpret_cast<kernels::LoraSiteDev*>(alloc<uint8_t>(table));
-  check(cudaMemset(lora_dsites_, 0, table), "drafter table");
+  check(gpu::memset_sync(lora_dsites_, 0, table), "drafter table");
   std::fprintf(stderr, "lora: the drafter's part of each slot, %zu MB\n", lora_dslot_bytes_ >> 20);
 }
 
@@ -144,7 +144,7 @@ void Engine::lora_upload(int slot, const LoraAdapter& adapter) {
   // Nothing may read the slot while it is rewritten: every stream idle (a slot is refilled only when no running
   // sequence holds it, so this waits for at most the step in flight).
   side_join();
-  check(cudaDeviceSynchronize(), "upload");
+  check(gpu::device_sync(), "upload");
   copy_in(adapter.target, target, lora_pool_[su], lora_sites_ + su * c.layers * kLoraSites);
   std::copy(target.table.begin(), target.table.end(),
             lora_table_.begin() + static_cast<ptrdiff_t>(su * c.layers * kLoraSites));
@@ -232,7 +232,7 @@ void Engine::lora_site(const kernels::LoraRows& rows, int layer, LoraSite site, 
   if (profile_) t0 = std::chrono::steady_clock::now();
   auto lap = [&](const char* phase) {
     if (!profile_) return;
-    check(cudaStreamSynchronize(stream_), phase);
+    check(gpu::stream_sync(stream_), phase);
     const auto now = std::chrono::steady_clock::now();
     phase_seconds_[std::string("lora_decode/") + phase] +=
         std::chrono::duration<double>(now - t0).count();
