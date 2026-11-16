@@ -32,8 +32,25 @@ __device__ __forceinline__ float e4m3_to_float(uint8_t b) {
 __device__ __forceinline__ float2 e4m3x2_to_float2(uint16_t pair) {
   return make_float2(e4m3_to_float(static_cast<uint8_t>(pair & 0xff)), e4m3_to_float(static_cast<uint8_t>(pair >> 8)));
 }
+// A float to OCP FP8 E4M3, rounded to nearest even and saturated to +-448 (infinity too), NaN to 0x7f:
+// the result of CUDA's __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3). Written out because HIP's
+// software conversion on gfx1151 encodes magnitudes far below the smallest subnormal (2^-9) as 0x01,
+// where the rounding gives zero.
 __host__ __device__ __forceinline__ uint8_t e4m3_from_float(float v) {
-  return __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+  uint32_t u;
+  __builtin_memcpy(&u, &v, 4);
+  const uint8_t sign = static_cast<uint8_t>((u >> 24) & 0x80);
+  const uint32_t a = u & 0x7fffffffu;
+  if (a > 0x7f800000u) return 0x7f;            // NaN
+  if (a >= 0x43e80000u) return sign | 0x7e;    // 464 and above (infinity too) saturate to 448
+  if (a < 0x3c800000u) {                       // below 2^-6: subnormal codes m * 2^-9, m = 0..8
+    float m;
+    __builtin_memcpy(&m, &a, 4);
+    return sign | static_cast<uint8_t>(__builtin_rintf(m * 512.0f));  // exact scaling; rint rounds to even
+  }
+  const uint32_t r = a + 0x7ffffu + ((a >> 20) & 1u);  // round the mantissa to 3 bits, ties to even
+  const uint32_t code = (r >> 20) - (120u << 3);       // rebias the exponent from 127 to 7
+  return sign | static_cast<uint8_t>(code > 0x7eu ? 0x7eu : code);
 }
 
 // x * y rounded to nearest, never fused into an FMA (the multiply carries no contract flag).
