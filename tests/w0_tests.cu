@@ -1100,6 +1100,36 @@ void test_sparse_head(Rng& r) {
     const auto gm = download(dm, N);
     check("sparse_head_mark", gm, mismatches(gm, mask), 0);
   }
+#if defined(RAGON_BACKEND_HIP)
+  // The HIP approx stage (no tensor cores) under the determinism rule: with inputs whose sums round, its keys (the
+  // first N u32 of the scratch) equal a host loop in its order to the bit: per lane t, the products of values
+  // t * 64 .. t * 64 + 63 fused in index order from 0, then (s0 + s1) + (s2 + s3), the maximum over P's rows.
+  for (const int Mh : {3, 20}) {
+    const auto ph = r.vec(size_t(Mh) * R);
+    const auto ub = to_bits(r.vec(size_t(N) * R));
+    const auto pf = from_bits(to_bits(ph)), uf = from_bits(ub);
+    std::vector<uint32_t> want(N);
+    for (int n = 0; n < N; ++n) {
+      float best = -INFINITY;
+      for (int m = 0; m < Mh; ++m) {
+        float s[4];
+        for (int t = 0; t < 4; ++t) {
+          s[t] = 0.f;
+          for (int k = t * 64; k < t * 64 + 64; ++k) s[t] = std::fma(uf[size_t(n) * R + k], pf[size_t(m) * R + k], s[t]);
+        }
+        best = std::max(best, (s[0] + s[1]) + (s[2] + s[3]));
+      }
+      uint32_t b;
+      std::memcpy(&b, &best, 4);
+      want[n] = (m0[n] || m1[n]) ? 0u : ((b & 0x80000000u) ? ~b : (b | 0x80000000u));
+    }
+    auto* rows = dev_zero<int>(N);
+    auto* nrows = dev_zero<int>(1);
+    K::sparse_head_select(dev(ph), Mh, dev_bf16(ub), N, R, masks, 40, N, scratch, rows, nrows, nullptr);
+    const auto got = download(static_cast<const uint32_t*>(scratch), N);
+    check(Mh <= 8 ? "sparse_head_approx_hip_m3" : "sparse_head_approx_hip_m20", got, mismatches(got, want), 0);
+  }
+#endif
 }
 
 }  // namespace
