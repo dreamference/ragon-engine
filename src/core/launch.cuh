@@ -19,7 +19,7 @@
 // an ordinary one, so the kernels compute exactly the same thing either way.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "backend/backend.hpp"  // the CUDA runtime under CUDA, the HIP runtime under HIP
 
 #include <stdexcept>
 #include <string>
@@ -56,6 +56,7 @@ __device__ __forceinline__ void pdl_begin() {
 bool probe_skip(const char* what);
 __global__ void probe_noop_kernel();
 
+#if !defined(RAGON_BACKEND_HIP)
 // kernel<<<grid, block, smem, s>>>(args...), with the PDL attribute when `pdl`.
 template <typename... Params, typename... Args>
 void launch_kernel_pdl(bool pdl, const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
@@ -88,6 +89,24 @@ void launch_kernel(const char* what, void (*kernel)(Params...), dim3 grid, dim3 
                    Args&&... args) {
   launch_kernel_pdl(pdl_enabled(), what, kernel, grid, block, smem, s, std::forward<Args>(args)...);
 }
+#else
+// HIP (BACKEND §7): no programmatic dependent launch (gpu::kDependentLaunch is false) and no RAGON_PROBE_SKIP probe,
+// so every launch is a plain one; pdl_begin() is then a no-op and the kernel computes exactly what it computes
+// under PDL. `pdl` is accepted and ignored.
+template <typename... Params, typename... Args>
+void launch_kernel_pdl(bool /*pdl*/, const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
+                       gpu::Stream s, Args&&... args) {
+  kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
+}
+
+template <typename... Params, typename... Args>
+void launch_kernel(const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem, gpu::Stream s,
+                   Args&&... args) {
+  launch_kernel_pdl(false, what, kernel, grid, block, smem, s, std::forward<Args>(args)...);
+}
+#endif
 
 // The attention kernels are left out of PDL unless RAGON_PDL_ATTN=1: llama.cpp found a race on DGX Spark in
 // its flash-attention kernels launched with PDL (ggml-org/llama.cpp#23825, attributed to an internal bug, fixed

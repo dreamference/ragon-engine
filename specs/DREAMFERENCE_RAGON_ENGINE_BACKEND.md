@@ -9,7 +9,7 @@ It builds on [ARCHITECTURE §8–9](./DREAMFERENCE_RAGON_ENGINE_ARCHITECTURE.md)
 - **What.** Every kernel the serve layer launches (attention including the shared and cascade phases, GDN/DeltaNet, the FFN GEMMs, the LM head and the sparse head, the drafter, KV pages, the top-K behind the samplers and the grammar mask, LoRA, the vision tower) is a host function in namespace `ragon::kernels` declared in one of three interface headers. Those declarations name no vendor type: a stream is `gpu::Stream`, a 16-bit float `gpu::bf16` or `gpu::half`. A backend supplies those types (§3), its capabilities (§4) and the definitions of every entry point (§2).
 - **How it is chosen.** At compile time: one CMake flag `-DRAGON_BACKEND=cuda|hip|metal` (default `cuda`), one backend per binary, no virtual call (§1).
 - **CUDA.** The first implementation is today's `.cu` files, unchanged. The types are aliases of the CUDA ones, so every object file the compiler emits is the same code as before the interface (§6: identical PTX, host code and kernel code; only the debug line tables differ).
-- **HIP and Metal.** `RAGON_BACKEND=hip` and `=metal` are reserved and refused with a message until their rows land (§7, §8). Each one implements §2 against its own types; the serve layer does not change.
+- **HIP and Metal.** `RAGON_BACKEND=hip` builds the kernels ported so far (topk.cu first, bit-identical to CUDA, §7); `=metal` is reserved and refused with a message until its row lands (§8). Each one implements §2 against its own types; the serve layer does not change.
 - **Not yet behind the interface.** The runtime layer (streams, events, graphs, allocation, copies, green contexts) is still called directly from the host files; its census and the plan to move it are in §5.2 (tier 2).
 
 ## 1. The interface is a compile-time backend namespace, not an abstract class
@@ -175,6 +175,7 @@ These parts compute on the host or only arrange data; every backend shares them 
 | `gpu::Stream` | An ordered queue of device work | `cudaStream_t` | `hipStream_t` | a handle to the engine's command-buffer queue (§8) |
 | `gpu::bf16` | BFloat16 storage, round to nearest even | `__nv_bfloat16` | `__hip_bfloat16` | `bfloat` (MSL), `uint16_t` storage on the host |
 | `gpu::half` | IEEE binary16 storage | `__half` | `__half` | `half` (MSL), `uint16_t` storage on the host |
+| `gpu::kWarpMask` | The full-warp mask of the `*_sync` warp intrinsics (a constant, not a type) | `0xffffffffu` (`unsigned`) | `0xffffffffull` (`unsigned long long`: HIP's warp-sync functions static_assert a 64-bit mask; wave32 only, §7) | — (simdgroup functions take no mask) |
 
 They are aliases, never wrappers: an alias leaves the mangled name, the overload set and the code unchanged, which is what keeps CUDA byte-identical (§6). A device pointer is a raw pointer (`gpu::bf16*`, `float*`); on CUDA and HIP it is a device address, on Metal see §8. The KV, tree and batch descriptor structs (`DevPos`, `TreeDesc`, `GatherBuf`, `SparseHeadBufs`, `MkAttnParams`, the `*Seqs` structs) are plain structs of such pointers and integers and are part of the interface.
 
@@ -195,11 +196,11 @@ They are aliases, never wrappers: an alias leaves the mangled name, the overload
 
 ### 5.1 Tier 1: the kernels (done)
 
-- `src/backend/backend.hpp` picks the backend by macro: no macro is CUDA, `RAGON_BACKEND_HIP` and `RAGON_BACKEND_METAL` stop with `#error` until their rows land.
+- `src/backend/backend.hpp` picks the backend by macro: no macro is CUDA, `RAGON_BACKEND_HIP` is HIP (§7), `RAGON_BACKEND_METAL` stops with `#error` until its row lands.
 - `src/backend/cuda/types.hpp` includes `cuda_bf16.h`, `cuda_fp16.h` and `cuda_runtime.h`, defines the aliases and capabilities, and `RAGON_GPU_DEVICE_CODE` when nvcc compiles device code.
 - The three interface headers include `backend/backend.hpp` instead of the CUDA headers and spell `gpu::Stream`, `gpu::bf16`, `gpu::half`. The include block keeps the same number of lines (comment lines fill it), so every later line keeps its number and `-lineinfo` points where it pointed.
 - The definitions stay in today's files (`src/core/*.cu`), unmoved: about ten branches in flight edit them, and a move would turn each of their merges into a conflict. Moving them to `src/backend/cuda/` is a later, mechanical commit (a rename with no content change), best made when few branches are open.
-- CMake: `RAGON_BACKEND` (cache string, `cuda` by default, `hip` and `metal` refused with a message). With `cuda` the CUDA language is enabled exactly as before; every compile line is unchanged.
+- CMake: `RAGON_BACKEND` (cache string, `cuda` by default, `hip` builds the ported kernels (§7), `metal` refused with a message). With `cuda` the CUDA language is enabled exactly as before; every compile line is unchanged.
 
 **Merging a branch that predates the interface.** Conflicts can only arise in the three interface headers. Apply to the branch's new lines there: `cudaStream_t` → `gpu::Stream`, `__nv_bfloat16` → `gpu::bf16`, `__half` → `gpu::half`. The `.cu` files and the host files may keep the CUDA spellings: under CUDA they are the same types.
 
@@ -229,6 +230,14 @@ A later change to the interface keeps the same proof: an alias or a declaration 
 ## 7. HIP (Windows node, Q203)
 
 The HIP row adds `src/backend/hip/types.hpp` (`hipStream_t`, `__hip_bfloat16`, `__half` from `hip_bf16.h` and `hip_fp16.h`; capabilities: graphs yes, dependent launch no, green contexts no, bulk copy no, persistent kernels per AMD §5), lifts the `#error` in backend.hpp and the CMake refusal, and compiles the `.cu` files as HIP (AMD_INVENTORY: hipify for most, rewritten for the tensor-core and PTX kernels). The entry points and their contracts are §2 unchanged; the exactness rules of AMD apply within the HIP build.
+
+**State (eng/hip-backend, 2026-11-14).** The row is in place and the first kernel file is ported:
+
+- `hip/types.hpp` as above, with `kPersistentKernels` false (the Windows driver reports no cooperative launch) and `gpu::kWarpMask` 64-bit (§3). Only wave32 targets are supported (gfx1151; the test checks `warpSize == 32`): a wave64 target would need the masks and the warp-level reductions widened.
+- `launch.cuh` includes `backend/backend.hpp`; under HIP `launch_kernel_pdl` and `launch_kernel` are a plain `<<<>>>` launch plus `hipGetLastError` (no dependent launch, `kDependentLaunch` false). The CUDA templates are unchanged.
+- `topk.cu` compiles from the same source under both backends (`gpu::kWarpMask` for the three masks, `gpu::Stream` for the stream parameters); no hipified copy is kept. hipify-clang alone does not get there: it keeps the 32-bit masks, which HIP refuses, and leaves `cudaLaunchKernelEx` and the programmatic-serialization attribute in launch.cuh unconverted.
+- CMake: `RAGON_BACKEND=hip` enables the HIP language (`CMAKE_HIP_ARCHITECTURES` gfx1151 by default) and builds only the ported kernels (`ragon_kernels_hip`) and `ragon-topk-tests`; the rest of the tree follows file by file. On Windows the CXX and HIP compilers are both TheRock's `clang++` (GNU-like driver) inside a VS 2022 developer environment: with `clang-cl` as CXX, CMake 3.31 compiles HIP sources with the clang-cl rule, refuses the MSVC runtime selection for HIP and puts `/machine:x64` in the link line.
+- Exactness (A-gate 2): `tests/topk_tests.cu` draws its inputs from `std::mt19937` with integer arithmetic only (the same on every standard library), covers plain, masked and special values (±inf, ±0, subnormals, ties) at K 1, 16, 20 and 64, checks every output bit for bit against a host reference, and hashes all outputs. The HIP build on gfx1151 (TheRock 10.0.0) gives the same bytes as the CUDA build on a GB10 (FNV-1a `bc18c88dc89f0d68`, checked in the test), across runs.
 
 ## 8. Metal (Mac node, Q204, in the 1.0 gate)
 

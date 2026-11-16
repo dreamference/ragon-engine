@@ -59,12 +59,12 @@ __device__ void warp_topk(Get get, int n, int K, WarpList L, int& count_out) {
     // Every lane has read count_s and the threshold before lane 0 may change them (a ballot synchronizes the
     // lanes but does not order their memory accesses; compute-sanitizer's racecheck flagged it).
     __syncwarp();
-    unsigned mask = __ballot_sync(0xffffffffu, cand);
+    unsigned mask = __ballot_sync(gpu::kWarpMask, cand);
     while (mask) {
       const int src = __ffs(mask) - 1;
       mask &= mask - 1;
-      const float sv = __shfl_sync(0xffffffffu, v, src);
-      const int si = __shfl_sync(0xffffffffu, idx, src);
+      const float sv = __shfl_sync(gpu::kWarpMask, v, src);
+      const int si = __shfl_sync(gpu::kWarpMask, idx, src);
       if (lane == 0) {
         int c = count_s;
         insert(L, c, K, sv, si);
@@ -149,7 +149,7 @@ __global__ void topk_stage2(const float* __restrict__ pv, const int* __restrict_
 
 size_t topk_scratch_floats(int rows, int K) { return static_cast<size_t>(rows) * kSegments * K * 2; }
 
-void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* vals, int* ids, cudaStream_t s) {
+void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* vals, int* ids, gpu::Stream s) {
   if (K < 1 || K > 64) throw std::runtime_error("topk_rows: K must be in [1, 64]");
   float* pv = scratch;
   int* pi = reinterpret_cast<int*>(scratch + static_cast<size_t>(rows) * kSegments * K);
@@ -158,7 +158,7 @@ void topk_rows(const float* x, int rows, int V, int K, float* scratch, float* va
 }
 
 void topk_rows_masked(const float* x, int rows, int V, int K, const int32_t* mask, int words, float* scratch,
-                      float* vals, int* ids, cudaStream_t s) {
+                      float* vals, int* ids, gpu::Stream s) {
   if (K < 1 || K > 64) throw std::runtime_error("topk_rows_masked: K must be in [1, 64]");
   if (words * 32 < V) throw std::runtime_error("topk_rows_masked: the mask is shorter than the row");
   float* pv = scratch;

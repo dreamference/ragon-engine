@@ -12,6 +12,9 @@ using Stream = cudaStream_t;  // an ordered queue of device work; every entry po
 using bf16 = __nv_bfloat16;   // bfloat16 storage (weights, KV caches, BF16 activations)
 using half = __half;          // IEEE binary16 storage (the stream GEMMs' activation copy)
 
+// The all-lanes mask of the warp-synchronous intrinsics (__ballot_sync, __shfl_sync): the kernels' 0xffffffffu.
+inline constexpr unsigned kWarpMask = 0xffffffffu;
+
 // What the backend offers to the engine's optional paths (BACKEND §4). A backend without one keeps the engine on
 // the path that does not need it; the outputs do not change, only the speed.
 inline constexpr const char* kName = "cuda";
