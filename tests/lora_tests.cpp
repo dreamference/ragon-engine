@@ -1,7 +1,9 @@
 // The LoRA loader, the adapter library and the GPU pool's slots, on the host (src/core/lora.hpp): tiny adapters
 // written as PEFT writes them, against a tiny model of two full-attention and two DeltaNet layers.
 #include <stdlib.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -10,6 +12,9 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#ifdef _WIN32
+#include <random>
+#endif
 #include <string>
 #include <vector>
 
@@ -157,9 +162,16 @@ bool throws(const std::function<void()>& f, const std::string& part) {
 }
 
 std::string tmp_root() {
+#ifdef _WIN32
+  // No mkdtemp: a fresh directory under %TEMP% with a random name.
+  std::error_code ec;
+  const fs::path d = fs::temp_directory_path(ec) / ("ragon-lora-tests-" + std::to_string(std::random_device{}()));
+  return !ec && fs::create_directory(d, ec) && !ec ? d.generic_string() : std::string();
+#else
   char t[] = "/tmp/ragon-lora-tests-XXXXXX";
   const char* d = mkdtemp(t);
   return d ? std::string(d) : std::string();
+#endif
 }
 
 void test_full_form(const std::string& root) {
@@ -289,14 +301,22 @@ void test_library(const std::string& root) {
   write_adapter(lib + "/a2", other, config());
   write_adapter(lib + "/b", full_form(), config());
   write_adapter(root + "/outside", full_form(), config());
+#ifdef _WIN32
+  fs::create_directory_symlink(root + "/outside", lib + "/escape");  // Windows tells a directory link from a file link
+#else
   fs::create_symlink(root + "/outside", lib + "/escape");
+#endif
 
   ragon::LoraLibrary none("", 8, tiny(), {});
   EXPECT(!none.enabled());
   EXPECT(throws([&] { none.load("a", lib + "/a"); }, "without an adapter library"));
 
   ragon::LoraLibrary l(lib + "/.", 2, tiny(), {});
+#ifdef _WIN32
+  EXPECT(l.enabled() && l.root() == fs::canonical(lib).generic_string());  // the library keeps '/' separators
+#else
   EXPECT(l.enabled() && l.root() == fs::canonical(lib).string());
+#endif
   EXPECT(throws([&] { l.load("x", root + "/outside"); }, "not in the adapter library"));
   EXPECT(throws([&] { l.load("x", lib + "/../outside"); }, "not in the adapter library"));
   EXPECT(throws([&] { l.load("x", lib + "/escape"); }, "not in the adapter library"));

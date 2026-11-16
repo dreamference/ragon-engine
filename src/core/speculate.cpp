@@ -946,7 +946,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
   // BACKLOG 19's offline input (bench/sparse_head): RAGON_DUMP_DRAFT_H=FILE appends each one-stream draft's rows' final
   // hidden states (E x hidden floats, the LM head's input) and their top-16 candidates (E x 16 ints).
   static FILE* dump = [] { const char* f = std::getenv("RAGON_DUMP_DRAFT_H"); return f ? std::fopen(f, "ab") : nullptr; }();
-  static long dump_left = [] { const char* n = std::getenv("RAGON_DUMP_DRAFT_H_STEPS"); return n ? std::atol(n) : 1L << 40; }();
+  static int64_t dump_left = [] { const char* n = std::getenv("RAGON_DUMP_DRAFT_H_STEPS"); return n ? int64_t(std::atol(n)) : int64_t{1} << 40; }();
   if (dump && dump_left-- > 0) {
     const int E = B - 1, H = draft_->config().hidden, K16 = draft_->config().selector_top_k;
     std::vector<float> h(size_t(E) * H);

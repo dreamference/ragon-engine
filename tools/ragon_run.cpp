@@ -192,8 +192,8 @@ int vision_check_run(ragon::Engine& engine, const std::string& dir, bool bench, 
   for (const auto& e : std::filesystem::directory_iterator(dir))
     if (e.path().extension() == ".json") names.push_back(e.path().stem().string());
   std::sort(names.begin(), names.end());
-  __nv_bfloat16* dout = nullptr;
-  cudaMalloc(&dout, size_t(tower->max_patches() / 4) * OUT * 2);
+  ragon::gpu::bf16* dout = nullptr;
+  ragon::gpu::device_alloc(&dout, size_t(tower->max_patches() / 4) * OUT * 2);
   for (const std::string& name : names) {
     const std::string base = dir + "/" + name;
     const nlohmann::json meta = nlohmann::json::parse(read_file(base + ".json"));
@@ -257,9 +257,9 @@ int vision_check_run(ragon::Engine& engine, const std::string& dir, bool bench, 
     // 2. The tower on production's pixel values against the references.
     if (ref_patches.size() != size_t(n) * PD) throw std::runtime_error(name + ": pixel_values has the wrong size");
     tower->forward(ref_patches.data(), gh, gw, dout, nullptr);
-    cudaDeviceSynchronize();
+    ragon::gpu::device_sync();
     std::vector<uint16_t> ob(size_t(n / 4) * OUT);
-    cudaMemcpy(ob.data(), dout, ob.size() * 2, cudaMemcpyDeviceToHost);
+    ragon::gpu::memcpy_sync(ob.data(), dout, ob.size() * 2, ragon::gpu::kD2H);
     std::vector<float> eng(ob.size());
     for (size_t i = 0; i < ob.size(); ++i) eng[i] = bf16f(ob[i]);
     auto load_f32 = [&](const std::string& path) {
@@ -323,26 +323,26 @@ int vision_check_run(ragon::Engine& engine, const std::string& dir, bool bench, 
     std::printf("  engine against FP32: rel L2 %.3e, worst cosine %.6f; %s (%s: %.3e, %.6f) %s\n", er, ec,
                 cos_summary(ecos).c_str(), floor_name.c_str(), floor_rel, floor_cos, ok ? "ok" : "FAIL");
     if (bench) {
-      cudaEvent_t a, b;
-      cudaEventCreate(&a);
-      cudaEventCreate(&b);
+      ragon::gpu::Event a, b;
+      ragon::gpu::event_create(&a);
+      ragon::gpu::event_create(&b);
       std::vector<float> ms;
       for (int k = 0; k < 5; ++k) {
-        cudaEventRecord(a);
+        ragon::gpu::event_record(a, nullptr);
         tower->forward(ref_patches.data(), gh, gw, dout, nullptr);
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
+        ragon::gpu::event_record(b, nullptr);
+        ragon::gpu::event_sync(b);
         float t = 0;
-        cudaEventElapsedTime(&t, a, b);
+        ragon::gpu::event_elapsed(&t, a, b);
         ms.push_back(t);
       }
       std::sort(ms.begin(), ms.end());
       std::printf("  tower: %.1f ms (median of 5), %.0f patches/s\n", ms[2], n / (ms[2] / 1e3));
-      cudaEventDestroy(a);
-      cudaEventDestroy(b);
+      ragon::gpu::event_destroy(a);
+      ragon::gpu::event_destroy(b);
     }
   }
-  cudaFree(dout);
+  ragon::gpu::device_free(dout);
   std::printf(failures ? "VISION CHECK FAILED (%d)\n" : "vision check passed\n", failures);
   return failures ? 1 : 0;
 }

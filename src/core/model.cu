@@ -2,8 +2,8 @@
 
 #include "core/kernels.cuh"
 
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include "backend/device.hpp"  // gpu::bf16, gpu::fp8_e4m3, e4m3_from_float and the runtime calls (BACKEND §5.2)
+// (model.cu holds no kernels: its device allocations and copies are the runtime tier's)
 
 #include <algorithm>
 #include <cmath>
@@ -29,13 +29,13 @@ namespace {
 constexpr float kHeadInScale = 0.02167038805782795f;
 
 float e4m3_value(uint8_t c) {
-  __nv_fp8_e4m3 v;
+  gpu::fp8_e4m3 v;
   v.__x = c;
   return static_cast<float>(v);
 }
 
-void check(cudaError_t e, const std::string& what) {
-  if (e != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(e));
+void check(gpu::Error e, const std::string& what) {
+  if (e != gpu::kSuccess) throw std::runtime_error(what + ": " + gpu::error_string(e));
 }
 
 // A megakernel stage reads one kind of NVFP4 tiles (LOWBIT §8 a1): false when any of a group's NVFP4 projections has
@@ -95,15 +95,15 @@ Model::Model(const std::string& dir) : dir_(dir) {
   // The served checkpoint nests the text model under model.language_model.; a text-only one (the all-NVFP4
   // checkpoint of LOWBIT §8 a1) has it under model.
   prefix_ = ck.has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
-  embed_ = static_cast<const __nv_bfloat16*>(upload(ck, prefix_ + "embed_tokens.weight", "BF16"));
-  final_norm_ = static_cast<const __nv_bfloat16*>(upload(ck, prefix_ + "norm.weight", "BF16"));
+  embed_ = static_cast<const gpu::bf16*>(upload(ck, prefix_ + "embed_tokens.weight", "BF16"));
+  final_norm_ = static_cast<const gpu::bf16*>(upload(ck, prefix_ + "norm.weight", "BF16"));
   lm_head_ = fp4(ck, "lm_head");
   for (int i = 0; i < cfg_.layers; ++i) {
     const std::string p = prefix_ + "layers." + std::to_string(i) + ".";
     LayerWeights L;
     L.full = cfg_.full_attention[i];
-    L.input_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "input_layernorm.weight", "BF16"));
-    L.post_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "post_attention_layernorm.weight", "BF16"));
+    L.input_norm = static_cast<const gpu::bf16*>(upload(ck, p + "input_layernorm.weight", "BF16"));
+    L.post_norm = static_cast<const gpu::bf16*>(upload(ck, p + "post_attention_layernorm.weight", "BF16"));
     L.gate = fp4(ck, p + "mlp.gate_proj");
     L.up = fp4(ck, p + "mlp.up_proj");
     L.down = fp4(ck, p + "mlp.down_proj");
@@ -113,8 +113,8 @@ Model::Model(const std::string& dir) : dir_(dir) {
       L.k = fp8(ck, p + "self_attn.k_proj", c);
       L.v = fp8(ck, p + "self_attn.v_proj", c);
       L.o = fp8(ck, p + "self_attn.o_proj", c);
-      L.q_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "self_attn.q_norm.weight", "BF16"));
-      L.k_norm = static_cast<const __nv_bfloat16*>(upload(ck, p + "self_attn.k_norm.weight", "BF16"));
+      L.q_norm = static_cast<const gpu::bf16*>(upload(ck, p + "self_attn.q_norm.weight", "BF16"));
+      L.k_norm = static_cast<const gpu::bf16*>(upload(ck, p + "self_attn.k_norm.weight", "BF16"));
     } else {
       const std::string a = p + "linear_attn.";
       const bool c = codable(ck, {a + "in_proj_qkv", a + "in_proj_z", a + "out_proj"});
@@ -123,10 +123,10 @@ Model::Model(const std::string& dir) : dir_(dir) {
       L.out = fp8(ck, a + "out_proj", c);
       L.in_a = bf16_linear(ck, a + "in_proj_a");
       L.in_b = bf16_linear(ck, a + "in_proj_b");
-      L.conv = static_cast<const __nv_bfloat16*>(upload(ck, a + "conv1d.weight", "BF16"));
-      L.A_log = static_cast<const __nv_bfloat16*>(upload(ck, a + "A_log", "BF16"));
-      L.dt_bias = static_cast<const __nv_bfloat16*>(upload(ck, a + "dt_bias", "BF16"));
-      L.lin_norm = static_cast<const __nv_bfloat16*>(upload(ck, a + "norm.weight", "BF16"));
+      L.conv = static_cast<const gpu::bf16*>(upload(ck, a + "conv1d.weight", "BF16"));
+      L.A_log = static_cast<const gpu::bf16*>(upload(ck, a + "A_log", "BF16"));
+      L.dt_bias = static_cast<const gpu::bf16*>(upload(ck, a + "dt_bias", "BF16"));
+      L.lin_norm = static_cast<const gpu::bf16*>(upload(ck, a + "norm.weight", "BF16"));
       if (L.in_qkv.N != cfg_.lin_conv_channels() || L.in_z.N != cfg_.lin_value_size())
         throw std::runtime_error("unexpected linear-attention projection shapes in layer " + std::to_string(i));
     }
@@ -142,15 +142,15 @@ Model::Model(const std::string& dir) : dir_(dir) {
 }
 
 Model::~Model() {
-  for (void* p : allocations_) cudaFree(p);
+  for (void* p : allocations_) gpu::device_free(p);
 }
 
 const void* Model::upload(const Checkpoint& ck, const std::string& name, const std::string& dtype) {
   const TensorView& t = ck.get(name);
   if (t.dtype != dtype) throw std::runtime_error(name + " is " + t.dtype + ", expected " + dtype);
   void* d = nullptr;
-  check(cudaMalloc(&d, t.bytes), "cudaMalloc " + name);
-  check(cudaMemcpy(d, t.data, t.bytes, cudaMemcpyHostToDevice), "upload " + name);
+  check(gpu::device_alloc(&d, t.bytes), "cudaMalloc " + name);
+  check(gpu::memcpy_sync(d, t.data, t.bytes, gpu::kH2D), "upload " + name);
   allocations_.push_back(d);
   bytes_ += t.bytes;
   return d;
@@ -167,20 +167,20 @@ float Model::scalar(const Checkpoint& ck, const std::string& name) {
 const uint8_t* upload_tiled(const TensorView& values, const TensorView* scales, int N, int K, size_t* bytes) {
   auto to_device = [](const TensorView& t) {
     void* d = nullptr;
-    check(cudaMalloc(&d, t.bytes), "cudaMalloc staging");
-    check(cudaMemcpy(d, t.data, t.bytes, cudaMemcpyHostToDevice), "upload staging");
+    check(gpu::device_alloc(&d, t.bytes), "cudaMalloc staging");
+    check(gpu::memcpy_sync(d, t.data, t.bytes, gpu::kH2D), "upload staging");
     return static_cast<uint8_t*>(d);
   };
   const size_t tiled = scales ? kernels::tiled_bytes_nvfp4(N, K) : kernels::tiled_bytes_fp8(N, K);
   void* out = nullptr;
-  check(cudaMalloc(&out, tiled), "cudaMalloc tiled");
+  check(gpu::device_alloc(&out, tiled), "cudaMalloc tiled");
   uint8_t* v = to_device(values);
   uint8_t* sc = scales ? to_device(*scales) : nullptr;
   if (scales) kernels::retile_nvfp4(v, sc, static_cast<uint8_t*>(out), N, K, nullptr);
   else kernels::retile_fp8(v, static_cast<uint8_t*>(out), N, K, nullptr);
-  check(cudaDeviceSynchronize(), "retile");
-  cudaFree(v);
-  if (sc) cudaFree(sc);
+  check(gpu::device_sync(), "retile");
+  gpu::device_free(v);
+  if (sc) gpu::device_free(sc);
   *bytes += tiled;
   return static_cast<const uint8_t*>(out);
 }
@@ -200,8 +200,8 @@ Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N
   }
   auto dev = [&](size_t n, const void* host) {
     void* d = nullptr;
-    check(cudaMalloc(&d, n), "cudaMalloc coded");
-    if (host) check(cudaMemcpy(d, host, n, cudaMemcpyHostToDevice), "upload coded");
+    check(gpu::device_alloc(&d, n), "cudaMalloc coded");
+    if (host) check(gpu::memcpy_sync(d, host, n, gpu::kH2D), "upload coded");
     return static_cast<uint8_t*>(d);
   };
   uint8_t* v = dev(values.bytes, values.data);
@@ -211,8 +211,8 @@ Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N
   uint8_t* raw = dev(scales.bytes, nullptr);
   uint8_t* tab = dev(kernels::kScaleCodes, table);
   kernels::retile_nvfp4_coded(v, sc, map, blob, raw, N, K, nullptr);
-  check(cudaDeviceSynchronize(), "retile coded");
-  cudaFree(v), cudaFree(sc), cudaFree(map);
+  check(gpu::device_sync(), "retile coded");
+  gpu::device_free(v), gpu::device_free(sc), gpu::device_free(map);
   owned.push_back(blob), owned.push_back(raw), owned.push_back(tab);
   *bytes += kernels::tiled_bytes_nvfp4_coded(N, K) + scales.bytes + kernels::kScaleCodes;
   u.w = blob;
@@ -221,13 +221,13 @@ Fp4Upload upload_nvfp4(const TensorView& values, const TensorView& scales, int N
   return u;
 }
 
-Nvfp4Host quantize_nvfp4(const __nv_bfloat16* w, int N, int K) {
+Nvfp4Host quantize_nvfp4(const gpu::bf16* w, int N, int K) {
   if (N <= 0 || K <= 0 || K % 16) throw std::runtime_error("quantize_nvfp4: K must be a positive multiple of 16");
   static constexpr float kE2M1[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
   static constexpr float kBounds[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.f};
   auto bf = [&](size_t i) { return __bfloat162float(w[i]); };
   auto e4m3 = [](uint8_t c) {
-    __nv_fp8_e4m3 v;
+    gpu::fp8_e4m3 v;
     v.__x = c;
     return static_cast<float>(v);
   };
@@ -262,7 +262,7 @@ Nvfp4Host quantize_nvfp4(const __nv_bfloat16* w, int N, int K) {
         float bm = 0.f;
         for (int j = 0; j < 16; ++j) bm = std::max(bm, std::fabs(bf(base + j)));
         const float sv = std::max(bm / 6.f / g, 0x1p-9f);
-        const uint8_t sc = __nv_cvt_float_to_fp8(sv, __NV_SATFINITE, __NV_E4M3);
+        const uint8_t sc = gpu::e4m3_from_float(sv);
         q.scales[size_t(r) * (K / 16) + b] = sc;
         const float s = e4m3(sc) * g;
         for (int j = 0; j < 16; ++j) {
@@ -295,7 +295,7 @@ Fp4Weight Model::fp4(const Checkpoint& ck, const std::string& prefix, bool codes
   if (!ct && t.dtype == "BF16" && t.shape.size() == 2) {
     w.N = static_cast<int>(t.shape[0]);
     w.K = static_cast<int>(t.shape[1]);
-    const Nvfp4Host q = quantize_nvfp4(reinterpret_cast<const __nv_bfloat16*>(t.data), w.N, w.K);
+    const Nvfp4Host q = quantize_nvfp4(reinterpret_cast<const gpu::bf16*>(t.data), w.N, w.K);
     TensorView v, s;
     v.dtype = "U8", v.shape = {w.N, w.K / 2}, v.data = q.values.data(), v.bytes = q.values.size();
     s.dtype = "F8_E4M3", s.shape = {w.N, w.K / 16}, s.data = q.scales.data(), s.bytes = q.scales.size();
@@ -360,18 +360,18 @@ Bf16Weight Model::bf16_linear(const Checkpoint& ck, const std::string& prefix) {
   w.K = static_cast<int>(t.shape[1] * 2);
   if (s.bytes != size_t(w.N) * (w.K / 16)) throw std::runtime_error(prefix + ": unexpected scale shape");
   const float g = scalar(ck, prefix + ".weight_global_scale");
-  std::vector<__nv_bfloat16> h(size_t(w.N) * w.K);
+  std::vector<gpu::bf16> h(size_t(w.N) * w.K);
   for (size_t i = 0; i < h.size(); ++i) {
     const uint8_t b = t.data[i / 2];
     const float v = kE2M1[i % 2 ? b >> 4 : b & 15] * e4m3_value(s.data[i / 16]);
-    h[i] = __float2bfloat16_rn(v / g);
+    h[i] = gpu::bf16_from_float(v / g);
   }
   void* d = nullptr;
-  check(cudaMalloc(&d, h.size() * 2), "cudaMalloc " + prefix);
-  check(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice), "upload " + prefix);
+  check(gpu::device_alloc(&d, h.size() * 2), "cudaMalloc " + prefix);
+  check(gpu::memcpy_sync(d, h.data(), h.size() * 2, gpu::kH2D), "upload " + prefix);
   allocations_.push_back(d);
   bytes_ += h.size() * 2;
-  w.w = static_cast<const __nv_bfloat16*>(d);
+  w.w = static_cast<const gpu::bf16*>(d);
   return w;
 }
 
@@ -380,7 +380,7 @@ Bf16Weight Model::bf16(const Checkpoint& ck, const std::string& name) {
   const TensorView& t = ck.get(name);
   w.N = static_cast<int>(t.shape[0]);
   w.K = static_cast<int>(t.shape[1]);
-  w.w = static_cast<const __nv_bfloat16*>(upload(ck, name, "BF16"));
+  w.w = static_cast<const gpu::bf16*>(upload(ck, name, "BF16"));
   return w;
 }
 

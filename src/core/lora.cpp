@@ -14,6 +14,20 @@
 
 #include "core/safetensors.hpp"
 
+#ifdef _WIN32
+#include <filesystem>
+#define PATH_MAX 32768  // the longest path Windows' wide calls take
+// Windows has no realpath: std::filesystem::canonical also resolves every link and fails on a missing path, and its
+// generic form has '/' separators, so the adapter library's prefix check below reads the same on both systems.
+static char* realpath(const char* path, char* out) {
+  std::error_code ec;
+  const std::string s = std::filesystem::canonical(std::filesystem::path(path), ec).generic_string();
+  if (ec || s.size() >= PATH_MAX) return nullptr;
+  std::memcpy(out, s.c_str(), s.size() + 1);
+  return out;
+}
+#endif
+
 namespace ragon {
 
 namespace {

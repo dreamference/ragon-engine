@@ -14,6 +14,10 @@
 namespace ragon::gpu {
 
 using bf16x2 = __nv_bfloat162;  // two bfloat16 values, low first
+using fp8_e4m3 = __nv_fp8_e4m3;  // OCP FP8 E4M3, convertible to float on the host and the device
+
+// A float to bf16, rounded to nearest even (on the host and the device).
+__host__ __device__ __forceinline__ bf16 bf16_from_float(float v) { return __float2bfloat16_rn(v); }
 
 // Two floats to a bf16x2, each rounded to nearest even.
 __device__ __forceinline__ bf16x2 floats_to_bf16x2(float lo, float hi) { return __floats2bfloat162_rn(lo, hi); }
