@@ -1,6 +1,6 @@
 // Checks the weight-streaming kernels against a host reference on random data, for every row count the
 // GEMV path takes and for the BF16 GEMM (gemm_bf16) path.
-#include <cuda_fp8.h>
+#include "gpu_test.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -14,19 +14,9 @@ namespace {
 
 const float kFp4[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
 
-float fp8(uint8_t b) {
-  __nv_fp8_e4m3 v;
-  v.__x = b;
-  return static_cast<float>(v);
-}
+float fp8(uint8_t b) { return ragon::test::e4m3(b); }
 
-template <typename T>
-T* upload(const std::vector<T>& h) {
-  T* d = nullptr;
-  cudaMalloc(&d, h.size() * sizeof(T));
-  cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
-  return d;
-}
+using ragon::test::upload;
 
 bool close(const std::vector<float>& a, const std::vector<float>& b, const char* what, int M) {
   double worst = 0;
@@ -61,8 +51,7 @@ int main() {
     std::vector<float> x(size_t(M) * K);
     for (auto& v : x) v = normal(rng);
     float* dx = upload(x);
-    float* dy = nullptr;
-    cudaMalloc(&dy, size_t(M) * N * sizeof(float));
+    float* dy = ragon::test::alloc<float>(size_t(M) * N);
     std::vector<float> ref4(size_t(M) * N), ref8(size_t(M) * N), got(size_t(M) * N);
     for (int m = 0; m < M; ++m)
       for (int n = 0; n < N; ++n) {
@@ -78,12 +67,15 @@ int main() {
       }
     if (M <= ragon::kernels::kMaxGemvRows) {
       ragon::kernels::gemv_nvfp4(dx, M, dw4, ds4, scale2, dy, N, K, nullptr);
-      cudaMemcpy(got.data(), dy, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
+      ragon::test::d2h(got.data(), dy, got.size() * sizeof(float));
       ok &= close(got, ref4, "gemv_nvfp4", M);
       ragon::kernels::gemv_fp8(dx, M, dw8, scale8, dy, N, K, nullptr);
-      cudaMemcpy(got.data(), dy, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
+      ragon::test::d2h(got.data(), dy, got.size() * sizeof(float));
       ok &= close(got, ref8, "gemv_fp8", M);
     } else {
+#if defined(RAGON_BACKEND_HIP)
+      std::printf("%-26s M=%-3d skipped: gemm_bf16 is W1, not in the HIP build yet\n", "gemm_bf16", M);
+#else
       __nv_bfloat16 *wb, *xb;
       cudaMalloc(&wb, size_t(N) * K * 2);
       cudaMalloc(&xb, size_t(M) * K * 2);
@@ -110,11 +102,14 @@ int main() {
       ok &= worst < 2e-2;
       cudaFree(wb);
       cudaFree(xb);
+#endif
     }
-    cudaFree(dx);
-    cudaFree(dy);
+    ragon::test::free_bytes(dx);
+    ragon::test::free_bytes(dy);
   }
-  // Bandwidth of the decode path (M = 1) on the model's largest shapes; informational, not a pass/fail.
+  // Bandwidth of the decode path (M = 1) on the model's largest shapes; informational, not a pass/fail. Not in the HIP
+  // build: the port's rows time nothing (backlog/plan-win-engine-p1.md).
+#if !defined(RAGON_BACKEND_HIP)
   {
     const int BN = 17408, BK = 5120;
     uint8_t *bw4, *bs4, *bw8;
@@ -157,9 +152,9 @@ int main() {
     cudaFree(bx);
     cudaFree(by);
   }
-  cudaError_t e = cudaDeviceSynchronize();
-  if (e != cudaSuccess) {
-    std::printf("CUDA error: %s\n", cudaGetErrorString(e));
+#endif
+  if (const char* e = ragon::test::sync_error()) {
+    std::printf("GPU error: %s\n", e);
     return 1;
   }
   std::printf(ok ? "all kernel tests passed\n" : "KERNEL TESTS FAILED\n");
