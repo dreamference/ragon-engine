@@ -289,13 +289,14 @@ void run(bool fp4, const float* dx, int M, int Kd, uint16_t* xh, float* xinv, co
 
 // One shape: tolerance against the host at every M, every row's bytes those of the 64-row launch, and a repeat of the
 // 64-row launch the same bytes.
-bool test_gemm(int N, int Kd, uint32_t seed, const std::vector<int>& Ms) {
+bool test_gemm(int N, int Kd, uint32_t seed, bool split, const std::vector<int>& Ms) {
   std::mt19937 rng(seed);
   Mat w = make_mat(rng, N, Kd);
   const int MMAX = K::kMaxStreamRows;
   std::vector<float> x(size_t(MMAX) * Kd);
   for (auto& v : x) v = value(rng);
   bool ok = retile(w, "stream");
+  if (split) K::stream_gemm_split_k(w.dw4, N, Kd), K::stream_gemm_split_k(w.dw8, N, Kd);
   float* dx = upload(x);
   uint16_t* xh = ragon::test::alloc<uint16_t>(size_t(MMAX) * Kd);
   float *xinv = ragon::test::alloc<float>(MMAX), *dy = ragon::test::alloc<float>(size_t(MMAX) * N);
@@ -340,8 +341,8 @@ bool test_gemm(int N, int Kd, uint32_t seed, const std::vector<int>& Ms) {
       // K=5120 measured); a wrong index or scale shows as 1e-1.
       const bool good = worstq < std::max(5e-5, 3e-8 * Kd) && (Kd < 2048 || worst < 2e-3) && same && again && !err;
       ok &= good;
-      std::printf("stream_gemm %-5s N=%d K=%d M=%-2d err/rms %.2e (FP16 x %.1e), rows identical to M=64 %s, repeat identical %s%s%s %s\n",
-                  fp4 ? "nvfp4" : "fp8", N, Kd, M, worst, worstq, same ? "yes" : "NO", again ? "yes" : "NO", err ? ", error " : "",
+      std::printf("stream_gemm %-5s N=%d K=%d%s M=%-2d err/rms %.2e (FP16 x %.1e), rows identical to M=64 %s, repeat identical %s%s%s %s\n",
+                  fp4 ? "nvfp4" : "fp8", N, Kd, split ? " marked" : "", M, worst, worstq, same ? "yes" : "NO", again ? "yes" : "NO", err ? ", error " : "",
                   err ? err : "", good ? "ok" : "FAIL");
     }
   }
@@ -354,11 +355,12 @@ bool test_gemm(int N, int Kd, uint32_t seed, const std::vector<int>& Ms) {
 // stream_gemm_multi: each target's bytes those of its single launch (grouping changes nothing), 2 to 4 targets.
 bool test_multi() {
   std::mt19937 rng(23);
-  const int Kd = 2048, Ns[] = {528, 4096, 1024, 16};  // 4096 does not split K, the others do
+  const int Kd = 2048, Ns[] = {528, 4096, 1024, 16};  // 528 and 16 marked (K split in 8), 1024 not, 4096 too wide
   std::vector<Mat> ws;
   for (int N : Ns) ws.push_back(make_mat(rng, N, Kd));
   bool ok = true;
   for (auto& w : ws) ok &= retile(w, "multi");
+  for (int i : {0, 3}) K::stream_gemm_split_k(ws[i].dw4, Ns[i], Kd), K::stream_gemm_split_k(ws[i].dw8, Ns[i], Kd);
   const int MMAX = K::kMaxStreamRows;
   std::vector<float> x(size_t(MMAX) * Kd);
   for (auto& v : x) v = value(rng);
@@ -397,6 +399,58 @@ bool test_multi() {
   return ok;
 }
 
+// One split blob on two streams at once (a side prefill chunk beside the main step): each stream has its own split
+// counters, so every launch's bytes are those of the blob alone on the null stream.
+bool test_two_streams() {
+  std::mt19937 rng(31);
+  const int N = 1280, Kd = 5120, M = 16, reps = 40;  // the drafter conv projection: K split in 4
+  Mat w = make_mat(rng, N, Kd);
+  bool ok = retile(w, "streams");
+  K::stream_gemm_split_k(w.dw4, N, Kd), K::stream_gemm_split_k(w.dw8, N, Kd);
+  float* dx[2];
+  uint16_t* xh[2];
+  float *xinv[2], *dy[2];
+  std::vector<float> want[2];
+  for (int j = 0; j < 2; ++j) {
+    std::vector<float> x(size_t(M) * Kd);
+    for (auto& v : x) v = value(rng);
+    dx[j] = upload(x);
+    xh[j] = ragon::test::alloc<uint16_t>(size_t(M) * Kd);
+    xinv[j] = ragon::test::alloc<float>(M);
+    dy[j] = ragon::test::alloc<float>(size_t(M) * N);
+  }
+  gpu::Stream st[2];
+  for (auto& s : st) ok &= gpu::stream_create(&s, gpu::kStreamNonBlocking) == gpu::kSuccess;
+  for (bool fp4 : {true, false}) {
+    const float gs = fp4 ? 0.37f : 0.021f;
+    for (int j = 0; j < 2; ++j) {
+      run(fp4, dx[j], M, Kd, xh[j], xinv[j], w, gs, dy[j]);
+      want[j] = download(dy[j], size_t(M) * N);
+    }
+    (void)gpu::device_sync();  // an error shows in sync_error below
+    bool same = true;
+    for (int r = 0; r < reps && same; ++r) {
+      for (int j = 0; j < 2; ++j) {
+        const gpu::half* x = reinterpret_cast<gpu::half*>(xh[j]);
+        if (fp4) K::stream_gemm_nvfp4(x, xinv[j], M, w.dw4, nullptr, gs, dy[j], N, Kd, st[j]);
+        else K::stream_gemm_fp8(x, xinv[j], M, w.dw8, gs, dy[j], N, Kd, st[j]);
+      }
+      (void)gpu::device_sync();
+      for (int j = 0; j < 2; ++j) same &= download(dy[j], size_t(M) * N) == want[j];
+    }
+    const char* err = ragon::test::sync_error();
+    ok &= same && !err;
+    std::printf("stream_gemm %-5s N=%d K=%d on two streams at once, %d launches each: bytes those of one stream %s%s%s\n",
+                fp4 ? "nvfp4" : "fp8", N, Kd, reps, same ? "yes ok" : "NO FAIL", err ? ", error " : "", err ? err : "");
+  }
+  for (auto s : st) (void)gpu::stream_destroy(s);
+  for (int j = 0; j < 2; ++j)
+    ragon::test::free_bytes(dx[j]), ragon::test::free_bytes(xh[j]), ragon::test::free_bytes(xinv[j]),
+        ragon::test::free_bytes(dy[j]);
+  ragon::test::free_bytes(w.dw4), ragon::test::free_bytes(w.dw8);
+  return ok;
+}
+
 // ---- bench ----
 __global__ void fill_kernel(uint8_t* p, size_t n, uint32_t seed, int mode) {
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n;
@@ -418,6 +472,7 @@ struct Group {
   bool fp4;
   int K;
   std::vector<int> Ns;
+  bool split = false;  // marked as the loader marks it (stream_gemm_split_k)
 };
 
 double median(std::vector<double> v) {
@@ -431,7 +486,7 @@ void bench(const std::string& only) {
       {"head", true, 5120, {248320}},         {"dn_in", false, 5120, {10240, 6144}},
       {"out", false, 6144, {5120}},           {"a_qkv", false, 5120, {12288, 1024, 1024}},
       {"d_qkv", true, 5120, {4096, 1024, 1024}}, {"d_o", true, 4096, {5120}},
-      {"d_fc", true, 25600, {5120}},          {"d_kproj", true, 5120, {1280}},
+      {"d_fc", true, 25600, {5120}},          {"d_kproj", true, 5120, {1280}, true},
       {"d_head48k", true, 5120, {49152}},     {"d_head80k", true, 5120, {81920}},
   };
   const long long kMinBytes = 1100000000LL;
@@ -458,6 +513,7 @@ void bench(const std::string& only) {
         } else {
           fill(p, tb[i], 17u * c + i, 2);
         }
+        if (g.split) K::stream_gemm_split_k(p, N, Kd);
         bufs.push_back(p);
       }
     float* dx = ragon::test::alloc<float>(size_t(16) * Kd);
@@ -527,12 +583,15 @@ int main(int argc, char** argv) {
   for (int M : {17, 20, 24, 31, 32, 33, 48, 63, 64}) all.push_back(M);
   bool ok = test_to_half_rows();
   ok &= test_rmsnorm_half();
-  ok &= test_gemm(528, 2048, 11, all);              // partial blocks (33 tiles), K split in 8
-  ok &= test_gemm(528, 640, 13, {1, 7, 16, 17, 64});  // the K % 256 tail (no split)
-  ok &= test_gemm(1040, 5120, 17, {1, 2, 9, 16, 32, 64});  // K split in 5
-  ok &= test_gemm(4096, 1024, 19, {1, 16, 17, 64});   // 256 tiles: no split
-  ok &= test_gemm(1280, 5120, 29, {1, 16, 64});       // the drafter conv projection: K split in 4
+  // "marked": stream_gemm_split_k, as the loader marks the drafter's conv projections.
+  ok &= test_gemm(528, 2048, 11, true, all);                // partial blocks (33 tiles), K split in 8
+  ok &= test_gemm(528, 640, 13, true, {1, 7, 16, 17, 64});  // the K % 256 tail: no split even marked
+  ok &= test_gemm(1040, 5120, 17, true, {1, 2, 9, 16, 32, 64});  // K split in 5
+  ok &= test_gemm(1040, 5120, 17, false, {1, 16, 64});      // the same unmarked: no split
+  ok &= test_gemm(4096, 1024, 19, true, {1, 16, 17, 64});   // 256 tiles: no split even marked
+  ok &= test_gemm(1280, 5120, 29, true, {1, 16, 64});       // the drafter conv projection: K split in 4
   ok &= test_multi();
+  ok &= test_two_streams();
   std::printf("HASH gemm %016llx retile %016llx\n", static_cast<unsigned long long>(g_hash_gemm),
               static_cast<unsigned long long>(g_hash_retile));
   std::printf(ok ? "all HIP stream GEMM tests passed\n" : "HIP STREAM GEMM TESTS FAILED\n");

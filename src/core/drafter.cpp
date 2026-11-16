@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/kernels.cuh"
 #include "core/safetensors.hpp"
 
 namespace ragon {
@@ -144,6 +145,7 @@ DraftModel::DraftModel(const std::string& dir, bool nvfp4_copies) {
         return;
       }
       w4 = fp4_copy(name);
+      kernels::stream_gemm_split_k(w4.w, w4.N, w4.K);  // it runs alone with 80 tiles (HIP splits its K)
       bw = shape_only(name);
     };
     kproj(p + "attention_conv.kernel_projection.weight", L.attn_kproj, L.attn_kproj4);

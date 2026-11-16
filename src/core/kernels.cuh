@@ -351,6 +351,10 @@ struct StreamTarget {
 };
 void stream_gemm_multi(bool nvfp4, const gpu::half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
                        gpu::Stream s);
+// Marks a tiled blob (after its retile_*) that runs alone with few 16-row tiles, the drafter's conv projection: the
+// HIP build splits its K across blocks in every launch of it (a fixed split per blob, so its bytes are the same
+// alone and grouped; stream_gemm_hip.cu). Call at load, outside any capture. The CUDA kernels ignore it.
+void stream_gemm_split_k(const uint8_t* w, int N, int K);
 // The drafter's sparse head (BACKLOG 19): y[M][cap] = scale2 * x . W[rows[i]]^T for i < *nrows, -inf after, W the
 // tiled NVFP4 blob the full head streams (raw, or coded with raw_scales its raw scales in block order: Fp4Weight's
 // w and scales). Each element's arithmetic is the tiled stream_gemm's, so a selected row's logit is bit for bit the

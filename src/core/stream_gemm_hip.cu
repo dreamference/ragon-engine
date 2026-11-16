@@ -245,9 +245,8 @@ void check_shape(int N, int K, const char* what) {
     throw std::runtime_error(std::string(what) + ": N % 16 and K % 128 must be 0");
 }
 
-// K splits of a weight, from its shape only (so a target splits the same alone and grouped): none from kSplitBelow
-// tiles up or when K is not whole chunks; else the fewest equal whole-chunk parts reaching kSplitWaves waves (all
-// chunks when none does).
+// K splits of a marked weight (stream_gemm_split_k), from its shape: none from kSplitBelow tiles up or when K is not
+// whole chunks; else the fewest equal whole-chunk parts reaching kSplitWaves waves (all chunks when none does).
 int splits(int N, int K) {
   const int tiles = N / 16, chunks = K / kKC;
   if (tiles >= kSplitBelow || K % kKC || chunks < 2) return 1;
@@ -256,10 +255,23 @@ int splits(int N, int K) {
   return chunks;
 }
 
-// Split scratch per weight blob (its partials and tile counters), made when the blob is retiled, or at its first
-// launch outside a capture. One blob must not run on two streams at once (the counters are the blob's).
+// Split K is per blob, not per launch: only a blob the loader marks (stream_gemm_split_k) splits, alone or grouped,
+// so its bytes are the same in every launch. Grouped targets fill the GPU without it (a split q|k|v ran 5% slower:
+// its k and v blocks no longer filled the tail of q's), so only a matrix that runs alone with few tiles is marked.
+// A marked blob's scratch (partials and tile counters) is made at the mark, outside any capture; retiling a blob at
+// that address forgets it. The counters are per stream: kStreamSlots slots, each bound to the first stream that runs
+// the blob through it, so the main, side, commit and fork streams may run one blob at once (a side prefill chunk
+// beside the main step). One stream's launches are ordered, so a slot is never in use twice at a time. Binding
+// allocates nothing and works under capture; a fifth stream throws.
+constexpr int kStreamSlots = 4;
 struct Scratch {
   int N = 0, K = 0, S = 0;
+  float* part = nullptr;  // [kStreamSlots][tiles * S * 256]
+  u32* cnt = nullptr;     // [kStreamSlots][tiles]
+  gpu::Stream bound[kStreamSlots] = {};
+  int nbound = 0;
+};
+struct Slot {
   float* part = nullptr;
   u32* cnt = nullptr;
 };
@@ -268,24 +280,36 @@ std::unordered_map<const void*, Scratch>& scratch_map() {
   static auto* m = new std::unordered_map<const void*, Scratch>();
   return *m;
 }
-Scratch split_scratch(const void* w, int N, int K, gpu::Stream st) {
-  const int S = splits(N, K);
+void free_scratch(Scratch& e) {
+  if (e.part) (void)gpu::device_free(e.part);
+  if (e.cnt) (void)gpu::device_free(e.cnt);
+  e = Scratch{};
+}
+// A new blob at `w` (retile): a mark there belonged to a freed blob.
+void forget_split(const void* w) {
   std::lock_guard<std::mutex> lock(g_scratch_mu);
-  Scratch& e = scratch_map()[w];
-  if (e.part && e.N == N && e.K == K) return e;
-  gpu::CaptureStatus cs = gpu::kCaptureNone;
-  if (gpu::is_capturing(st, &cs) == gpu::kSuccess && cs != gpu::kCaptureNone)
-    throw std::runtime_error("stream_gemm: split-K scratch must be made before capture (retile the weight first)");
-  if (e.part) gpu::device_free(e.part), gpu::device_free(e.cnt);  // a new blob at a freed blob's address
-  const size_t tiles = N / 16;
-  e = Scratch{N, K, S, nullptr, nullptr};
-  if (gpu::device_alloc(&e.part, tiles * S * 256 * sizeof(float)) != gpu::kSuccess ||
-      gpu::device_alloc(&e.cnt, tiles * sizeof(u32)) != gpu::kSuccess ||
-      gpu::memset_sync(e.cnt, 0, tiles * sizeof(u32)) != gpu::kSuccess) {
-    e = Scratch{};
-    throw std::runtime_error("stream_gemm: split-K scratch allocation failed");
+  auto it = scratch_map().find(w);
+  if (it == scratch_map().end()) return;
+  free_scratch(it->second);
+  scratch_map().erase(it);
+}
+// The K splits of target w (1 when unmarked), and the launching stream's slot of its scratch.
+int split_slot(const void* w, int N, int K, gpu::Stream st, Slot* slot) {
+  std::lock_guard<std::mutex> lock(g_scratch_mu);
+  auto it = scratch_map().find(w);
+  if (it == scratch_map().end()) return 1;
+  Scratch& e = it->second;
+  if (e.N != N || e.K != K) return 1;  // the mark of a freed blob (a new one is retiled, which forgets it)
+  int i = 0;
+  while (i < e.nbound && e.bound[i] != st) ++i;
+  if (i == e.nbound) {
+    if (e.nbound == kStreamSlots) throw std::runtime_error("stream_gemm: a split-K blob ran on more than 4 streams");
+    e.bound[e.nbound++] = st;
   }
-  return e;
+  const size_t tiles = N / 16;
+  slot->part = e.part + i * tiles * e.S * 256;
+  slot->cnt = e.cnt + i * tiles;
+  return e.S;
 }
 
 // The rows run in passes of 16 (each row's arithmetic is the same in any pass); the targets of one launch share x.
@@ -304,12 +328,10 @@ void dispatch(const gpu::half* x, const float* xinv, int M, const StreamTarget* 
     T.scale[i] = t[i].scale;
     T.N[i] = t[i].N;
     T.b0[i] = blocks;
-    T.S[i] = splits(t[i].N, K);
     T.cb[i] = (t[i].N / 16 + BW - 1) / BW;
-    if (T.S[i] > 1) {
-      const Scratch sc = split_scratch(t[i].w, t[i].N, K, s);
-      T.part[i] = sc.part, T.cnt[i] = sc.cnt;
-    }
+    Slot sc;
+    T.S[i] = split_slot(t[i].w, t[i].N, K, s, &sc);
+    T.part[i] = sc.part, T.cnt[i] = sc.cnt;
     blocks += T.S[i] * T.cb[i];
   }
   T.b0[n] = blocks;
@@ -463,13 +485,13 @@ void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, 
   check_shape(N, K, "retile_nvfp4");
   launch_kernel("retile_nvfp4", retile_nvfp4_kernel, dim3(grid_of(tiled_bytes_nvfp4(N, K))), dim3(256), 0, s, w,
                 wscale, out, N, K);
-  if (splits(N, K) > 1) split_scratch(out, N, K, s);
+  forget_split(out);
 }
 
 void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, gpu::Stream s) {
   check_shape(N, K, "retile_fp8");
   launch_kernel("retile_fp8", retile_fp8_kernel, dim3(grid_of(tiled_bytes_fp8(N, K))), dim3(256), 0, s, w, out, N, K);
-  if (splits(N, K) > 1) split_scratch(out, N, K, s);
+  forget_split(out);
 }
 
 void retile_nvfp4_coded(const uint8_t*, const uint8_t*, const uint8_t*, uint8_t*, uint8_t*, int, int, gpu::Stream) {
@@ -525,6 +547,25 @@ void stream_gemm_multi(bool nvfp4, const gpu::half* x, const float* xinv, int M,
                        gpu::Stream s) {
   if (nvfp4) dispatch<true>(x, xinv, M, t, n, K, s);
   else dispatch<false>(x, xinv, M, t, n, K, s);
+}
+
+void stream_gemm_split_k(const uint8_t* w, int N, int K) {
+  check_shape(N, K, "stream_gemm_split_k");
+  const int S = splits(N, K);
+  if (S == 1) return;
+  std::lock_guard<std::mutex> lock(g_scratch_mu);
+  Scratch& e = scratch_map()[w];
+  free_scratch(e);
+  const size_t tiles = N / 16;
+  Scratch n{N, K, S};
+  if (gpu::device_alloc(&n.part, kStreamSlots * tiles * S * 256 * sizeof(float)) != gpu::kSuccess ||
+      gpu::device_alloc(&n.cnt, kStreamSlots * tiles * sizeof(u32)) != gpu::kSuccess ||
+      gpu::memset_sync(n.cnt, 0, kStreamSlots * tiles * sizeof(u32)) != gpu::kSuccess) {
+    free_scratch(n);
+    scratch_map().erase(w);
+    throw std::runtime_error("stream_gemm: split-K scratch allocation failed");
+  }
+  e = n;
 }
 
 }  // namespace ragon::kernels

@@ -2050,6 +2050,8 @@ void stream_gemm_multi(bool nvfp4, const __half* x, const float* xinv, int M, co
   else dispatch<false>(x, xinv, M, t, n, K, s);
 }
 
+void stream_gemm_split_k(const uint8_t*, int, int) {}  // the HIP build's mark (kernels.cuh); nothing to do here
+
 // The arguments of a mixer launch (false: a shape or override the kernel does not reproduce).
 static bool gdn_build(const MkGdnParams& p, MkGdnArgs& a) {
   static const int chain_env = sg_env("RAGON_MK_CHAIN", 24);
