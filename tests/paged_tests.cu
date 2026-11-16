@@ -8,8 +8,7 @@
 // P4b: kv_table_set, the page table's update. Exits 0 when everything is identical. With the argument `head-major`,
 // the pool is laid out as RAGON_KV_HEAD_MAJOR=1 lays it out ([layer][K, V][kv head][page][PT][D], the table in units of
 // one head's run).
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "gpu_test.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -27,15 +26,15 @@ namespace {
 template <typename T>
 T* upload(const std::vector<T>& h) {
   T* d = nullptr;
-  cudaMalloc(&d, std::max<size_t>(h.size(), 1) * sizeof(T));
-  cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+  ragon::test::alloc_into(&d, std::max<size_t>(h.size(), 1) * sizeof(T));
+  ragon::test::h2d(d, h.data(), h.size() * sizeof(T));
   return d;
 }
 template <typename T>
 std::vector<T> download(const T* d, size_t n) {
   std::vector<T> h(n);
-  cudaDeviceSynchronize();
-  cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+  (void)ragon::test::sync_error();
+  ragon::test::d2h(h.data(), d, n * sizeof(T));
   return h;
 }
 bool same(const void* a, const void* b, size_t bytes) { return std::memcmp(a, b, bytes) == 0; }
@@ -53,8 +52,8 @@ std::vector<float> randv(size_t n, float scale = 1.f) {
   for (auto& x : v) x = normal(rng) * scale;
   return v;
 }
-std::vector<__nv_bfloat16> randb(size_t n, float scale = 1.f) {
-  std::vector<__nv_bfloat16> v(n);
+std::vector<ragon::gpu::bf16> randb(size_t n, float scale = 1.f) {
+  std::vector<ragon::gpu::bf16> v(n);
   for (auto& x : v) x = __float2bfloat16(normal(rng) * scale);
   return v;
 }
@@ -69,16 +68,16 @@ void paged_layout() { k::set_kv_layout(g_hs, D); }
 // One sequence's KV of one layer in both layouts. The pool holds every sequence's pages (page 0 unused); a sequence's
 // table maps its pages in a shuffled order, so neighbouring positions across a page boundary are far apart.
 struct Pool {
-  std::vector<__nv_bfloat16> host;
-  __nv_bfloat16* dev = nullptr;
+  std::vector<ragon::gpu::bf16> host;
+  ragon::gpu::bf16* dev = nullptr;
   int pages = 0;
   explicit Pool(int n) : host(kPageElems * (n + 1)), pages(n + 1) {
     std::memset(host.data(), 0x3f, host.size() * 2);  // 0.746 wherever nothing is mapped (page 0, the other layer)
     g_hs = g_head_major ? size_t(pages) * PT * D : size_t(PT) * D;
     g_unit = g_head_major ? size_t(PT) * D : kPageElems;
   }
-  __nv_bfloat16* kbase() const { return dev + size_t(LAYER) * 2 * Hkv * g_hs; }
-  __nv_bfloat16* vbase() const { return kbase() + size_t(Hkv) * g_hs; }
+  ragon::gpu::bf16* kbase() const { return dev + size_t(LAYER) * 2 * Hkv * g_hs; }
+  ragon::gpu::bf16* vbase() const { return kbase() + size_t(Hkv) * g_hs; }
   size_t at(uint64_t page_off, int kv, int h, int p) const {
     return page_off + (size_t(LAYER) * 2 + kv) * Hkv * g_hs + size_t(h) * g_hs + size_t(p % PT) * D;
   }
@@ -86,9 +85,9 @@ struct Pool {
 
 struct Seq {
   int max_ctx = 0;
-  std::vector<__nv_bfloat16> k, v;  // flat [Hkv][max_ctx][D]
+  std::vector<ragon::gpu::bf16> k, v;  // flat [Hkv][max_ctx][D]
   std::vector<uint64_t> table;      // element offsets into the pool
-  __nv_bfloat16 *dk = nullptr, *dv = nullptr;
+  ragon::gpu::bf16 *dk = nullptr, *dv = nullptr;
   uint64_t* dtable = nullptr;
 };
 
@@ -117,8 +116,8 @@ void upload_seq(Seq& s) {
   s.dtable = upload(s.table);
 }
 // The pool's KV of sequence s read back into the flat layout.
-std::vector<__nv_bfloat16> read_back(const Pool& pool, const std::vector<__nv_bfloat16>& dev_pool, const Seq& s, int kv) {
-  std::vector<__nv_bfloat16> out(size_t(Hkv) * s.max_ctx * D);
+std::vector<ragon::gpu::bf16> read_back(const Pool& pool, const std::vector<ragon::gpu::bf16>& dev_pool, const Seq& s, int kv) {
+  std::vector<ragon::gpu::bf16> out(size_t(Hkv) * s.max_ctx * D);
   for (int h = 0; h < Hkv; ++h)
     for (int p = 0; p < s.max_ctx; ++p)
       std::memcpy(&out[(size_t(h) * s.max_ctx + p) * D], &dev_pool[pool.at(s.table[p / PT], kv, h, p)], D * 2);
@@ -148,14 +147,14 @@ bool attention_case(const Seq& s, const Pool& pool, const float* dq, int P, int 
   flat_layout(s.max_ctx);
   k::attention_rows(dq, s.dk, s.dv, pos, M, Hq, Hkv, D, scratch, out, nullptr, fixed, td);
   const std::vector<float> a = download(out, n);
-  cudaMemset(out, 0, n * 4);
+  ragon::test::fill(out, 0, n * 4);
   paged_layout();
   k::attention_rows(dq, pool.kbase(), pool.vbase(), pos, M, Hq, Hkv, D, scratch, out, nullptr, fixed, td, s.dtable);
   const std::vector<float> b = download(out, n);
-  if (dpos) cudaFree(dpos);
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) std::printf("CUDA error: %s\n", cudaGetErrorString(e));
-  return e == cudaSuccess && same(a.data(), b.data(), n * 4);
+  if (dpos) ragon::test::free_bytes(dpos);
+  const char* e = ragon::test::last_error();
+  if (e) std::printf("GPU error: %s\n", e);
+  return !e && same(a.data(), b.data(), n * 4);
 }
 
 }  // namespace
@@ -176,8 +175,8 @@ int main(int argc, char** argv) {
 
   float* dq = upload(randv(size_t(32) * Hq * D, 2.f));
   float *scratch, *out;
-  cudaMalloc(&scratch, k::attention_rows_scratch_floats(256, Hq, D, kMaxCtx) * sizeof(float));
-  cudaMalloc(&out, size_t(256) * Hq * D * sizeof(float));
+  ragon::test::alloc_into(&scratch, k::attention_rows_scratch_floats(256, Hq, D, kMaxCtx) * sizeof(float));
+  ragon::test::alloc_into(&out, size_t(256) * Hq * D * sizeof(float));
 
   // ---- attention_rows ----
   const int contexts[] = {1, 33, 63, 64, 65, 127, 4095, 4096, 4097, 27000, 131072};
@@ -206,7 +205,7 @@ int main(int argc, char** argv) {
     float* dq256 = upload(randv(size_t(256) * Hq * D, 2.f));
     bool ok = true;
     for (int P : {0, 3900, 70000}) ok &= attention_case(big, pool, dq256, P, 256, scratch, out);
-    cudaFree(dq256);
+    ragon::test::free_bytes(dq256);
     report("attention_rows over a 256-row prefill slice", ok);
   }
   // ---- a tree verify whose path crosses a page: rows 0-4 one variant (depths 0-4), 5-7 another (depths 2-4) ----
@@ -227,23 +226,23 @@ int main(int argc, char** argv) {
     float* qg = upload(randv(size_t(M) * Hq * 2 * D));
     float* kk = upload(randv(size_t(M) * Hkv * D));
     float* vv = upload(randv(size_t(M) * Hkv * D));
-    __nv_bfloat16* qn = upload(randb(D, 0.1f));
-    __nv_bfloat16* kn = upload(randb(D, 0.1f));
+    ragon::gpu::bf16* qn = upload(randb(D, 0.1f));
+    ragon::gpu::bf16* kn = upload(randb(D, 0.1f));
     float *q1, *g1, *q2, *g2;
     const size_t qn_ = size_t(M) * Hq * D;
-    cudaMalloc(&q1, qn_ * 4), cudaMalloc(&g1, qn_ * 4), cudaMalloc(&q2, qn_ * 4), cudaMalloc(&g2, qn_ * 4);
+    ragon::test::alloc_into(&q1, qn_ * 4), ragon::test::alloc_into(&g1, qn_ * 4), ragon::test::alloc_into(&q2, qn_ * 4), ragon::test::alloc_into(&g2, qn_ * 4);
     flat_layout(big.max_ctx);
     k::attn_prepare(qg, kk, vv, qn, kn, P, M, Hq, Hkv, D, rot, 1e7f, 1e-6f, q1, g1, big.dk, big.dv, nullptr, dtd);
     paged_layout();
     k::attn_prepare(qg, kk, vv, qn, kn, P, M, Hq, Hkv, D, rot, 1e7f, 1e-6f, q2, g2, pool.kbase(), pool.vbase(), nullptr,
                     dtd, nullptr, big.dtable);
-    const std::vector<__nv_bfloat16> dev_pool = download(pool.dev, pool.host.size());
+    const std::vector<ragon::gpu::bf16> dev_pool = download(pool.dev, pool.host.size());
     bool prep = same(download(q1, qn_).data(), download(q2, qn_).data(), qn_ * 4) &&
                 same(download(g1, qn_).data(), download(g2, qn_).data(), qn_ * 4);
     report("attn_prepare (a tree's rows into slots across a page): q and gate", prep);
-    // The caches compared as bytes (operator== on __nv_bfloat16 compares values; use memcmp).
-    const std::vector<__nv_bfloat16> fk = download(big.dk, big.k.size()), fv = download(big.dv, big.v.size());
-    const std::vector<__nv_bfloat16> pk = read_back(pool, dev_pool, big, 0), pv = read_back(pool, dev_pool, big, 1);
+    // The caches compared as bytes (operator== on ragon::gpu::bf16 compares values; use memcmp).
+    const std::vector<ragon::gpu::bf16> fk = download(big.dk, big.k.size()), fv = download(big.dv, big.v.size());
+    const std::vector<ragon::gpu::bf16> pk = read_back(pool, dev_pool, big, 0), pv = read_back(pool, dev_pool, big, 1);
     report("attn_prepare: the K and V caches, position by position",
            same(fk.data(), pk.data(), fk.size() * 2) && same(fv.data(), pv.data(), fv.size() * 2));
     // tree_gather: the accepted path 0, 1, 5, 6, 7 moved to slots P .. P + 4, every head of K and V.
@@ -260,14 +259,14 @@ int main(int argc, char** argv) {
     k::GatherBuf* dgp = upload(gp);
     k::tree_gather(dgf, int(gf.size()), drows, int(rows.size()), k::DevPos(P), nullptr);
     k::tree_gather(dgp, int(gp.size()), drows, int(rows.size()), k::DevPos(P), nullptr);
-    const std::vector<__nv_bfloat16> dev_pool2 = download(pool.dev, pool.host.size());
-    const std::vector<__nv_bfloat16> gk = download(big.dk, big.k.size()), gv = download(big.dv, big.v.size());
-    const std::vector<__nv_bfloat16> qk = read_back(pool, dev_pool2, big, 0), qv = read_back(pool, dev_pool2, big, 1);
+    const std::vector<ragon::gpu::bf16> dev_pool2 = download(pool.dev, pool.host.size());
+    const std::vector<ragon::gpu::bf16> gk = download(big.dk, big.k.size()), gv = download(big.dv, big.v.size());
+    const std::vector<ragon::gpu::bf16> qk = read_back(pool, dev_pool2, big, 0), qv = read_back(pool, dev_pool2, big, 1);
     report("tree_gather (rows moved across a page boundary)",
            same(gk.data(), qk.data(), gk.size() * 2) && same(gv.data(), qv.data(), gv.size() * 2));
     for (void* p : {(void*)qg, (void*)kk, (void*)vv, (void*)qn, (void*)kn, (void*)q1, (void*)g1, (void*)q2, (void*)g2,
                     (void*)dtd, (void*)drows, (void*)dgf, (void*)dgp})
-      cudaFree(p);
+      ragon::test::free_bytes(p);
   }
   // ---- three sequences in one launch: attn_prepare_seqs and attention_rows_seqs, each with its own table ----
   {
@@ -279,13 +278,13 @@ int main(int argc, char** argv) {
     float* qg = upload(randv(size_t(M) * Hq * 2 * D));
     float* kk = upload(randv(size_t(M) * Hkv * D));
     float* vv = upload(randv(size_t(M) * Hkv * D));
-    __nv_bfloat16* qn = upload(randb(D, 0.1f));
-    __nv_bfloat16* kn = upload(randb(D, 0.1f));
+    ragon::gpu::bf16* qn = upload(randb(D, 0.1f));
+    ragon::gpu::bf16* kn = upload(randb(D, 0.1f));
     const size_t qn_ = size_t(M) * Hq * D;
     float *q1, *g1, *q2, *g2, *o1, *o2;
-    for (float** p : {&q1, &g1, &q2, &g2, &o1, &o2}) cudaMalloc(p, qn_ * 4);
-    k::SeqPtrs<__nv_bfloat16> kf, vf, kp, vp;
-    k::SeqPtrs<const __nv_bfloat16> kfr, vfr, kpr, vpr;
+    for (float** p : {&q1, &g1, &q2, &g2, &o1, &o2}) ragon::test::alloc_into(p, qn_ * 4);
+    k::SeqPtrs<ragon::gpu::bf16> kf, vf, kp, vp;
+    k::SeqPtrs<const ragon::gpu::bf16> kfr, vfr, kpr, vpr;
     k::SeqPtrs<const uint64_t> pg;
     for (int i = 0; i < 3; ++i) {
       kfr.p[i] = kf.p[i] = seqs[i].dk, vfr.p[i] = vf.p[i] = seqs[i].dv;
@@ -298,12 +297,12 @@ int main(int argc, char** argv) {
     paged_layout();
     k::attn_prepare_seqs(qg, kk, vv, qn, kn, sb, Hq, Hkv, D, rot, 1e7f, 1e-6f, q2, g2, kp, vp, nullptr, pg);
     k::attention_rows_seqs(q2, kpr, vpr, sb, Hq, Hkv, D, scratch, o2, nullptr, 0, pg);
-    const std::vector<__nv_bfloat16> dev_pool = download(pool.dev, pool.host.size());
+    const std::vector<ragon::gpu::bf16> dev_pool = download(pool.dev, pool.host.size());
     bool ok = same(download(q1, qn_).data(), download(q2, qn_).data(), qn_ * 4) &&
               same(download(o1, qn_).data(), download(o2, qn_).data(), qn_ * 4);
     for (const Seq& s : seqs) {
-      const std::vector<__nv_bfloat16> fk = download(s.dk, s.k.size()), fv = download(s.dv, s.v.size());
-      const std::vector<__nv_bfloat16> pk = read_back(pool, dev_pool, s, 0), pv = read_back(pool, dev_pool, s, 1);
+      const std::vector<ragon::gpu::bf16> fk = download(s.dk, s.k.size()), fv = download(s.dv, s.v.size());
+      const std::vector<ragon::gpu::bf16> pk = read_back(pool, dev_pool, s, 0), pv = read_back(pool, dev_pool, s, 1);
       ok &= same(fk.data(), pk.data(), fk.size() * 2) && same(fv.data(), pv.data(), fv.size() * 2);
     }
     // As a graph launches it: device positions, every range up to the context.
@@ -311,43 +310,43 @@ int main(int argc, char** argv) {
     k::SeqBatch gb = sb;
     gb.pos[0] = gb.pos[1] = gb.pos[2] = -1;
     gb.pos_dev = dpos;
-    cudaMemset(o2, 0, qn_ * 4);
+    ragon::test::fill(o2, 0, qn_ * 4);
     k::attention_rows_seqs(q2, kpr, vpr, gb, Hq, Hkv, D, scratch, o2, nullptr, 8192, pg);
     ok &= same(download(o1, qn_).data(), download(o2, qn_).data(), qn_ * 4);
     report("attn_prepare_seqs and attention_rows_seqs over three sequences (eager and graph form), caches too", ok);
     for (void* p : {(void*)qg, (void*)kk, (void*)vv, (void*)qn, (void*)kn, (void*)q1, (void*)g1, (void*)q2, (void*)g2,
                     (void*)o1, (void*)o2, (void*)dpos})
-      cudaFree(p);
+      ragon::test::free_bytes(p);
   }
   // ---- kv_pages_copy: positions [from, to) of a sequence to a store-layout buffer and back ----
   {
     // Layer-and-K/V count NL * 2: the store layout holds every layer's K and V. Compare layer LAYER's K and V.
     const int from = 37, to = 4200, buf_start = 30, buf_len = 4200 - 30 + 5;
     const size_t bn = size_t(NL) * 2 * Hkv * buf_len * D;
-    __nv_bfloat16* buf;
-    cudaMalloc(&buf, bn * 2);
-    cudaMemset(buf, 0, bn * 2);
+    ragon::gpu::bf16* buf;
+    ragon::test::alloc_into(&buf, bn * 2);
+    ragon::test::fill(buf, 0, bn * 2);
     paged_layout();  // kv_pages_copy reads the pool's head stride
     k::kv_pages_copy(pool.dev, big.dtable, NL * 2, Hkv, D, buf, buf_start, buf_len, from, to, true, nullptr);
-    const std::vector<__nv_bfloat16> b = download(buf, bn), fk = download(big.dk, big.k.size()),
+    const std::vector<ragon::gpu::bf16> b = download(buf, bn), fk = download(big.dk, big.k.size()),
                                      fv = download(big.dv, big.v.size());
     bool ok = true;
     for (int kv = 0; kv < 2; ++kv)
       for (int h = 0; h < Hkv; ++h)
         for (int p = from; p < to; ++p) {
-          const __nv_bfloat16* src = &(kv ? fv : fk)[(size_t(h) * big.max_ctx + p) * D];
-          const __nv_bfloat16* dst = &b[((size_t(LAYER * 2 + kv) * Hkv + h) * buf_len + (p - buf_start)) * D];
+          const ragon::gpu::bf16* src = &(kv ? fv : fk)[(size_t(h) * big.max_ctx + p) * D];
+          const ragon::gpu::bf16* dst = &b[((size_t(LAYER * 2 + kv) * Hkv + h) * buf_len + (p - buf_start)) * D];
           ok &= same(src, dst, D * 2);
         }
     // Back into the pages of the last of the three sequences (a different table), then read back.
     k::kv_pages_copy(pool.dev, seqs[2].dtable, NL * 2, Hkv, D, buf, buf_start, buf_len, from, std::min(to, 8192), false,
                      nullptr);
-    const std::vector<__nv_bfloat16> dev_pool = download(pool.dev, pool.host.size());
-    const std::vector<__nv_bfloat16> rk = read_back(pool, dev_pool, seqs[2], 0);
+    const std::vector<ragon::gpu::bf16> dev_pool = download(pool.dev, pool.host.size());
+    const std::vector<ragon::gpu::bf16> rk = read_back(pool, dev_pool, seqs[2], 0);
     for (int h = 0; h < Hkv; ++h)
       for (int p = from; p < std::min(to, 8192); ++p)
         ok &= same(&rk[(size_t(h) * 8192 + p) * D], &fk[(size_t(h) * big.max_ctx + p) * D], D * 2);
-    cudaFree(buf);
+    ragon::test::free_bytes(buf);
     report("kv_pages_copy to the store's layout and back into another table", ok);
   }
   // ---- kv_table_set (P4b): table entries as kernel parameters, several launches queued back to back ----
@@ -357,8 +356,8 @@ int main(int argc, char** argv) {
     // launch must still write the values it was given (no copy reads a host buffer later).
     const int n_entries = 4096;
     uint64_t* table = nullptr;
-    cudaMalloc(&table, n_entries * sizeof(uint64_t));
-    cudaMemset(table, 0, n_entries * sizeof(uint64_t));
+    ragon::test::alloc_into(&table, n_entries * sizeof(uint64_t));
+    ragon::test::fill(table, 0, n_entries * sizeof(uint64_t));
     std::vector<uint64_t> model(n_entries, 0);
     std::vector<int> idx;
     std::vector<uint64_t> val;
@@ -375,11 +374,11 @@ int main(int argc, char** argv) {
     k::kv_table_set(table, idx.data(), val.data(), 0, nullptr);  // nothing to write: no launch
     const std::vector<uint64_t> got = download(table, n_entries);
     report("kv_table_set: 957 entries over five launches queued back to back, read back", got == model);
-    cudaFree(table);
+    ragon::test::free_bytes(table);
   }
-  const cudaError_t e = cudaDeviceSynchronize();
-  if (e != cudaSuccess) {
-    std::printf("CUDA error: %s\n", cudaGetErrorString(e));
+  const char* e = ragon::test::sync_error();
+  if (e) {
+    std::printf("GPU error: %s\n", e);
     ++failures;
   }
   std::printf(failures ? "PAGED TESTS FAILED (%d)\n" : "all paged tests passed\n", failures);

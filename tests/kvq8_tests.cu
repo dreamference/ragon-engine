@@ -6,8 +6,7 @@
 // and pages; a graph's device position; a tree verify whose rows straddle a unit). attention_rows_seqs and the cascade
 // with a KvQ8 against attention_rows per sequence. M2: the same rows with the E4M3 page mirror (kv_seal) read for the
 // tiles every row of a block takes rounded, all pages or every other one sealed. Exits 0 when everything is identical.
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "gpu_test.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,15 +24,15 @@ namespace {
 template <typename T>
 T* upload(const std::vector<T>& h) {
   T* d = nullptr;
-  cudaMalloc(&d, std::max<size_t>(h.size(), 1) * sizeof(T));
-  cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+  ragon::test::alloc_into(&d, std::max<size_t>(h.size(), 1) * sizeof(T));
+  ragon::test::h2d(d, h.data(), h.size() * sizeof(T));
   return d;
 }
 template <typename T>
 std::vector<T> download(const T* d, size_t n) {
   std::vector<T> h(n);
-  cudaDeviceSynchronize();
-  cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+  (void)ragon::test::sync_error();
+  ragon::test::d2h(h.data(), d, n * sizeof(T));
   return h;
 }
 
@@ -45,8 +44,8 @@ std::vector<float> randv(size_t n, float scale = 1.f) {
   for (auto& x : v) x = normal(rng) * scale;
   return v;
 }
-std::vector<__nv_bfloat16> randb(size_t n, float scale = 1.f) {
-  std::vector<__nv_bfloat16> v(n);
+std::vector<ragon::gpu::bf16> randb(size_t n, float scale = 1.f) {
+  std::vector<ragon::gpu::bf16> v(n);
   for (auto& x : v) x = __float2bfloat16(normal(rng) * scale);
   return v;
 }
@@ -57,26 +56,26 @@ void report(const char* what, bool ok) {
   if (!ok) ++failures;
 }
 bool cuda_ok() {
-  const cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess) std::printf("CUDA error: %s\n", cudaGetErrorString(e));
-  return e == cudaSuccess;
+  const char* e = ragon::test::last_error();
+  if (e) std::printf("GPU error: %s\n", e);
+  return !e;
 }
 
 // ---- the codes ----
 __global__ void codes_kernel(float s, float inv, int* bad) {
   const int c = threadIdx.x;  // 0 .. 255
   if ((c & 0x7f) == 0x7f) return;  // the two NaN codes
-  const __nv_fp8x2_storage_t e = static_cast<__nv_fp8x2_storage_t>(c | (c << 8));
-  const __nv_bfloat162 x = k::kv_q8_decode2(e, s);
-  const __nv_fp8x2_storage_t e2 = k::kv_q8_encode2(__bfloat1622float2(x), inv);
-  const __nv_bfloat162 x2 = k::kv_q8_decode2(e2, s);
+  const uint16_t e = static_cast<uint16_t>(c | (c << 8));
+  const ragon::gpu::bf16x2 x = k::kv_q8_decode2(e, s);
+  const uint16_t e2 = k::kv_q8_encode2(__bfloat1622float2(x), inv);
+  const ragon::gpu::bf16x2 x2 = k::kv_q8_decode2(e2, s);
   // Codes that decode to the same value (only +0 and -0 times a scale) may come back as either.
   if (e2 != e && *reinterpret_cast<const unsigned*>(&x2) != *reinterpret_cast<const unsigned*>(&x)) atomicAdd(bad, 1);
 }
-__global__ void idem_kernel(const __nv_bfloat162* v, int n, float s, float inv, int* bad) {
+__global__ void idem_kernel(const ragon::gpu::bf16x2* v, int n, float s, float inv, int* bad) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  const __nv_bfloat162 r1 = k::kv_q8_round2(v[i], s, inv), r2 = k::kv_q8_round2(r1, s, inv);
+  const ragon::gpu::bf16x2 r1 = k::kv_q8_round2(v[i], s, inv), r2 = k::kv_q8_round2(r1, s, inv);
   if (*reinterpret_cast<const unsigned*>(&r1) != *reinterpret_cast<const unsigned*>(&r2)) atomicAdd(bad, 1);
 }
 
@@ -86,33 +85,33 @@ struct Cache {
   int max_ctx = 0;
   bool paged = false;
   size_t hs = 0, elems = 0;
-  __nv_bfloat16 *k = nullptr, *v = nullptr;        // the bases the kernels take
-  __nv_bfloat16 *k0 = nullptr, *v0 = nullptr;      // pristine copies
+  ragon::gpu::bf16 *k = nullptr, *v = nullptr;        // the bases the kernels take
+  ragon::gpu::bf16 *k0 = nullptr, *v0 = nullptr;      // pristine copies
   uint64_t* table = nullptr;
 };
 // Rounds the K and V of every head at the given positions (kv_off's addressing).
-__global__ void round_positions(__nv_bfloat16* kc, __nv_bfloat16* vc, const uint64_t* pages, const int* pos, size_t hs,
+__global__ void round_positions(ragon::gpu::bf16* kc, ragon::gpu::bf16* vc, const uint64_t* pages, const int* pos, size_t hs,
                                 float ks, float kinv, float vs, float vinv) {
   const int p = pos[blockIdx.x], h = blockIdx.y;
   const size_t off = k::kv_off(pages, h, p, hs, D);
   for (int d = 2 * threadIdx.x; d < D; d += 2 * blockDim.x) {
-    auto* kp = reinterpret_cast<__nv_bfloat162*>(kc + off + d);
-    auto* vp = reinterpret_cast<__nv_bfloat162*>(vc + off + d);
+    auto* kp = reinterpret_cast<ragon::gpu::bf16x2*>(kc + off + d);
+    auto* vp = reinterpret_cast<ragon::gpu::bf16x2*>(vc + off + d);
     *kp = k::kv_q8_round2(*kp, ks, kinv);
     *vp = k::kv_q8_round2(*vp, vs, vinv);
   }
 }
 void layout(const Cache& c) { k::set_kv_layout(c.hs, D); }
 void restore(const Cache& c) {
-  cudaMemcpy(c.k, c.k0, c.elems * 2, cudaMemcpyDeviceToDevice);
-  cudaMemcpy(c.v, c.v0, c.elems * 2, cudaMemcpyDeviceToDevice);
+  ragon::test::d2d(c.k, c.k0, c.elems * 2);
+  ragon::test::d2d(c.v, c.v0, c.elems * 2);
 }
 void round_at(const Cache& c, const std::vector<int>& pos, const k::KvQ8& q) {
   if (pos.empty()) return;
   int* dp = upload(pos);
   round_positions<<<dim3(pos.size(), Hkv), 64>>>(c.k, c.v, c.table, dp, c.hs, q.ks, q.kinv, q.vs, q.vinv);
-  cudaDeviceSynchronize();
-  cudaFree(dp);
+  (void)ragon::test::sync_error();
+  ragon::test::free_bytes(dp);
 }
 // Flat: the KV of max_ctx positions. Paged: the same in a pool of shuffled pages; `share` (optional) maps its first
 // `shared` pages to the pages of another paged cache (the cascade's runs).
@@ -123,7 +122,7 @@ Cache make_cache(int max_ctx, bool paged, k::KvQ8* scales) {
   const int np = (max_ctx + PT - 1) / PT;
   c.elems = paged ? size_t(np + 1) * Hkv * PT * D : size_t(Hkv) * max_ctx * D;
   c.hs = paged ? size_t(np + 1) * PT * D : size_t(max_ctx) * D;
-  const std::vector<__nv_bfloat16> hk = randb(c.elems, 1.5f), hv = randb(c.elems, 0.8f);
+  const std::vector<ragon::gpu::bf16> hk = randb(c.elems, 1.5f), hv = randb(c.elems, 0.8f);
   if (scales) {  // the layer's scales from its maxima, as bench/quant/kv_calib.py sets them
     float mk = 0.f, mv = 0.f;
     for (size_t i = 0; i < c.elems; ++i) {
@@ -177,7 +176,7 @@ bool rows_case(const Cache& c, const float* dq, int P, int M, const k::KvQ8& q8,
       for (int m = 0; m < M; ++m)
         if (P + htd->depth[m] < U) pos_r.push_back(P + m);
     round_at(c, pos_r, q8);
-    cudaMemset(out, 0, n * 4);
+    ragon::test::fill(out, 0, n * 4);
     k::attention_rows(dq, c.k, c.v, pos, M, Hq, Hkv, D, scratch, out, nullptr, fixed, dtd, c.table);
     const std::vector<float> ref = download(out, n);
     ok &= cuda_ok();
@@ -188,7 +187,7 @@ bool rows_case(const Cache& c, const float* dq, int P, int M, const k::KvQ8& q8,
       }
   }
   restore(c);
-  if (dpos) cudaFree(dpos);
+  if (dpos) ragon::test::free_bytes(dpos);
   return ok;
 }
 
@@ -201,7 +200,7 @@ int main() {
   {
     bool ok = true;
     for (float s : {1e-3f, 0.0123f, 0.37f, 1.f, 3.3f, 17.5f}) {
-      cudaMemset(bad, 0, 4);
+      ragon::test::fill(bad, 0, 4);
       codes_kernel<<<1, 256>>>(s, 1.f / s, bad);
       ok &= download(bad, 1)[0] == 0 && cuda_ok();
     }
@@ -212,12 +211,12 @@ int main() {
     const int n = 1 << 20;
     for (float s : {1e-3f, 0.0123f, 0.37f, 1.f, 3.3f}) {
       for (float spread : {0.01f, 1.f, 100.f}) {
-        std::vector<__nv_bfloat16> h = randb(2 * n, spread * s * 64.f);
+        std::vector<ragon::gpu::bf16> h = randb(2 * n, spread * s * 64.f);
         auto* dv = upload(h);
-        cudaMemset(bad, 0, 4);
-        idem_kernel<<<(n + 255) / 256, 256>>>(reinterpret_cast<const __nv_bfloat162*>(dv), n, s, 1.f / s, bad);
+        ragon::test::fill(bad, 0, 4);
+        idem_kernel<<<(n + 255) / 256, 256>>>(reinterpret_cast<const ragon::gpu::bf16x2*>(dv), n, s, 1.f / s, bad);
         ok &= download(bad, 1)[0] == 0 && cuda_ok();
-        cudaFree(dv);
+        ragon::test::free_bytes(dv);
       }
     }
     report("R(R(v)) == R(v) for 2M random values at five scales and three spreads (saturation included)", ok);
@@ -229,8 +228,8 @@ int main() {
   Cache paged = make_cache(kMaxCtx, true, nullptr);
   float* dq = upload(randv(size_t(256) * Hq * D, 2.f));
   float *scratch, *out;
-  cudaMalloc(&scratch, k::attention_rows_scratch_floats(256, Hq, D, kMaxCtx) * sizeof(float));
-  cudaMalloc(&out, size_t(256) * Hq * D * sizeof(float));
+  ragon::test::alloc_into(&scratch, k::attention_rows_scratch_floats(256, Hq, D, kMaxCtx) * sizeof(float));
+  ragon::test::alloc_into(&out, size_t(256) * Hq * D * sizeof(float));
   k::set_attention_bulk(false);
 
   for (const Cache* c : {&flat, &paged}) {
@@ -270,20 +269,20 @@ int main() {
     for (const Cache* c : {&flat, &paged})
       for (int P : {28, 30, 32, 58, 62, 4093}) ok &= rows_case(*c, dq, P, 8, q8, scratch, out, &td, dtd);
     report("attention_rows with FP8 reads, a tree verify whose rows straddle a unit", ok);
-    cudaFree(dtd);
+    ragon::test::free_bytes(dtd);
   }
   // ---- M2: the E4M3 page mirror (kv_seal) read for the tiles every row takes as R(v), against the same reference ----
   {
     layout(paged);
     const int np = (kMaxCtx + PT - 1) / PT;
     // kv_seal's pool: one layer, [K, V][head][page][PT][D]; the cache's K and V copied into it.
-    __nv_bfloat16* pool = nullptr;
-    cudaMalloc(&pool, paged.elems * 2 * 2);
-    cudaMemcpy(pool, paged.k0, paged.elems * 2, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(pool + paged.elems, paged.v0, paged.elems * 2, cudaMemcpyDeviceToDevice);
+    ragon::gpu::bf16* pool = nullptr;
+    ragon::test::alloc_into(&pool, paged.elems * 2 * 2);
+    ragon::test::d2d(pool, paged.k0, paged.elems * 2);
+    ragon::test::d2d(pool + paged.elems, paged.v0, paged.elems * 2);
     uint8_t* mirror = nullptr;
-    cudaMalloc(&mirror, paged.elems * 2);
-    cudaMemset(mirror, 0xff, paged.elems * 2);  // NaN codes where nothing was sealed
+    ragon::test::alloc_into(&mirror, paged.elems * 2);
+    ragon::test::fill(mirror, 0xff, paged.elems * 2);  // NaN codes where nothing was sealed
     uint8_t* flags = upload(std::vector<uint8_t>(np + 1, 0));
     k::KvQ8 m8 = q8;
     m8.k8 = mirror;
@@ -299,7 +298,7 @@ int main() {
     for (int pass = 0; pass < 2; ++pass) {
       const std::vector<int>& ids = pass ? all : half;
       k::kv_seal(pool, mirror, flags, ids.data(), static_cast<int>(ids.size()), 0, 1, Hkv, D, m8.unit, kinv, vinv, 0);
-      cudaDeviceSynchronize();
+      (void)ragon::test::sync_error();
       for (int pf : {0, 2}) {
         k::set_attention_prefetch(pf);
         bool ok = cuda_ok();
@@ -330,7 +329,7 @@ int main() {
       bool ok = true;
       for (int P : {62, 126, 4093, 8000}) ok &= rows_case(paged, dq, P, 8, m8, scratch, out, &td, dtd);
       report("attention_rows with the E4M3 mirror, a tree verify", ok);
-      cudaFree(dtd);
+      ragon::test::free_bytes(dtd);
     }
     {  // kv_unseal clears exactly the flags named
       k::kv_unseal(flags, half.data(), static_cast<int>(half.size()), 0);
@@ -339,17 +338,17 @@ int main() {
       for (int i = 1; i <= np; ++i) ok &= f[i] == (i % 2 ? 0 : 1);
       report("kv_unseal clears the flags of the pages named and no others", ok);
     }
-    cudaFree(pool);
-    cudaFree(mirror);
-    cudaFree(flags);
+    ragon::test::free_bytes(pool);
+    ragon::test::free_bytes(mirror);
+    ragon::test::free_bytes(flags);
   }
   // ---- several sequences: attention_rows_seqs and the cascade against attention_rows per sequence ----
   {
     // Three sequences over one pool: 0 and 1 share their first 40 pages (a run), 2 has its own.
     const int np = 72, shared = 40;
     const size_t hs = size_t(3 * np + 1) * PT * D, elems = size_t(Hkv) * hs;
-    __nv_bfloat16* kp = upload(randb(elems, 1.5f));
-    __nv_bfloat16* vp = upload(randb(elems, 0.8f));
+    ragon::gpu::bf16* kp = upload(randb(elems, 1.5f));
+    ragon::gpu::bf16* vp = upload(randb(elems, 0.8f));
     std::vector<std::vector<uint64_t>> t(3);
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < np; ++j) t[i].push_back(uint64_t(i == 1 && j < shared ? 1 + j : 1 + i * np + j) * PT * D);
@@ -358,7 +357,7 @@ int main() {
     k::SeqBatch sb;
     sb.n = 3;
     for (int i = 0; i < 3; ++i) sb.row0[i + 1] = sb.row0[i] + rows[i], sb.pos[i] = pos[i];
-    k::SeqPtrs<const __nv_bfloat16> kc, vc;
+    k::SeqPtrs<const ragon::gpu::bf16> kc, vc;
     k::SeqPtrs<const uint64_t> pg;
     std::vector<uint64_t*> dt;
     for (int i = 0; i < 3; ++i) {
@@ -384,14 +383,14 @@ int main() {
     k::SeqGroups g;
     g.n = 1;
     g.seq0[0] = 0, g.seq1[0] = 2, g.cut[0] = 40 * PT;  // 2560: below 3333 and 4100, the end of the 40 shared pages
-    cudaMemset(out, 0, M * rowf * 4);
+    ragon::test::fill(out, 0, M * rowf * 4);
     k::attention_rows_cascade(dq, kc, vc, sb, g, Hq, Hkv, D, scratch, out, nullptr, pg, q8);
     got = download(out, M * rowf);
     const bool okc = cuda_ok() && std::memcmp(got.data(), per.data(), got.size() * 4) == 0;
     report("attention_rows_cascade with FP8 reads (a group of two over shared pages) against attention_rows", okc);
-    for (uint64_t* p : dt) cudaFree(p);
-    cudaFree(kp);
-    cudaFree(vp);
+    for (uint64_t* p : dt) ragon::test::free_bytes(p);
+    ragon::test::free_bytes(kp);
+    ragon::test::free_bytes(vp);
   }
   // ---- a KvQ8 that is off leaves the plain path: the default instantiation, the same bits ----
   {

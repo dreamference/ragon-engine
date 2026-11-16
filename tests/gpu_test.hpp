@@ -33,6 +33,25 @@ inline const char* sync_error() {
   const hipError_t e = hipDeviceSynchronize();
   return e == hipSuccess ? nullptr : hipGetErrorString(e);
 }
+inline void d2d(void* d, const void* s, size_t n) { (void)hipMemcpy(d, s, n, hipMemcpyDeviceToDevice); }
+inline void fill(void* d, int v, size_t n) { (void)hipMemset(d, v, n); }
+// nullptr when no launch failed since the last call, else the error's text (cudaGetLastError's contract).
+inline const char* last_error() {
+  const hipError_t e = hipGetLastError();
+  return e == hipSuccess ? nullptr : hipGetErrorString(e);
+}
+// Milliseconds between two points of the null stream (an event pair).
+struct Timer {
+  hipEvent_t a{}, b{};
+  Timer() { (void)hipEventCreate(&a), (void)hipEventCreate(&b); }
+  ~Timer() { (void)hipEventDestroy(a), (void)hipEventDestroy(b); }
+  void start() { (void)hipEventRecord(a); }
+  float stop() {
+    float ms = 0;
+    (void)hipEventRecord(b), (void)hipEventSynchronize(b), (void)hipEventElapsedTime(&ms, a, b);
+    return ms;
+  }
+};
 #else
 inline void* alloc_bytes(size_t n) {
   void* p = nullptr;
@@ -47,7 +66,30 @@ inline const char* sync_error() {
   const cudaError_t e = cudaDeviceSynchronize();
   return e == cudaSuccess ? nullptr : cudaGetErrorString(e);
 }
+inline void d2d(void* d, const void* s, size_t n) { cudaMemcpy(d, s, n, cudaMemcpyDeviceToDevice); }
+inline void fill(void* d, int v, size_t n) { cudaMemset(d, v, n); }
+inline const char* last_error() {
+  const cudaError_t e = cudaGetLastError();
+  return e == cudaSuccess ? nullptr : cudaGetErrorString(e);
+}
+struct Timer {
+  cudaEvent_t a{}, b{};
+  Timer() { cudaEventCreate(&a), cudaEventCreate(&b); }
+  ~Timer() { cudaEventDestroy(a), cudaEventDestroy(b); }
+  void start() { cudaEventRecord(a); }
+  float stop() {
+    float ms = 0;
+    cudaEventRecord(b), cudaEventSynchronize(b), cudaEventElapsedTime(&ms, a, b);
+    return ms;
+  }
+};
 #endif
+
+// cudaMalloc's form: *p gets n bytes of device memory.
+template <typename T>
+void alloc_into(T** p, size_t n) {
+  *p = static_cast<T*>(alloc_bytes(n));
+}
 
 template <typename T>
 T* alloc(size_t n) {

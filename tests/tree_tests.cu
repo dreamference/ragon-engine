@@ -2,7 +2,7 @@
 // verify (attention with its q/k norms and RoPE, the DeltaNet conv and recurrence) must equal what the chain kernels
 // compute for that row's root-to-row path laid out as a chain. Model-free: a context of random keys and values,
 // random projections, trees from build_tree on random drafter scores.
-#include <cuda_bf16.h>
+#include "gpu_test.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -22,14 +22,14 @@ namespace {
 template <typename T>
 T* upload(const std::vector<T>& h) {
   T* d = nullptr;
-  cudaMalloc(&d, std::max<size_t>(h.size(), 1) * sizeof(T));
-  cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice);
+  ragon::test::alloc_into(&d, std::max<size_t>(h.size(), 1) * sizeof(T));
+  ragon::test::h2d(d, h.data(), h.size() * sizeof(T));
   return d;
 }
 template <typename T>
 std::vector<T> download(const T* d, size_t n) {
   std::vector<T> h(n);
-  cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost);
+  ragon::test::d2h(h.data(), d, n * sizeof(T));
   return h;
 }
 
@@ -70,22 +70,22 @@ bool check_attention(std::mt19937_64& rng, int pos0, int E, int nodes, int width
   ragon::describe_tree(t, td);
   const int V = t.rows();
   std::normal_distribution<float> nd(0.f, 1.f);
-  std::vector<__nv_bfloat16> kc(size_t(Hkv) * ctx * D), vc(kc.size());
+  std::vector<ragon::gpu::bf16> kc(size_t(Hkv) * ctx * D), vc(kc.size());
   for (size_t i = 0; i < kc.size(); ++i) kc[i] = __float2bfloat16(nd(rng)), vc[i] = __float2bfloat16(nd(rng));
   std::vector<float> qg(size_t(V) * Hq * 2 * D), kk(size_t(V) * Hkv * D), vv(kk.size());
   for (float& x : qg) x = nd(rng);
   for (float& x : kk) x = nd(rng);
   for (float& x : vv) x = nd(rng);
-  std::vector<__nv_bfloat16> qn(D), kn(D);
+  std::vector<ragon::gpu::bf16> qn(D), kn(D);
   for (int i = 0; i < D; ++i) qn[i] = __float2bfloat16(0.1f * nd(rng)), kn[i] = __float2bfloat16(0.1f * nd(rng));
   k::set_kv_layout(size_t(ctx) * D, D);
-  __nv_bfloat16 *dkc = upload(kc), *dvc = upload(vc), *dqn = upload(qn), *dkn = upload(kn);
+  ragon::gpu::bf16 *dkc = upload(kc), *dvc = upload(vc), *dqn = upload(qn), *dkn = upload(kn);
   float *dqg = upload(qg), *dk = upload(kk), *dv = upload(vv);
   float *dq = nullptr, *dgate = nullptr, *dout = nullptr, *dscr = nullptr;
-  cudaMalloc(&dq, size_t(k::kMaxStreamRows) * Hq * D * 4);
-  cudaMalloc(&dgate, size_t(k::kMaxStreamRows) * Hq * D * 4);
-  cudaMalloc(&dout, size_t(k::kMaxStreamRows) * Hq * D * 4);
-  cudaMalloc(&dscr, k::attention_rows_scratch_floats(k::kMaxStreamRows, Hq, D, ctx) * 4);
+  ragon::test::alloc_into(&dq, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  ragon::test::alloc_into(&dgate, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  ragon::test::alloc_into(&dout, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  ragon::test::alloc_into(&dscr, k::attention_rows_scratch_floats(k::kMaxStreamRows, Hq, D, ctx) * 4);
   k::TreeDesc* dtd = upload(std::vector<k::TreeDesc>{td});
   k::attn_prepare(dqg, dk, dv, dqn, dkn, pos0, V, Hq, Hkv, D, rot, theta, eps, dq, dgate, dkc, dvc, 0, dtd);
   k::attention_rows(dq, dkc, dvc, pos0, V, Hq, Hkv, D, dscr, dout, 0, 0, dtd);
@@ -104,7 +104,7 @@ bool check_attention(std::mt19937_64& rng, int pos0, int E, int nodes, int width
       std::memcpy(&ck[size_t(j) * Hkv * D], &kk[size_t(r) * Hkv * D], size_t(Hkv) * D * 4);
       std::memcpy(&cv[size_t(j) * Hkv * D], &vv[size_t(r) * Hkv * D], size_t(Hkv) * D * 4);
     }
-    __nv_bfloat16 *ckc = upload(kc), *cvc = upload(vc);
+    ragon::gpu::bf16 *ckc = upload(kc), *cvc = upload(vc);
     float *dcqg = upload(cqg), *dck = upload(ck), *dcv = upload(cv);
     k::attn_prepare(dcqg, dck, dcv, dqn, dkn, pos0, P, Hq, Hkv, D, rot, theta, eps, dq, dgate, ckc, cvc, 0);
     k::attention_rows(dq, ckc, cvc, pos0, P, Hq, Hkv, D, dscr, dout, 0, 0);
@@ -116,14 +116,14 @@ bool check_attention(std::mt19937_64& rng, int pos0, int E, int nodes, int width
       bad += compare(&tree_q[size_t(r) * Hq * D], &chain_q[size_t(j) * Hq * D], size_t(Hq) * D);
       ++checked;
     }
-    cudaFree(ckc), cudaFree(cvc), cudaFree(dcqg), cudaFree(dck), cudaFree(dcv);
+    ragon::test::free_bytes(ckc), ragon::test::free_bytes(cvc), ragon::test::free_bytes(dcqg), ragon::test::free_bytes(dck), ragon::test::free_bytes(dcv);
   }
-  cudaFree(dkc), cudaFree(dvc), cudaFree(dqn), cudaFree(dkn), cudaFree(dqg), cudaFree(dk), cudaFree(dv);
-  cudaFree(dq), cudaFree(dgate), cudaFree(dout), cudaFree(dscr), cudaFree(dtd);
-  const cudaError_t e = cudaGetLastError();
+  ragon::test::free_bytes(dkc), ragon::test::free_bytes(dvc), ragon::test::free_bytes(dqn), ragon::test::free_bytes(dkn), ragon::test::free_bytes(dqg), ragon::test::free_bytes(dk), ragon::test::free_bytes(dv);
+  ragon::test::free_bytes(dq), ragon::test::free_bytes(dgate), ragon::test::free_bytes(dout), ragon::test::free_bytes(dscr), ragon::test::free_bytes(dtd);
+  const char* e = ragon::test::last_error();
   std::printf("attention tree pos %d, %d rows, %d variants: %d path rows checked, %d differ%s %s\n", pos0, V, td.nvar,
-              checked, bad, e != cudaSuccess ? cudaGetErrorString(e) : "", bad == 0 && e == cudaSuccess ? "ok" : "FAIL");
-  return bad == 0 && e == cudaSuccess;
+              checked, bad, e ? e : "", bad == 0 && !e ? "ok" : "FAIL");
+  return bad == 0 && !e;
 }
 
 // DeltaNet: the tree conv and recurrence against each leaf path's chain (gdn_conv in place, gdn_recurrent).
@@ -141,13 +141,13 @@ bool check_gdn(std::mt19937_64& rng, int E, int nodes, int width) {
   for (float& x : beta) x = uu(rng);
   for (float& x : state) x = 0.05f * nd(rng);
   for (float& x : conv) x = nd(rng);
-  std::vector<__nv_bfloat16> w(size_t(C) * 4);
+  std::vector<ragon::gpu::bf16> w(size_t(C) * 4);
   for (auto& x : w) x = __float2bfloat16(0.5f * nd(rng));
   float *dpre = upload(pre), *dg = upload(g), *dbeta = upload(beta), *dstate = upload(state), *dconv = upload(conv);
-  __nv_bfloat16* dw = upload(w);
+  ragon::gpu::bf16* dw = upload(w);
   float *dpost = nullptr, *dout = nullptr;
-  cudaMalloc(&dpost, size_t(V) * C * 4);
-  cudaMalloc(&dout, size_t(V) * HV * Dv * 4);
+  ragon::test::alloc_into(&dpost, size_t(V) * C * 4);
+  ragon::test::alloc_into(&dout, size_t(V) * HV * Dv * 4);
   k::TreeDesc* dtd = upload(std::vector<k::TreeDesc>{td});
   k::gdn_conv_tree(dpre, dpost, dconv, dw, V, C, dtd, 0);
   k::gdn_recurrent_tree(dpost, dg, dbeta, dstate, dout, H, HV, dtd, k::kMaxTreeVariants, 0);
@@ -176,14 +176,14 @@ bool check_gdn(std::mt19937_64& rng, int E, int nodes, int width) {
       bad += compare(&tout[size_t(r) * HV * Dv], &cout[size_t(j) * HV * Dv], size_t(HV) * Dv);
       ++checked;
     }
-    cudaFree(dcm), cudaFree(dcg), cudaFree(dcb), cudaFree(dtmp);
+    ragon::test::free_bytes(dcm), ragon::test::free_bytes(dcg), ragon::test::free_bytes(dcb), ragon::test::free_bytes(dtmp);
   }
-  cudaFree(dpre), cudaFree(dg), cudaFree(dbeta), cudaFree(dstate), cudaFree(dconv), cudaFree(dw), cudaFree(dpost);
-  cudaFree(dout), cudaFree(dtd);
-  const cudaError_t e = cudaGetLastError();
-  const bool ok = bad == 0 && state_kept && e == cudaSuccess;
+  ragon::test::free_bytes(dpre), ragon::test::free_bytes(dg), ragon::test::free_bytes(dbeta), ragon::test::free_bytes(dstate), ragon::test::free_bytes(dconv), ragon::test::free_bytes(dw), ragon::test::free_bytes(dpost);
+  ragon::test::free_bytes(dout), ragon::test::free_bytes(dtd);
+  const char* e = ragon::test::last_error();
+  const bool ok = bad == 0 && state_kept && !e;
   std::printf("deltanet tree %d rows, %d gdn paths: %d path rows checked, %d differ, state %s%s %s\n", V, ngdn, checked,
-              bad, state_kept ? "unwritten" : "WRITTEN", e != cudaSuccess ? cudaGetErrorString(e) : "", ok ? "ok" : "FAIL");
+              bad, state_kept ? "unwritten" : "WRITTEN", e ? e : "", ok ? "ok" : "FAIL");
   return ok;
 }
 
@@ -203,9 +203,8 @@ void bench_gdn() {
   std::vector<float> state(size_t(L) * HV * Dk * Dv);
   for (float& x : state) x = 0.05f * nd(rng);
   float *dpre = upload(pre), *dg = upload(g), *dbeta = upload(beta), *dstate = upload(state), *dout = nullptr;
-  cudaMalloc(&dout, size_t(k::kMaxStreamRows) * HV * Dv * 4);
-  cudaEvent_t a, b;
-  cudaEventCreate(&a), cudaEventCreate(&b);
+  ragon::test::alloc_into(&dout, size_t(k::kMaxStreamRows) * HV * Dv * 4);
+  ragon::test::Timer timer;
   for (int nodes : {0, 3, 7, 11, 15, 19, 23}) {
     for (int trial = 0; trial < 3; ++trial) {
       const ragon::DraftTree t = random_tree(rng, 12, nodes, 16, nodes ? 8 : 1000);
@@ -214,19 +213,17 @@ void bench_gdn() {
       k::TreeDesc* dtd = upload(std::vector<k::TreeDesc>{td});
       float ms = 0;
       for (int pass = 0; pass < 2; ++pass) {
-        cudaEventRecord(a);
+        timer.start();
         for (int r = 0; r < reps; ++r)
           for (int l = 0; l < L; ++l)
             k::gdn_recurrent_tree(dpre, dg, dbeta, dstate + size_t(l) * HV * Dk * Dv, dout, H, HV, dtd, ngdn, 0);
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
-        cudaEventElapsedTime(&ms, a, b);
+        ms = timer.stop();
       }
       std::printf("bench gdn %2d rows, %d paths: %.3f ms per 48 layers\n", t.rows(), ngdn, ms / reps);
-      cudaFree(dtd);
+      ragon::test::free_bytes(dtd);
     }
   }
-  cudaFree(dpre), cudaFree(dg), cudaFree(dbeta), cudaFree(dstate), cudaFree(dout);
+  ragon::test::free_bytes(dpre), ragon::test::free_bytes(dg), ragon::test::free_bytes(dbeta), ragon::test::free_bytes(dstate), ragon::test::free_bytes(dout);
 }
 
 // tree/rows: the attention's time per full-attention layer at agentlong's contexts, by rows (one block of 96 query rows
@@ -236,23 +233,22 @@ void bench_attention() {
   const float theta = 1e7f, eps = 1e-6f;
   std::mt19937_64 rng(11);
   std::normal_distribution<float> nd(0.f, 1.f);
-  std::vector<__nv_bfloat16> kc(size_t(Hkv) * ctx * D);
+  std::vector<ragon::gpu::bf16> kc(size_t(Hkv) * ctx * D);
   for (auto& x : kc) x = __float2bfloat16(nd(rng));
   k::set_kv_layout(size_t(ctx) * D, D);
-  __nv_bfloat16 *dkc = upload(kc), *dvc = upload(kc);
+  ragon::gpu::bf16 *dkc = upload(kc), *dvc = upload(kc);
   std::vector<float> qg(size_t(k::kMaxStreamRows) * Hq * 2 * D), kk(size_t(k::kMaxStreamRows) * Hkv * D);
   for (float& x : qg) x = nd(rng);
   for (float& x : kk) x = nd(rng);
-  std::vector<__nv_bfloat16> qn(D), kn(D);
+  std::vector<ragon::gpu::bf16> qn(D), kn(D);
   for (int i = 0; i < D; ++i) qn[i] = __float2bfloat16(0.1f * nd(rng)), kn[i] = __float2bfloat16(0.1f * nd(rng));
-  __nv_bfloat16 *dqn = upload(qn), *dkn = upload(kn);
+  ragon::gpu::bf16 *dqn = upload(qn), *dkn = upload(kn);
   float *dqg = upload(qg), *dk = upload(kk), *dv = upload(kk), *dq, *dgate, *dout, *dscr;
-  cudaMalloc(&dq, size_t(k::kMaxStreamRows) * Hq * D * 4);
-  cudaMalloc(&dgate, size_t(k::kMaxStreamRows) * Hq * D * 4);
-  cudaMalloc(&dout, size_t(k::kMaxStreamRows) * Hq * D * 4);
-  cudaMalloc(&dscr, k::attention_rows_scratch_floats(k::kMaxStreamRows, Hq, D, ctx) * 4);
-  cudaEvent_t a, b;
-  cudaEventCreate(&a), cudaEventCreate(&b);
+  ragon::test::alloc_into(&dq, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  ragon::test::alloc_into(&dgate, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  ragon::test::alloc_into(&dout, size_t(k::kMaxStreamRows) * Hq * D * 4);
+  ragon::test::alloc_into(&dscr, k::attention_rows_scratch_floats(k::kMaxStreamRows, Hq, D, ctx) * 4);
+  ragon::test::Timer timer;
   for (int pos0 : {28000, 57000})
     for (int nodes : {0, 7, 8, 11, 15, 23}) {
       const ragon::DraftTree t = random_tree(rng, 12, nodes, 16, nodes ? 8 : 1000);
@@ -263,18 +259,16 @@ void bench_attention() {
       k::attn_prepare(dqg, dk, dv, dqn, dkn, pos0, V, Hq, Hkv, D, rot, theta, eps, dq, dgate, dkc, dvc, 0, dtd);
       float ms = 0;
       for (int pass = 0; pass < 2; ++pass) {
-        cudaEventRecord(a);
+        timer.start();
         for (int r = 0; r < reps; ++r) k::attention_rows(dq, dkc, dvc, pos0, V, Hq, Hkv, D, dscr, dout, 0, 0, dtd);
-        cudaEventRecord(b);
-        cudaEventSynchronize(b);
-        cudaEventElapsedTime(&ms, a, b);
+        ms = timer.stop();
       }
       std::printf("bench attention pos %d, %2d rows, %2d variants: %.3f ms per layer (x16 layers %.2f ms)\n", pos0, V,
                   td.nvar, ms / reps, 16 * ms / reps);
-      cudaFree(dtd);
+      ragon::test::free_bytes(dtd);
     }
-  cudaFree(dkc), cudaFree(dvc), cudaFree(dqn), cudaFree(dkn), cudaFree(dqg), cudaFree(dk), cudaFree(dv);
-  cudaFree(dq), cudaFree(dgate), cudaFree(dout), cudaFree(dscr);
+  ragon::test::free_bytes(dkc), ragon::test::free_bytes(dvc), ragon::test::free_bytes(dqn), ragon::test::free_bytes(dkn), ragon::test::free_bytes(dqg), ragon::test::free_bytes(dk), ragon::test::free_bytes(dv);
+  ragon::test::free_bytes(dq), ragon::test::free_bytes(dgate), ragon::test::free_bytes(dout), ragon::test::free_bytes(dscr);
 }
 
 // tree_gather with row0: a batched sequence's accepted rows move within its own rows of the buffers the batch shares,
@@ -297,10 +291,10 @@ bool check_gather_row0() {
   k::GatherBuf* dbufs = upload(bufs);
   int* drows = upload(path);
   k::tree_gather(dbufs, int(bufs.size()), drows, int(path.size()), k::DevPos(kPos), nullptr, kRow0);
-  cudaDeviceSynchronize();
+  (void)ragon::test::sync_error();
   const bool ok = download(row_buf, h.size()) == expect(kRow0) && download(kv_buf, h.size()) == expect(kPos);
   std::printf("%s tree_gather at row0\n", ok ? "ok  " : "FAIL");
-  for (void* p : {(void*)row_buf, (void*)kv_buf, (void*)dbufs, (void*)drows}) cudaFree(p);
+  for (void* p : {(void*)row_buf, (void*)kv_buf, (void*)dbufs, (void*)drows}) ragon::test::free_bytes(p);
   return ok;
 }
 
