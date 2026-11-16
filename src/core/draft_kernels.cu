@@ -2,7 +2,7 @@
 // candidate selector), written against SGLang's reference implementation (models/dflash.py).
 #include "core/kernels.cuh"
 #include "core/launch.cuh"
-
+#include "backend/device.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -16,7 +16,7 @@ namespace {
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(gpu::kWarpMask, v, o);
   return v;
 }
 
@@ -27,7 +27,7 @@ constexpr int kExchange = 0;
 // Per-head RMSNorm (plain weight) and NeoX RoPE over the whole head, in place. One block per (row, head),
 // one thread per dim.
 __device__ __forceinline__ void draft_qk_rope_body(float* __restrict__ x, int row_stride,
-                                                   const __nv_bfloat16* __restrict__ w, int r, int pos, float theta,
+                                                   const gpu::bf16* __restrict__ w, int r, int pos, float theta,
                                                    float eps) {
   __shared__ float red[4], xs[kDD];
   const int h = blockIdx.y, d = threadIdx.x;
@@ -46,14 +46,14 @@ __device__ __forceinline__ void draft_qk_rope_body(float* __restrict__ x, int ro
   p[d] = d < half ? xs[d] * cs - xs[d + half] * sn : xs[d] * cs + xs[d - half] * sn;
 }
 
-__global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
+__global__ void draft_qk_rope_kernel(float* __restrict__ x, int row_stride, const gpu::bf16* __restrict__ w,
                                      DevPos pos0, float theta, float eps) {
   pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x;
   draft_qk_rope_body(x, row_stride, w, r, pos_value(pos0) + r, theta, eps);
 }
 
-__global__ void draft_qk_rope_seqs_kernel(float* __restrict__ x, int row_stride, const __nv_bfloat16* __restrict__ w,
+__global__ void draft_qk_rope_seqs_kernel(float* __restrict__ x, int row_stride, const gpu::bf16* __restrict__ w,
                                           SeqBatch b, float theta, float eps) {
   pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x, sq = seq_of(b, r);
@@ -61,7 +61,7 @@ __global__ void draft_qk_rope_seqs_kernel(float* __restrict__ x, int row_stride,
 }
 
 __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
-                                      DevPos pos0_arg, __nv_bfloat16* __restrict__ kc, __nv_bfloat16* __restrict__ vc,
+                                      DevPos pos0_arg, gpu::bf16* __restrict__ kc, gpu::bf16* __restrict__ vc,
                                       int ring) {
   pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x, pos0 = pos_value(pos0_arg);
@@ -73,11 +73,11 @@ __global__ void draft_store_kv_kernel(const float* __restrict__ k, const float* 
 }
 
 __global__ void draft_store_kv_seqs_kernel(const float* __restrict__ k, const float* __restrict__ v, int kv_size,
-                                           SeqPtrs<__nv_bfloat16> kcs, SeqPtrs<__nv_bfloat16> vcs, int ring, SeqBatch b) {
+                                           SeqPtrs<gpu::bf16> kcs, SeqPtrs<gpu::bf16> vcs, int ring, SeqBatch b) {
   pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x, sq = seq_of(b, r), pos = seq_pos(b, sq) + r - b.row0[sq];
-  __nv_bfloat16* __restrict__ kc = kcs.p[sq];
-  __nv_bfloat16* __restrict__ vc = vcs.p[sq];
+  gpu::bf16* __restrict__ kc = kcs.p[sq];
+  gpu::bf16* __restrict__ vc = vcs.p[sq];
   for (int i = threadIdx.x; i < kv_size; i += blockDim.x) {
     const size_t dst = static_cast<size_t>(pos % ring) * kv_size + i;
     kc[dst] = __float2bfloat16(k[static_cast<size_t>(r) * kv_size + i]);
@@ -90,8 +90,8 @@ __global__ void draft_store_kv_seqs_kernel(const float* __restrict__ k, const fl
 // softmax and are merged at the end. Lane l owns dims 4l .. 4l + 3.
 // Query row j of a block of B rows at positions L .. L + B - 1 (q, kb, vb and out start at the block's first row).
 template <int G, int U>
-__device__ __forceinline__ void draft_attention_body(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
-                                                     const __nv_bfloat16* __restrict__ vc, int ring,
+__device__ __forceinline__ void draft_attention_body(const float* __restrict__ q, const gpu::bf16* __restrict__ kc,
+                                                     const gpu::bf16* __restrict__ vc, int ring,
                                                      const float* __restrict__ kb, const float* __restrict__ vb, int L,
                                                      int window_left, int Hkv, float* __restrict__ out, int j, int B) {
   __shared__ float wm[8][G], wl[8][G], wacc[8][kDD];
@@ -143,7 +143,7 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
       float sc[NU][G];
 #pragma unroll
       for (int u = 0; u < NU; ++u) {
-        const __nv_bfloat16* k16 = reinterpret_cast<const __nv_bfloat16*>(&kr[u]);
+        const gpu::bf16* k16 = reinterpret_cast<const gpu::bf16*>(&kr[u]);
         float kf[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) kf[i] = __bfloat162float(k16[i]);
@@ -167,7 +167,7 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
 #pragma unroll
           for (int k = 0; k < n / 2; ++k) {
             const float keep = hi ? part[k + n / 2] : part[k], send = hi ? part[k] : part[k + n / 2];
-            part[k] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+            part[k] = keep + __shfl_xor_sync(gpu::kWarpMask, send, o);
           }
         }
         const int g = lane % G;
@@ -175,21 +175,21 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
         float m = s;  // the running maximum of head g over this batch's keys up to lane's: a scan over lanes g + 4u
 #pragma unroll
         for (int o = G; o < 32; o <<= 1) {
-          const float up = __shfl_up_sync(0xffffffffu, m, o);
+          const float up = __shfl_up_sync(gpu::kWarpMask, m, o);
           if (lane >= o) m = fmaxf(m, up);
         }
         float before = mx[0];
 #pragma unroll
         for (int gg = 1; gg < G; ++gg) before = g == gg ? mx[gg] : before;
         const float nm = fmaxf(before, m);
-        const float prev_in = __shfl_up_sync(0xffffffffu, nm, G), prev = lane >= G ? prev_in : before;
+        const float prev_in = __shfl_up_sync(gpu::kWarpMask, nm, G), prev = lane >= G ? prev_in : before;
         xs[warp][0][lane] = __expf(prev - nm);  // corr
         xs[warp][1][lane] = __expf(s - nm);     // p
         xs[warp][2][lane] = nm;
         __syncwarp();
 #pragma unroll
         for (int u = 0; u < NU; ++u) {
-          const __nv_bfloat16* v16 = reinterpret_cast<const __nv_bfloat16*>(&vr[u]);
+          const gpu::bf16* v16 = reinterpret_cast<const gpu::bf16*>(&vr[u]);
           float vf[4];
 #pragma unroll
           for (int i = 0; i < 4; ++i) vf[i] = __bfloat162float(v16[i]);
@@ -210,7 +210,7 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
       } else {
 #pragma unroll
         for (int u = 0; u < NU; ++u) {
-          const __nv_bfloat16* v16 = reinterpret_cast<const __nv_bfloat16*>(&vr[u]);
+          const gpu::bf16* v16 = reinterpret_cast<const gpu::bf16*>(&vr[u]);
           float vf[4];
 #pragma unroll
           for (int i = 0; i < 4; ++i) vf[i] = __bfloat162float(v16[i]);
@@ -233,8 +233,8 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
       const size_t off = (static_cast<size_t>((lo + kk) % ring) * Hkv + kvh) * kDD + lane * 4;
       const uint2 kr = *reinterpret_cast<const uint2*>(kc + off);
       const uint2 vr = *reinterpret_cast<const uint2*>(vc + off);
-      const __nv_bfloat16* k16 = reinterpret_cast<const __nv_bfloat16*>(&kr);
-      const __nv_bfloat16* v16 = reinterpret_cast<const __nv_bfloat16*>(&vr);
+      const gpu::bf16* k16 = reinterpret_cast<const gpu::bf16*>(&kr);
+      const gpu::bf16* v16 = reinterpret_cast<const gpu::bf16*>(&vr);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         kf[i] = __bfloat162float(k16[i]);
@@ -293,8 +293,8 @@ __device__ __forceinline__ void draft_attention_body(const float* __restrict__ q
 
 template <int G, int U>
 __global__ void __launch_bounds__(256)
-    draft_attention_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
-                           const __nv_bfloat16* __restrict__ vc, int ring, const float* __restrict__ kb,
+    draft_attention_kernel(const float* __restrict__ q, const gpu::bf16* __restrict__ kc,
+                           const gpu::bf16* __restrict__ vc, int ring, const float* __restrict__ kb,
                            const float* __restrict__ vb, DevPos L_arg, int window_left, int Hkv, float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
   draft_attention_body<G, U>(q, kc, vc, ring, kb, vb, pos_value(L_arg), window_left, Hkv, out, blockIdx.x, gridDim.x);
@@ -304,8 +304,8 @@ __global__ void __launch_bounds__(256)
 // rows of b, over its own ring at its own position.
 template <int G, int U>
 __global__ void __launch_bounds__(256)
-    draft_attention_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
-                                SeqPtrs<const __nv_bfloat16> vc, int ring, const float* __restrict__ kb,
+    draft_attention_seqs_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc,
+                                SeqPtrs<const gpu::bf16> vc, int ring, const float* __restrict__ kb,
                                 const float* __restrict__ vb, SeqBatch b, int window_left, int Hkv,
                                 float* __restrict__ out) {
   pdl_begin();  // first statement: see launch.cuh
@@ -320,7 +320,7 @@ __global__ void __launch_bounds__(256)
 // c / group_size, out[n] = (base[side][0][c] + coef[n][side][0][grp]) * h[n]
 //                       + (base[side][1][c] + coef[n][side][1][grp]) * h[n - 1]   (only if n % block >= 1).
 __global__ void grouped_conv_kernel(const float* __restrict__ h, const float* __restrict__ coef,
-                                    const __nv_bfloat16* __restrict__ base, int side, float* __restrict__ out, int C,
+                                    const gpu::bf16* __restrict__ base, int side, float* __restrict__ out, int C,
                                     int groups, int block) {
   pdl_begin();  // first statement: see launch.cuh
   const int n = blockIdx.x, gs = C / groups;
@@ -343,8 +343,8 @@ __global__ void grouped_conv_kernel(const float* __restrict__ h, const float* __
 constexpr int kSelK = 16, kSelR = 256;
 __global__ void __launch_bounds__(256)
     selector_lattice_kernel(const float* __restrict__ hp, const int* __restrict__ cand,
-                            const float* __restrict__ unary, const __nv_bfloat16* __restrict__ P,
-                            const __nv_bfloat16* __restrict__ S, int anchor_arg, const int* __restrict__ anchor_dev,
+                            const float* __restrict__ unary, const gpu::bf16* __restrict__ P,
+                            const gpu::bf16* __restrict__ S, int anchor_arg, const int* __restrict__ anchor_dev,
                             float* __restrict__ scores) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float Ps[kSelK][kSelR + 1], Ss[kSelK][kSelR + 1], hs[kSelR];
@@ -364,7 +364,7 @@ __global__ void __launch_bounds__(256)
   scores[(static_cast<size_t>(e) * kSelK + p) * kSelK + c] = unary[e * kSelK + c] + sum;
 }
 
-__global__ void copy_rows_bf16_kernel(const float* __restrict__ src, int H, __nv_bfloat16* __restrict__ dst,
+__global__ void copy_rows_bf16_kernel(const float* __restrict__ src, int H, gpu::bf16* __restrict__ dst,
                                       int dst_stride) {
   pdl_begin();  // first statement: see launch.cuh
   const int r = blockIdx.x;
@@ -374,15 +374,15 @@ __global__ void copy_rows_bf16_kernel(const float* __restrict__ src, int H, __nv
 
 // to_half_rows (stream_gemm.cu) from BF16 rows: one block per row, the power-of-two scale that puts the row's largest
 // magnitude in [2^14, 2^15), the same arithmetic on the same values.
-__global__ void bf16_to_half_rows_kernel(const __nv_bfloat16* __restrict__ x, int K, __half* __restrict__ out,
+__global__ void bf16_to_half_rows_kernel(const gpu::bf16* __restrict__ x, int K, gpu::half* __restrict__ out,
                                          float* __restrict__ xinv) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[32];
-  const __nv_bfloat16* row = x + static_cast<size_t>(blockIdx.x) * K;
+  const gpu::bf16* row = x + static_cast<size_t>(blockIdx.x) * K;
   float mx = 0.f;
   for (int k = threadIdx.x; k < K; k += blockDim.x) mx = fmaxf(mx, fabsf(__bfloat162float(row[k])));
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(gpu::kWarpMask, mx, o));
   if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
   __syncthreads();
   mx = 0.f;
@@ -399,20 +399,20 @@ __global__ void bf16_to_half_rows_kernel(const __nv_bfloat16* __restrict__ x, in
 // blocks, each finding the whole row's largest magnitude (exact in any order) and converting its slice of K, so the
 // values are the one-block kernel's bit for bit. VEC: x and out aligned to 16 bytes, K and slice multiples of 8.
 __device__ __forceinline__ float abs_max8(float m, const uint4& v) {
-  const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+  const gpu::bf16* b = reinterpret_cast<const gpu::bf16*>(&v);
 #pragma unroll
   for (int i = 0; i < 8; ++i) m = fmaxf(m, fabsf(__bfloat162float(b[i])));
   return m;
 }
 
 template <bool VEC>
-__global__ void __launch_bounds__(256) bf16_to_half_rows_wide_kernel(const __nv_bfloat16* __restrict__ x, int K,
-                                                                     int slice, __half* __restrict__ out,
+__global__ void __launch_bounds__(256) bf16_to_half_rows_wide_kernel(const gpu::bf16* __restrict__ x, int K,
+                                                                     int slice, gpu::half* __restrict__ out,
                                                                      float* __restrict__ xinv) {
   pdl_begin();  // first statement: see launch.cuh
   __shared__ float red[8];
   const size_t r = blockIdx.x;
-  const __nv_bfloat16* row = x + r * K;
+  const gpu::bf16* row = x + r * K;
   const int tid = threadIdx.x;
   float m0 = 0.f, m1 = 0.f;
   if constexpr (VEC) {
@@ -431,7 +431,7 @@ __global__ void __launch_bounds__(256) bf16_to_half_rows_wide_kernel(const __nv_
   }
   float mx = fmaxf(m0, m1);
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(gpu::kWarpMask, mx, o));
   if ((tid & 31) == 0) red[tid >> 5] = mx;
   __syncthreads();
   mx = 0.f;
@@ -446,9 +446,9 @@ __global__ void __launch_bounds__(256) bf16_to_half_rows_wide_kernel(const __nv_
     uint4* out8 = reinterpret_cast<uint4*>(out + r * K);
     for (int k = k0 / 8 + tid; k < k1 / 8; k += 256) {
       const uint4 v = row8[k];
-      const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+      const gpu::bf16* b = reinterpret_cast<const gpu::bf16*>(&v);
       uint4 o;
-      __half* h = reinterpret_cast<__half*>(&o);
+      gpu::half* h = reinterpret_cast<gpu::half*>(&o);
 #pragma unroll
       for (int i = 0; i < 8; ++i) h[i] = __float2half_rn(__bfloat162float(b[i]) * s);
       out8[k] = o;
@@ -479,7 +479,7 @@ void with_keys(int ring, Launch&& launch) {
 }  // namespace
 
 // About RAGON_HALF_BLOCKS (default 96) blocks in all, as to_half_rows; RAGON_HALF_BLOCKS=0: one block per row.
-void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, __half* out, float* xinv, cudaStream_t s) {
+void bf16_to_half_rows(const gpu::bf16* x, int M, int K, gpu::half* out, float* xinv, gpu::Stream s) {
   if (M <= 0) return;
   static const int target = [] {
     const char* e = std::getenv("RAGON_HALF_BLOCKS");
@@ -502,26 +502,26 @@ void bf16_to_half_rows(const __nv_bfloat16* x, int M, int K, __half* out, float*
 
 void set_draft_attention_keys(int u) { draft_keys = u; }
 
-void copy_rows_bf16(const float* src, int rows, int H, __nv_bfloat16* dst, int dst_stride, cudaStream_t s) {
+void copy_rows_bf16(const float* src, int rows, int H, gpu::bf16* dst, int dst_stride, gpu::Stream s) {
   if (rows <= 0) return;
   launch_kernel("copy_rows_bf16", copy_rows_bf16_kernel, dim3(rows), dim3(256), 0, s, src, H, dst, dst_stride);
 }
 
-void draft_qk_rope(float* x, int rows, int heads, int row_stride, const __nv_bfloat16* norm, DevPos pos0, float theta,
-                   float eps, cudaStream_t s) {
+void draft_qk_rope(float* x, int rows, int heads, int row_stride, const gpu::bf16* norm, DevPos pos0, float theta,
+                   float eps, gpu::Stream s) {
   launch_kernel("draft_qk_rope", draft_qk_rope_kernel, dim3(rows, heads), dim3(kDD), 0, s, x, row_stride, norm, pos0,
                 theta, eps);
 }
 
-void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, __nv_bfloat16* kc,
-                    __nv_bfloat16* vc, int ring, cudaStream_t s) {
+void draft_store_kv(const float* k, const float* v, int rows, int kv_size, DevPos pos0, gpu::bf16* kc,
+                    gpu::bf16* vc, int ring, gpu::Stream s) {
   if (rows > ring) throw std::runtime_error("draft_store_kv: more rows than the ring holds");
   launch_kernel("draft_store_kv", draft_store_kv_kernel, dim3(rows), dim3(256), 0, s, k, v, kv_size, pos0, kc, vc,
                 ring);
 }
 
-void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, int ring, const float* kb,
-                     const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, cudaStream_t s) {
+void draft_attention(const float* q, const gpu::bf16* kc, const gpu::bf16* vc, int ring, const float* kb,
+                     const float* vb, DevPos L, int B, int window_left, int Hq, int Hkv, float* out, gpu::Stream s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
   if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
   with_keys(ring, [&](auto u) {
@@ -530,23 +530,23 @@ void draft_attention(const float* q, const __nv_bfloat16* kc, const __nv_bfloat1
   });
 }
 
-void draft_qk_rope_seqs(float* x, int heads, int row_stride, const __nv_bfloat16* norm, const SeqBatch& b, float theta,
-                        float eps, cudaStream_t s) {
+void draft_qk_rope_seqs(float* x, int heads, int row_stride, const gpu::bf16* norm, const SeqBatch& b, float theta,
+                        float eps, gpu::Stream s) {
   launch_kernel("draft_qk_rope_seqs", draft_qk_rope_seqs_kernel, dim3(b.row0[b.n], heads), dim3(kDD), 0, s, x,
                 row_stride, norm, b, theta, eps);
 }
 
-void draft_store_kv_seqs(const float* k, const float* v, int kv_size, SeqPtrs<__nv_bfloat16> kc,
-                         SeqPtrs<__nv_bfloat16> vc, int ring, const SeqBatch& b, cudaStream_t s) {
+void draft_store_kv_seqs(const float* k, const float* v, int kv_size, SeqPtrs<gpu::bf16> kc,
+                         SeqPtrs<gpu::bf16> vc, int ring, const SeqBatch& b, gpu::Stream s) {
   for (int i = 0; i < b.n; ++i)
     if (b.row0[i + 1] - b.row0[i] > ring) throw std::runtime_error("draft_store_kv: more rows than the ring holds");
   launch_kernel("draft_store_kv_seqs", draft_store_kv_seqs_kernel, dim3(b.row0[b.n]), dim3(256), 0, s, k, v, kv_size,
                 kc, vc, ring, b);
 }
 
-void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc, int ring,
+void draft_attention_seqs(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc, int ring,
                           const float* kb, const float* vb, const SeqBatch& b, int window_left, int Hq, int Hkv,
-                          float* out, cudaStream_t s) {
+                          float* out, gpu::Stream s) {
   if (Hq != 4 * Hkv) throw std::runtime_error("draft_attention: built for 4 query heads per KV head");
   if (ring <= window_left) throw std::runtime_error("draft_attention: the ring is shorter than the window");
   with_keys(ring, [&](auto u) {
@@ -555,14 +555,14 @@ void draft_attention_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPt
   });
 }
 
-void grouped_conv(const float* h, const float* coef, const __nv_bfloat16* base, int side, float* out, int rows,
-                  int C, int groups, int block, cudaStream_t s) {
+void grouped_conv(const float* h, const float* coef, const gpu::bf16* base, int side, float* out, int rows,
+                  int C, int groups, int block, gpu::Stream s) {
   launch_kernel("grouped_conv", grouped_conv_kernel, dim3(rows), dim3(256), 0, s, h, coef, base, side, out, C, groups,
                 block);
 }
 
-void selector_lattice(const float* hp, const int* cand, const float* unary, const __nv_bfloat16* P,
-                      const __nv_bfloat16* S, int anchor, int E, float* scores, cudaStream_t s, const int* anchor_dev) {
+void selector_lattice(const float* hp, const int* cand, const float* unary, const gpu::bf16* P,
+                      const gpu::bf16* S, int anchor, int E, float* scores, gpu::Stream s, const int* anchor_dev) {
   launch_kernel("selector_lattice", selector_lattice_kernel, dim3(E), dim3(256), 0, s, hp, cand, unary, P, S, anchor,
                 anchor_dev, scores);
 }
