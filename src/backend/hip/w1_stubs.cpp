@@ -68,8 +68,6 @@ void kv_absmax(const gpu::bf16* kcache, const gpu::bf16* vcache, const uint64_t*
 void kv_seal(const gpu::bf16* pool, uint8_t* mirror, uint8_t* sealed, const int* ids, int n, int l0, int l1, int Hkv,
     int D, size_t page_unit, const float* kinv, const float* vinv, gpu::Stream s) { not_ported("kv_seal"); }
 void kv_unseal(uint8_t* sealed, const int* ids, int n, gpu::Stream s) { not_ported("kv_unseal"); }
-void l2_prefetch_weights(const uint8_t* w, bool fp4, bool coded, int N, int K, size_t bytes,
-    gpu::Stream s) { not_ported("l2_prefetch_weights"); }
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
     const LoraOuts& outs, gpu::Stream stream) { not_ported("lora_expand"); }
 void lora_gemm_parts(const LoraSiteDev& d, const float* t,
@@ -100,34 +98,14 @@ void quant_act_fp8_bf16in(const gpu::bf16* x, int M, int K, float input_scale, u
     gpu::Stream s) { not_ported("quant_act_fp8_bf16in"); }
 void quant_act_nvfp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf,
     gpu::Stream s) { not_ported("quant_act_nvfp4"); }
-void retile_fp8(const uint8_t* w, uint8_t* out, int N, int K, gpu::Stream s) { not_ported("retile_fp8"); }
-void retile_nvfp4(const uint8_t* w, const uint8_t* wscale, uint8_t* out, int N, int K,
-    gpu::Stream s) { not_ported("retile_nvfp4"); }
-void retile_nvfp4_coded(const uint8_t* w, const uint8_t* wscale, const uint8_t* code_of_dev, uint8_t* out,
-    uint8_t* raw_scales, int N, int K, gpu::Stream s) { not_ported("retile_nvfp4_coded"); }
-void rmsnorm_half(const float* x, const gpu::bf16* w, float* out, gpu::half* xh, float* xinv, int rows, int H,
-    float eps, bool gemma, gpu::Stream s) { not_ported("rmsnorm_half"); }
 void rmsnorm_quant(const float* x, const gpu::bf16* w, float* out, int M, int H, float eps, bool nvfp4,
     float input_scale, uint8_t* q, uint8_t* sf, gpu::Stream s) { not_ported("rmsnorm_quant"); }
 void rmsnorm_quant_bf16(const float* x, const gpu::bf16* w, gpu::bf16* out, int M, int H, float eps, bool nvfp4,
     float input_scale, uint8_t* q, uint8_t* sf, gpu::Stream s) { not_ported("rmsnorm_quant_bf16"); }
-bool scale_code_table(const uint8_t* scales, size_t n, uint8_t (&table)[kScaleCodes],
-    uint8_t (&code_of)[256]) { not_ported("scale_code_table"); }
 void sigmoid_mul_fp8(const float* x, const float* gate, size_t n, float input_scale, uint8_t* q,
     gpu::Stream s) { not_ported("sigmoid_mul_fp8"); }
 void silu_mul_quant_nvfp4(const float* g, const float* u, int M, int K, float input_scale, uint8_t* q, uint8_t* sf,
     gpu::Stream s) { not_ported("silu_mul_quant_nvfp4"); }
-void stream_gemm_fp8(const gpu::half* x, const float* xinv, int M, const uint8_t* w, float wscale, float* y, int N,
-    int K, gpu::Stream s) { not_ported("stream_gemm_fp8"); }
-void stream_gemm_multi(bool nvfp4, const gpu::half* x, const float* xinv, int M, const StreamTarget* t, int n, int K,
-    gpu::Stream s) { not_ported("stream_gemm_multi"); }
-void stream_gemm_nvfp4(const gpu::half* x, const float* xinv, int M, const uint8_t* w, const uint8_t* wscale,
-    float scale2, float* y, int N, int K, gpu::Stream s) { not_ported("stream_gemm_nvfp4"); }
-size_t tiled_bytes_fp8(int N, int K) { not_ported("tiled_bytes_fp8"); }
-size_t tiled_bytes_nvfp4(int N, int K) { not_ported("tiled_bytes_nvfp4"); }
-size_t tiled_bytes_nvfp4_coded(int N, int K) { not_ported("tiled_bytes_nvfp4_coded"); }
-void to_half_rows(const float* x, int M, int K, gpu::half* out, float* xinv,
-    gpu::Stream s) { not_ported("to_half_rows"); }
 
 }  // namespace ragon::kernels
 

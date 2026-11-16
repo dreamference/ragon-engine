@@ -53,8 +53,10 @@ endif()
 if(RAGON_BACKEND STREQUAL "hip")
   set(CMAKE_HIP_STANDARD 20)
   set(CMAKE_HIP_STANDARD_REQUIRED ON)
-  set(RAGON_HIP_SOURCES src/core/topk.cu src/core/kernels.cu src/core/draft_kernels.cu src/core/sparse_head.cu)
+  set(RAGON_HIP_SOURCES src/core/topk.cu src/core/kernels.cu src/core/draft_kernels.cu src/core/sparse_head.cu
+                        src/core/stream_gemm_hip.cu)
   set_source_files_properties(${RAGON_HIP_SOURCES} tests/topk_tests.cu tests/kernel_tests.cu tests/w0_tests.cu
+                              tests/stream_gemm_hip_tests.cu
                               PROPERTIES LANGUAGE HIP)
   add_library(ragon_kernels_hip STATIC ${RAGON_HIP_SOURCES})
   target_include_directories(ragon_kernels_hip PUBLIC src)
@@ -69,6 +71,9 @@ if(RAGON_BACKEND STREQUAL "hip")
   add_executable(ragon-w0-tests tests/w0_tests.cu)
   target_link_libraries(ragon-w0-tests PRIVATE ragon_kernels_hip)
   add_test(NAME w0 COMMAND ragon-w0-tests)
+  add_executable(ragon-stream-gemm-hip-tests tests/stream_gemm_hip_tests.cu)
+  target_link_libraries(ragon-stream-gemm-hip-tests PRIVATE ragon_kernels_hip)
+  add_test(NAME stream_gemm_hip COMMAND ragon-stream-gemm-hip-tests)
   # The engine's host side on HIP (W1 host build): the host files through the runtime facade (BACKEND §5.2 tier 2),
   # model.cu, the safetensors loader, the tokenizer and the API layer, linked into ragon-run, ragon-template and the
   # host tests. The kernel entry points whose files are not ported yet are defined by src/backend/hip/w1_stubs.cpp,
