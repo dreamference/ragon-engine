@@ -17,7 +17,7 @@ It builds on [ARCHITECTURE §8–9](./DREAMFERENCE_RAGON_ENGINE_ARCHITECTURE.md)
 
 | Decision (the owner, 2026-11-04) | What it means here |
 |---|---|
-| A native Metal port with the same design | Hand-written Metal Shading Language kernels for this model's shapes; the CUDA engine's structure, names and invariants mirrored. No device abstraction layer, no runtime choice of backend, no third-party inference runtime. |
+| A native Metal port with the same design | Hand-written Metal Shading Language kernels for this model's shapes; the CUDA engine's structure, names and invariants mirrored. One kernel interface shared with CUDA and HIP, chosen at compile time ([BACKEND](./DREAMFERENCE_RAGON_ENGINE_BACKEND.md), Q203/Q204 of 2026-11-12, superseding "no device abstraction layer"); no runtime choice of backend, no third-party inference runtime. |
 | The same HTTP API | `/v1/responses` (the Codex Responses API), `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/metrics`, `/spec_stats`, `/model_info`, `/health` exactly as [API §2–§9](./DREAMFERENCE_RAGON_ENGINE_API.md); the same source (`src/serve/api.cpp`), so the same bytes on the wire. |
 | The same exactness rules | §2: within the Metal build, the CUDA engine's rules bit for bit; across builds, a stated statistical gate. |
 | The same speculative decoding | DFlash2 (the ScaleSearch drafter), the sparse head, tree verify of 16 rows, exact rejection sampling, commit by replay; the multi-drafter of Ragon's next major release ([MULTI_DRAFTER](./DREAMFERENCE_RAGON_ENGINE_MULTI_DRAFTER.md)) as soon as the CUDA engine has it. |
