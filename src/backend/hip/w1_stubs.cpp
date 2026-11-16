@@ -26,17 +26,6 @@ namespace {
 
 namespace ragon::kernels {
 
-int attention_chunk() { not_ported("attention_chunk"); }
-void attention_rows(const float* q, const gpu::bf16* kcache, const gpu::bf16* vcache, DevPos pos0, int M, int Hq,
-    int Hkv, int D, float* scratch, float* out, gpu::Stream s, int fixed_ctx, const TreeDesc* td,
-    const uint64_t* pages, KvQ8 q8) { not_ported("attention_rows"); }
-void attention_rows_cascade(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
-    const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out, gpu::Stream s,
-    SeqPtrs<const uint64_t> pages, KvQ8 q8) { not_ported("attention_rows_cascade"); }
-size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) { not_ported("attention_rows_scratch_floats"); }
-void attention_rows_seqs(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc, const SeqBatch& b,
-    int Hq, int Hkv, int D, float* scratch, float* out, gpu::Stream s, int fixed_ctx, SeqPtrs<const uint64_t> pages,
-    KvQ8 q8) { not_ported("attention_rows_seqs"); }
 bool attn_persistent(const MkAttnParams& p, gpu::Stream s) { not_ported("attn_persistent"); }
 void attn_persistent_prepare() { not_ported("attn_persistent_prepare"); }
 void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
@@ -63,11 +52,6 @@ void gdn_recurrent_prefill_bf16(const gpu::bf16* mixed, const float* g, const fl
     int at) { not_ported("gdn_recurrent_prefill_bf16"); }
 void gemm_bf16(const gpu::bf16* x, int M, const gpu::bf16* w, float* y, int N, int K,
     gpu::Stream s) { not_ported("gemm_bf16"); }
-void kv_absmax(const gpu::bf16* kcache, const gpu::bf16* vcache, const uint64_t* pages, int p0, int n, int Hkv,
-    int D, float* amax, gpu::Stream s) { not_ported("kv_absmax"); }
-void kv_seal(const gpu::bf16* pool, uint8_t* mirror, uint8_t* sealed, const int* ids, int n, int l0, int l1, int Hkv,
-    int D, size_t page_unit, const float* kinv, const float* vinv, gpu::Stream s) { not_ported("kv_seal"); }
-void kv_unseal(uint8_t* sealed, const int* ids, int n, gpu::Stream s) { not_ported("kv_unseal"); }
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
     const LoraOuts& outs, gpu::Stream stream) { not_ported("lora_expand"); }
 void lora_gemm_parts(const LoraSiteDev& d, const float* t,
@@ -91,7 +75,6 @@ void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8
 void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
     const uint8_t* up, float alpha_up, int N, int K, float out_input_scale, uint8_t* q_out, uint8_t* sf_out,
     gpu::Stream s, const uint8_t* gate_sf, const uint8_t* up_sf) { not_ported("prefill_swiglu_nvfp4"); }
-void prepare_kernels() { not_ported("prepare_kernels"); }
 void quant_act_fp8(const float* x, int M, int K, float input_scale, uint8_t* q,
     gpu::Stream s) { not_ported("quant_act_fp8"); }
 void quant_act_fp8_bf16in(const gpu::bf16* x, int M, int K, float input_scale, uint8_t* q,

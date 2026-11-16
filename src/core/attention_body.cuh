@@ -785,5 +785,9 @@ __device__ __forceinline__ void gdn_recurrent_tree_body(const float* __restrict_
   }
 }
 
+#if defined(RAGON_BACKEND_HIP)
+#include "core/attention_body_hip.cuh"  // the rows path's attention on HIP (BACKEND §7, W1)
+#endif
+
 }  // namespace
 }  // namespace ragon::kernels

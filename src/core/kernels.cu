@@ -696,8 +696,7 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
                     ps, pg.p[sq], p, blockIdx.y);
 }
 
-#if !defined(RAGON_BACKEND_HIP)  // W1 (attention, KV seal): CUDA only until the W1 port (BACKEND §7)
-// The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh.
+// The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh (HIP: attention_body_hip.cuh).
 
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
@@ -790,7 +789,6 @@ __global__ void attention_combine_kernel(const float* __restrict__ scratch, int 
   const int mh = blockIdx.x, d = threadIdx.x;
   out[static_cast<size_t>(mh) * D + d] = attention_combine_body<false>(scratch, splits, D, mh, d);
 }
-#endif  // !RAGON_BACKEND_HIP
 
 int grid_for(size_t n, int threads) {
   return static_cast<int>(std::min<size_t>((n + threads - 1) / threads, 65535 * 4));
@@ -1068,7 +1066,6 @@ void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, cons
                 unit);
 }
 
-#if !defined(RAGON_BACKEND_HIP)  // W1 (attention, KV seal): CUDA only until the W1 port (BACKEND §7)
 // Fixed key ranges at fixed positions (row invariance); RAGON_ATTN_CHUNK picks the size for experiments.
 int attention_chunk() {
   static const int c = [] {
@@ -1086,12 +1083,21 @@ size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
 
 // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
 // 16-key tiles with 3-5 stages were no faster.
+#if defined(RAGON_BACKEND_HIP)
+// HIP (BACKEND §7, W1): 48 rows, three waves of 16, so a block's queries and one tile fit the 64 KB of LDS.
+constexpr int kAttnRows = 48, kAttnTk = 32, kAttnNs = 2;
+#else
 constexpr int kAttnRows = 96, kAttnTk = 32, kAttnNs = 2;
+#endif
 // RAGON_ATTN_SHARED_RETILE (default on, 0 off; not with --kv-fp8, which keeps 96 rows): the cascade's shared phase (attention_shared_kernel) with 128 query rows per block, 8 warps,
 // not 96 and 6. 64 verify rows of 6 heads are then 3 row blocks per (KV head, key range), not 4: 96 blocks, two full
 // waves on 48 SMs, where 128 left a third wave two thirds full, and 8 warps fill the 4 sub-partitions evenly (6 put two
 // on two of them, one on the others). Each warp keeps its 16 rows, the tile grid and the key order: the same floats.
 // A third cp.async stage on top (99 KB, the most a block can have) was 0.2 ms a pass slower (2026-11-10).
+#if defined(RAGON_BACKEND_HIP)
+constexpr int kAttnSharedRetileRows = kAttnRows;  // no retile on HIP (128 rows do not fit the LDS): one instantiation
+bool attention_shared_retile() { return false; }
+#else
 constexpr int kAttnSharedRetileRows = 128;
 bool attention_shared_retile() {
   static const bool on = [] {
@@ -1102,8 +1108,12 @@ bool attention_shared_retile() {
   }();
   return on;
 }
+#endif
 
 void prepare_kernels() {
+#if defined(RAGON_BACKEND_HIP)
+  // HIP: the attention kernels' LDS is static (attention_body_hip.cuh), nothing to set.
+#else
   static bool configured = false;
   if (configured) return;
   check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
@@ -1149,6 +1159,7 @@ void prepare_kernels() {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem_q8(kAttnTk, kAttnNs))),
         "attention_rows smem");
   configured = true;
+#endif
 }
 
 namespace {
@@ -1179,7 +1190,7 @@ void kv_absmax(const gpu::bf16* kcache, const gpu::bf16* vcache, const uint64_t*
                int Hkv, int D, float* amax, gpu::Stream s) {
   if (n <= 0) return;
   kv_absmax_kernel<<<dim3(n, Hkv), 128, 0, s>>>(kcache, vcache, pages, p0, D, kv_hs(D), kv_ps(Hkv, D), amax);
-  check(cudaGetLastError(), "kv_absmax");
+  RAGON_LAUNCH_CHECK("kv_absmax");
 }
 
 namespace {
@@ -1363,6 +1374,5 @@ void attention_rows_cascade(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
-#endif  // !RAGON_BACKEND_HIP
 
 }  // namespace ragon::kernels
