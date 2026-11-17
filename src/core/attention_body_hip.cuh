@@ -374,7 +374,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     attn_v8f sc[KT];
 #pragma unroll
     for (int n = 0; n < KT; ++n) sc[n] = attn_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-#pragma unroll
+#pragma unroll 2
     for (int s = 0; s < D / 16; ++s) {
       const attn_v16s b = attn_lds16(qrow + 16 * s);
 #pragma unroll
@@ -475,8 +475,12 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // Q8: a tile in the rows' two domains, as on CUDA: first as stored for the rows whose unit is not past the tile's,
   // then rounded in place for the rows past it. Block-uniform branches (every thread meets the barriers).
   // A tile whose V tile_rows cut is loaded again for the rows past its unit (every one of them sees the whole tile).
-  auto tile_q8 = [&](int k0, bool ca, auto&& reload) {
-    const bool raw = k0 >= minP, rnd = k0 < maxP;
+  // f8: the tile came from the mirror, already R(v); sealed_tile put every row of the block past its unit (raw is
+  // false, rnd true) and every row's position past its end, so this is one tile_compute(k0, ca && Pa > k0). It runs
+  // through the rounded branch without the rounding: one compute site less in the kernel (with the separate site the
+  // compiler spilled the O accumulators in the tile loop).
+  auto tile_q8 = [&](int k0, bool ca, bool f8, auto&& reload) {
+    const bool raw = !f8 && k0 >= minP, rnd = f8 || k0 < maxP;
     bool cut = false;
     if (raw) cut = tile_rows(k0, ca && Pa <= k0, true);
     if (rnd) {
@@ -485,8 +489,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         reload();
       }
       if (raw) __syncthreads();
-      attn_round_tile<ROWS, TK>(sm, q8);
-      __syncthreads();
+      if (!f8) {
+        attn_round_tile<ROWS, TK>(sm, q8);
+        __syncthreads();
+      }
       tile_rows(k0, ca && Pa > k0, false);
     }
   };
@@ -502,11 +508,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     else attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps);
     __syncthreads();
     if constexpr (Q8) {
-      if (f8) {
-        if (active) tile_compute(k0, Pa > k0);  // every row of the block is past the tile's unit
-      } else {
-        tile_q8(k0, true, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); });
-      }
+      tile_q8(k0, true, f8, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); });
     } else {
       tile_rows(k0, true, true);
     }
@@ -528,7 +530,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src);
         __syncthreads();
         const bool cv = va && td->var[ra / G] == v;
-        if constexpr (Q8) tile_q8(k0, cv, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); });
+        if constexpr (Q8) tile_q8(k0, cv, false, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); });
         else tile_rows(k0, cv, true);
       }
     }
