@@ -91,31 +91,107 @@ struct AttnLds {
 
 // The tile of keys [k0, k0 + TK) into LDS, zero-filled from khi on; src(key) is the element offset of a key below khi.
 // K row by row (16 bytes a thread a step); V four keys by eight dims a step, transposed on the way into V^T.
+// The block has ROWS * 2 threads (the launches' block size), so each thread's share is a fixed count: every one of its
+// global loads is issued before the first LDS store (one memory round trip a tile, not one a step). The V steps go
+// keys-fastest across the lanes (eight key quads by four dim groups a wave), so the V^T stores of a wave fall on
+// distinct banks but for a 2-way overlap; the lanes-by-dims order put 16 lanes on one bank. Data movement only.
 template <int ROWS, int TK, typename Src>
 __device__ __forceinline__ void attn_load_tile(AttnLds<ROWS, TK>& sm, const gpu::bf16* __restrict__ kcache,
                                                const gpu::bf16* __restrict__ vcache, int k0, int khi, Src src) {
-  constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS;
-  for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
-    const int j = i / (D / 8), c = i % (D / 8), key = k0 + j;
-    uint4 w = make_uint4(0, 0, 0, 0);
-    if (key < khi) w = *reinterpret_cast<const uint4*>(kcache + src(key) + 8 * c);
-    *reinterpret_cast<uint4*>(sm.k + j * kHipQS + 8 * c) = w;
+  constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS, NT = ROWS * 2;
+  constexpr int NK = TK * (D / 8), NV = (TK / 4) * (D / 8), IK = (NK + NT - 1) / NT, IV = (NV + NT - 1) / NT;
+  const int tid = threadIdx.x;
+  uint4 wk[IK], wv[IV][4];
+#pragma unroll
+  for (int it = 0; it < IK; ++it) {
+    const int i = tid + it * NT, key = k0 + i / (D / 8);
+    wk[it] = make_uint4(0, 0, 0, 0);
+    if (i < NK && key < khi) wk[it] = *reinterpret_cast<const uint4*>(kcache + src(key) + 8 * (i % (D / 8)));
   }
-  for (int i = threadIdx.x; i < (TK / 4) * (D / 8); i += blockDim.x) {
-    const int jq = i / (D / 8), c = i % (D / 8);
-    uint4 w[4];
+#pragma unroll
+  for (int it = 0; it < IK; ++it) {
+    const int i = tid + it * NT;
+    if (i < NK) *reinterpret_cast<uint4*>(sm.k + (i / (D / 8)) * kHipQS + 8 * (i % (D / 8))) = wk[it];
+  }
+  __builtin_amdgcn_sched_barrier(0);  // the V loads stay after the K stores (registers: one batch live at a time)
+#pragma unroll
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
 #pragma unroll
     for (int u = 0; u < 4; ++u) {
       const int key = k0 + 4 * jq + u;
-      w[u] = key < khi ? *reinterpret_cast<const uint4*>(vcache + src(key) + 8 * c) : make_uint4(0, 0, 0, 0);
+      wv[it][u] = make_uint4(0, 0, 0, 0);
+      if (i < NV && key < khi) wv[it][u] = *reinterpret_cast<const uint4*>(vcache + src(key) + 8 * c);
     }
+  }
+#pragma unroll
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
+    if (i >= NV) continue;
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
       auto half = [&](const uint4& x) {
         const uint32_t d = e < 2 ? x.x : e < 4 ? x.y : e < 6 ? x.z : x.w;
         return (e & 1) ? d >> 16 : d & 0xffffu;
       };
-      const uint2 o = make_uint2(half(w[0]) | (half(w[1]) << 16), half(w[2]) | (half(w[3]) << 16));
+      const uint2 o = make_uint2(half(wv[it][0]) | (half(wv[it][1]) << 16), half(wv[it][2]) | (half(wv[it][3]) << 16));
+      *reinterpret_cast<uint2*>(sm.vt + (8 * c + e) * VS + 4 * jq) = o;
+    }
+  }
+}
+
+// attn_load_tile for a tile inside one page (src(key) = kbase + (key - k0) * ps): the same LDS bytes. A thread's key
+// row and V key quad are the same every step (the block's thread count is a multiple of both), so each load's address
+// is a block-uniform base (the step's) plus one 32-bit offset of the thread: no per-step offsets held across the tile
+// loop (with them the kernel spilled, and the spill reloads between the loads serialized the tile's round trips).
+template <int ROWS, int TK>
+__device__ __forceinline__ void attn_load_run(AttnLds<ROWS, TK>& sm, const gpu::bf16* __restrict__ kcache,
+                                              const gpu::bf16* __restrict__ vcache, int k0, int khi, size_t kbase,
+                                              size_t ps) {
+  constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS, NT = ROWS * 2, KR = D / 8, VQ = TK / 4;
+  constexpr int NK = TK * KR, NV = VQ * KR, IK = (NK + NT - 1) / NT, IV = (NV + NT - 1) / NT;
+  constexpr int KS = NT / KR, VC = NT / VQ;  // keys a K step, dim groups a V step
+  static_assert(NT % KR == 0 && NT % VQ == 0, "a thread's K row and V key quad are fixed");
+  const int tid = threadIdx.x, kj = tid / KR, kc = tid % KR, jq = tid % VQ, vc = tid / VQ;
+  const uint32_t ps32 = static_cast<uint32_t>(ps);
+  const uint32_t koff = kj * ps32 + 8 * kc, voff = 4 * jq * ps32 + 8 * vc;
+  const gpu::bf16* kt = kcache + kbase;
+  const gpu::bf16* vt = vcache + kbase;
+  uint4 wk[IK], wv[IV][4];
+#pragma unroll
+  for (int it = 0; it < IK; ++it) {
+    const int i = tid + it * NT, key = k0 + kj + it * KS;
+    wk[it] = make_uint4(0, 0, 0, 0);
+    if (i < NK && key < khi) wk[it] = *reinterpret_cast<const uint4*>(kt + static_cast<size_t>(it * KS) * ps + koff);
+  }
+#pragma unroll
+  for (int it = 0; it < IK; ++it) {
+    const int i = tid + it * NT;
+    if (i < NK) *reinterpret_cast<uint4*>(sm.k + (kj + it * KS) * kHipQS + 8 * kc) = wk[it];
+  }
+  __builtin_amdgcn_sched_barrier(0);  // one batch of loads in registers at a time
+#pragma unroll
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int key = k0 + 4 * jq + u;
+      wv[it][u] = make_uint4(0, 0, 0, 0);
+      if (i < NV && key < khi)
+        wv[it][u] = *reinterpret_cast<const uint4*>(vt + static_cast<size_t>(u) * ps + 8 * VC * it + voff);
+    }
+  }
+#pragma unroll
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT, c = vc + it * VC;
+    if (i >= NV) continue;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      auto half = [&](const uint4& x) {
+        const uint32_t d = e < 2 ? x.x : e < 4 ? x.y : e < 6 ? x.z : x.w;
+        return (e & 1) ? d >> 16 : d & 0xffffu;
+      };
+      const uint2 o = make_uint2(half(wv[it][0]) | (half(wv[it][1]) << 16), half(wv[it][2]) | (half(wv[it][3]) << 16));
       *reinterpret_cast<uint2*>(sm.vt + (8 * c + e) * VS + 4 * jq) = o;
     }
   }
@@ -126,11 +202,31 @@ __device__ __forceinline__ void attn_load_tile(AttnLds<ROWS, TK>& sm, const gpu:
 template <int ROWS, int TK>
 __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const KvQ8& q8, int k0, int kvh, size_t hs,
                                                   size_t ps, const uint64_t* __restrict__ pages) {
-  constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS;
+  constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS, NT = ROWS * 2;
+  constexpr int NK = TK * (D / 16), NV = (TK / 4) * (D / 16), IK = (NK + NT - 1) / NT, IV = (NV + NT - 1) / NT;
+  const int tid = threadIdx.x;
+  constexpr int KS = NT / (D / 16), VC = NT / (TK / 4);  // keys a K step, dim groups a V step
+  static_assert(NT % (D / 16) == 0 && NT % (TK / 4) == 0, "a thread's K row and V key quad are fixed");
   const size_t base = kv_off(pages, kvh, k0, hs, ps);
-  for (int i = threadIdx.x; i < TK * (D / 16); i += blockDim.x) {
-    const int j = i / (D / 16), c = i % (D / 16);
-    const uint4 w = *reinterpret_cast<const uint4*>(q8.k8 + base + static_cast<size_t>(j) * ps + 16 * c);
+  const uint32_t ps32 = static_cast<uint32_t>(ps);
+  const uint32_t koff = (tid / (D / 16)) * ps32 + 16 * (tid % (D / 16)), voff = 4 * (tid % (TK / 4)) * ps32 + 16 * (tid / (TK / 4));
+  const auto* k8 = q8.k8 + base;
+  const auto* v8 = q8.v8 + base;
+  // As attn_load_run: K's loads, its decodes and stores, then V's (keys fastest); addresses a uniform base a step plus
+  // the thread's 32-bit offset.
+  uint4 wk[IK], wv[IV][4];
+#pragma unroll
+  for (int it = 0; it < IK; ++it) {
+    const int i = tid + it * NT;
+    wk[it] = make_uint4(0, 0, 0, 0);
+    if (i < NK)
+      wk[it] = *reinterpret_cast<const uint4*>(k8 + static_cast<size_t>(it * KS) * ps + koff);
+  }
+#pragma unroll
+  for (int it = 0; it < IK; ++it) {
+    const int i = tid + it * NT, j = i / (D / 16), c = i % (D / 16);
+    if (i >= NK) continue;
+    const uint4 w = wk[it];
     const uint32_t e[4] = {w.x, w.y, w.z, w.w};
     uint4 o[2];
     uint32_t* h = reinterpret_cast<uint32_t*>(o);
@@ -143,12 +239,21 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
     dst[0] = o[0];
     dst[1] = o[1];
   }
-  for (int i = threadIdx.x; i < (TK / 4) * (D / 16); i += blockDim.x) {
-    const int jq = i / (D / 16), c = i % (D / 16);
-    uint4 w[4];
+  __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
-    for (int u = 0; u < 4; ++u)
-      w[u] = *reinterpret_cast<const uint4*>(q8.v8 + base + static_cast<size_t>(4 * jq + u) * ps + 16 * c);
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      wv[it][u] = make_uint4(0, 0, 0, 0);
+      if (i < NV) wv[it][u] = *reinterpret_cast<const uint4*>(v8 + static_cast<size_t>(u) * ps + 16 * VC * it + voff);
+    }
+  }
+#pragma unroll
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
+    if (i >= NV) continue;
+    const uint4* w = wv[it];
 #pragma unroll
     for (int e = 0; e < 16; ++e) {
       auto code = [&](const uint4& x) {
@@ -386,19 +491,21 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     }
   };
   const int kctx = td ? min(khi, klo + max(0, (pos0 - klo) / TK) * TK) : khi;
-  auto chain_src = [&](int key) { return kv_off(pages, kvh, key, hs, ps); };
   for (int k0 = kfirst; k0 < kctx; k0 += TK) {
+    // A tile never crosses a page (TK divides kKvPageTokens): one page-table read a tile, every key base + j * ps (the
+    // addresses kv_off gives per key, without a dependent read before each load).
+    const size_t kbase = kv_off(pages, kvh, k0, hs, ps);
     __syncthreads();  // the previous tile is consumed (and the queries are staged, the first time)
     bool f8 = false;
     if constexpr (Q8) f8 = sealed_tile(k0, kctx);
     if (f8) attn_load_tile_f8<ROWS, TK>(sm, q8, k0, kvh, hs, ps, pages);
-    else attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, chain_src);
+    else attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps);
     __syncthreads();
     if constexpr (Q8) {
       if (f8) {
         if (active) tile_compute(k0, Pa > k0);  // every row of the block is past the tile's unit
       } else {
-        tile_q8(k0, true, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, chain_src); });
+        tile_q8(k0, true, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); });
       }
     } else {
       tile_rows(k0, true, true);
