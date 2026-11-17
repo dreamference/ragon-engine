@@ -33,19 +33,10 @@ void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, cons
 bool ffn_persistent(const gpu::half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
     const StreamTarget& down, int H, int I, float* g, float* u, gpu::half* xh2, float* xinv2, unsigned* counters,
     gpu::Stream s, unsigned long long* times, const MkTail* tail) { not_ported("ffn_persistent"); }
-void gdn_conv_prefill(const float* in, float* out, float* conv_state, const gpu::bf16* w, int M, int C,
-    gpu::Stream s, float* window_at, int at) { not_ported("gdn_conv_prefill"); }
-void gdn_conv_prefill_bf16(const gpu::bf16* in, gpu::bf16* out, float* conv_state, const gpu::bf16* w, int M, int C,
-    gpu::Stream s, float* window_at, int at) { not_ported("gdn_conv_prefill_bf16"); }
 bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const StreamTarget& up,
     const StreamTarget& down, int I, float* g, float* u, gpu::half* xh2, float* xinv2, unsigned* counters,
     unsigned long long* times, const MkTail* tail, gpu::Stream s) { not_ported("gdn_ffn_persistent"); }
 bool gdn_persistent(const MkGdnParams& p, gpu::Stream s) { not_ported("gdn_persistent"); }
-void gdn_recurrent_prefill(const float* mixed, const float* g, const float* beta, float* state, float* out, int M,
-    int H, int HV, int pos0, gpu::Stream s, float* state_at, int at) { not_ported("gdn_recurrent_prefill"); }
-void gdn_recurrent_prefill_bf16(const gpu::bf16* mixed, const float* g, const float* beta, float* state,
-    gpu::bf16* out, int M, int H, int HV, int pos0, gpu::Stream s, float* state_at,
-    int at) { not_ported("gdn_recurrent_prefill_bf16"); }
 void gemm_bf16(const gpu::bf16* x, int M, const gpu::bf16* w, float* y, int N, int K,
     gpu::Stream s) { not_ported("gemm_bf16"); }
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,

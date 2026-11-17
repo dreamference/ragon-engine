@@ -605,6 +605,199 @@ bool test_narrow() {
   return good;
 }
 
+// ---- GDN prefill: the conv and the recurrence; gdn_recurrent_fused_seqs ----
+using ragon::test::free_bytes;
+
+bool same_bytes(const void* a, const void* b, size_t n) { return std::memcmp(a, b, n) == 0; }
+template <typename T>
+bool same_dev(const T* a, const T* b, size_t n) {
+  return same_bytes(download(a, n).data(), download(b, n).data(), n * sizeof(T));
+}
+template <typename T>
+void hash_dev(const T* d, size_t n) {
+  const std::vector<T> h = download(d, n);
+  g_hash = fnv(h.data(), n * sizeof(T), g_hash);
+}
+std::vector<float> randf(std::mt19937& rng, size_t n, float sc) {
+  std::vector<float> v(n);
+  for (auto& x : v) x = (unit(rng) * 2.f - 1.f) * sc;
+  return v;
+}
+gpu::bf16* upload_bf16(const std::vector<float>& v) {
+  std::vector<uint16_t> b(v.size());
+  for (size_t i = 0; i < v.size(); ++i) b[i] = bf16_bits(v[i]);
+  return reinterpret_cast<gpu::bf16*>(upload(b));
+}
+std::vector<float> download_bf16(const gpu::bf16* d, size_t n) {
+  const std::vector<uint16_t> b = download(reinterpret_cast<const uint16_t*>(d), n);
+  std::vector<float> v(n);
+  for (size_t i = 0; i < n; ++i) v[i] = from_bits(uint32_t(b[i]) << 16);
+  return v;
+}
+
+struct GdnIn {
+  int M, H, HV, C;
+  std::vector<float> mixed, g, beta, state;
+};
+GdnIn gdn_inputs(int M, int H, int HV, uint32_t seed) {
+  std::mt19937 rng(seed);
+  GdnIn in{M, H, HV, 2 * H * 128 + HV * 128, {}, {}, {}, {}};
+  in.mixed = randf(rng, size_t(M) * in.C, 1.f);
+  for (auto& x : in.mixed) x = bf16r(x);  // so the BF16 path reads the same values
+  in.g = randf(rng, size_t(M) * HV, 0.3f);
+  for (auto& x : in.g) x = -std::fabs(x);
+  in.beta = randf(rng, size_t(M) * HV, 3.f);
+  for (auto& x : in.beta) x = 1.f / (1.f + std::exp(-x));
+  in.state = randf(rng, size_t(HV) * 128 * 128, 0.05f);
+  return in;
+}
+
+bool test_gdn_recurrent_prefill() {
+  const int M = 2200, H = 4, HV = 8, cut = 1056, at = 992;
+  const GdnIn in = gdn_inputs(M, H, HV, 21);
+  const size_t SS = size_t(HV) * 128 * 128, O = size_t(M) * HV * 128;
+  float *dm = upload(in.mixed), *dg = upload(in.g), *db = upload(in.beta);
+  float *s_ref = upload(in.state), *s_one = upload(in.state), *s_two = upload(in.state), *s_at = upload(in.state),
+        *s_pre = upload(in.state);
+  float *o_ref = ragon::test::alloc<float>(O), *o_one = ragon::test::alloc<float>(O), *o_two = ragon::test::alloc<float>(O),
+        *o_pre = ragon::test::alloc<float>(O);
+  K::gdn_recurrent(dm, dg, db, s_ref, s_ref, o_ref, M, H, HV, nullptr);
+  K::gdn_recurrent_prefill(dm, dg, db, s_one, o_one, M, H, HV, 0, nullptr, s_at, at);
+  const size_t C = in.C;
+  K::gdn_recurrent_prefill(dm, dg, db, s_two, o_two, cut, H, HV, 0, nullptr);
+  K::gdn_recurrent_prefill(dm + cut * C, dg + cut * HV, db + cut * HV, s_two, o_two + size_t(cut) * HV * 128, M - cut, H,
+                           HV, cut, nullptr);
+  K::gdn_recurrent_prefill(dm, dg, db, s_pre, o_pre, at, H, HV, 0, nullptr);
+  bool ok = true;
+#ifdef RAGON_BACKEND_HIP
+  // The hip form is the decode recurrence token by token: bit for bit.
+  const bool eq = same_dev(o_ref, o_one, O) && same_dev(s_ref, s_one, SS);
+  std::printf("gdn_recurrent_prefill (%d tokens, %d-token launches) identical to gdn_recurrent: %s\n", M, 1024,
+              eq ? "yes ok" : "NO FAIL");
+  ok &= eq;
+#else
+  {
+    const std::vector<float> a = download(o_ref, O), b = download(o_one, O);
+    double worst = 0;
+    for (size_t i = 0; i < O; ++i) worst = std::max(worst, std::fabs(double(a[i]) - b[i]) / (1e-3 + std::fabs(a[i])));
+    const bool eq = worst < 2e-2;
+    std::printf("gdn_recurrent_prefill vs gdn_recurrent: worst rel %.3g: %s\n", worst, eq ? "ok" : "FAIL");
+    ok &= eq;
+  }
+#endif
+  const bool split = same_dev(o_one, o_two, O) && same_dev(s_one, s_two, SS);
+  std::printf("gdn_recurrent_prefill split at %d identical to one shot: %s\n", cut, split ? "yes ok" : "NO FAIL");
+  const bool sat = same_dev(s_at, s_pre, SS) && same_dev(o_one, o_pre, size_t(at) * HV * 128);
+  std::printf("gdn_recurrent_prefill state_at %d identical to a %d-token prefix: %s\n", at, at, sat ? "yes ok" : "NO FAIL");
+  ok &= split && sat;
+  // BF16 in and out over the same values: the FP32 path's output rounded, the state identical.
+  gpu::bf16* dmb = upload_bf16(in.mixed);
+  gpu::bf16* ob = reinterpret_cast<gpu::bf16*>(ragon::test::alloc<uint16_t>(O));
+  float* s_b = upload(in.state);
+  K::gdn_recurrent_prefill_bf16(dmb, dg, db, s_b, ob, M, H, HV, 0, nullptr);
+  const std::vector<float> fo = download(o_one, O), bo = download_bf16(ob, O);
+  size_t bad = 0;
+  for (size_t i = 0; i < O; ++i) bad += bits(bf16r(fo[i])) != bits(bo[i]);
+  const bool bfeq = bad == 0 && same_dev(s_one, s_b, SS);
+  std::printf("gdn_recurrent_prefill_bf16 = the FP32 path rounded (%zu of %zu differ), state identical: %s\n", bad, O,
+              bfeq ? "yes ok" : "NO FAIL");
+  ok &= bfeq;
+  hash_dev(o_one, O), hash_dev(s_one, SS), hash_dev(s_at, SS), hash_dev(reinterpret_cast<uint16_t*>(ob), O);
+  for (void* p : {(void*)dm, (void*)dg, (void*)db, (void*)s_ref, (void*)s_one, (void*)s_two, (void*)s_at, (void*)s_pre,
+                  (void*)o_ref, (void*)o_one, (void*)o_two, (void*)o_pre, (void*)dmb, (void*)ob, (void*)s_b})
+    free_bytes(p);
+  return ok;
+}
+
+bool test_gdn_conv_prefill() {
+  const int M = 300, C = 1000, at = 150;
+  std::mt19937 rng(23);
+  std::vector<float> x = randf(rng, size_t(M) * C, 2.f), st = randf(rng, size_t(C) * 3, 2.f), w = randf(rng, size_t(C) * 4, 0.5f);
+  for (auto& v : x) v = bf16r(v);
+  for (auto& v : w) v = bf16r(v);
+  float *dx = upload(x), *dst = upload(st), *dst2 = upload(st), *dwin = ragon::test::alloc<float>(size_t(C) * 3);
+  float* dout = ragon::test::alloc<float>(size_t(M) * C);
+  gpu::bf16* dw = upload_bf16(w);
+  K::gdn_conv_prefill(dx, dout, dst, dw, M, C, nullptr, dwin, at);
+  const std::vector<float> out = download(dout, size_t(M) * C), nst = download(dst, size_t(C) * 3),
+                           win = download(dwin, size_t(C) * 3);
+  auto xin = [&](int t, int c) { return t >= 0 ? x[size_t(t) * C + c] : st[c * 3 + 3 + t]; };
+  double worst = 0;
+  bool wins = true;
+  for (int c = 0; c < C; ++c) {
+    for (int t = 0; t < M; ++t) {
+      double o = 0;
+      for (int j = 0; j < 4; ++j) o += double(w[c * 4 + j]) * xin(t - 3 + j, c);
+      const double ref = o / (1 + std::exp(-o));
+      worst = std::max(worst, std::fabs(ref - out[size_t(t) * C + c]) / (1e-4 + std::fabs(ref)));
+    }
+    for (int j = 0; j < 3; ++j) wins &= nst[c * 3 + j] == xin(M - 3 + j, c) && win[c * 3 + j] == xin(at - 3 + j, c);
+  }
+  bool ok = worst < 1e-4 && wins;
+  std::printf("gdn_conv_prefill vs the host: worst rel %.3g, windows (end and at %d) exact %s: %s\n", worst, at,
+              wins ? "yes" : "NO", ok ? "ok" : "FAIL");
+  gpu::bf16* dxb = upload_bf16(x);
+  gpu::bf16* doutb = reinterpret_cast<gpu::bf16*>(ragon::test::alloc<uint16_t>(size_t(M) * C));
+  K::gdn_conv_prefill_bf16(dxb, doutb, dst2, dw, M, C, nullptr);
+  const std::vector<float> ob = download_bf16(doutb, size_t(M) * C);
+  size_t bad = 0;
+  for (size_t i = 0; i < ob.size(); ++i) bad += bits(bf16r(out[i])) != bits(ob[i]);
+  const bool bfeq = bad == 0 && same_dev(dst, dst2, size_t(C) * 3);
+  std::printf("gdn_conv_prefill_bf16 = the FP32 conv rounded (%zu differ), window identical: %s\n", bad, bfeq ? "yes ok" : "NO FAIL");
+  ok &= bfeq;
+  hash_dev(dout, size_t(M) * C), hash_dev(dst, size_t(C) * 3);
+  for (void* p : {(void*)dx, (void*)dst, (void*)dst2, (void*)dwin, (void*)dout, (void*)dw, (void*)dxb, (void*)doutb})
+    free_bytes(p);
+  return ok;
+}
+
+// gdn_recurrent_fused_seqs (RAGON_MK_GDN_FUSED): the previous step's pending rows replayed inside the verify's
+// recurrence, against gdn_recurrent_commit_seqs and then gdn_recurrent_seqs; the second sequence with pending rows
+// and without (stream_tests.cu's check, which the hip build did not run).
+bool test_gdn_fused_seqs() {
+  const int H = 16, HV = 48, M = 20, rows[2] = {9, 11};
+  const GdnIn in = gdn_inputs(M, H, HV, 25);
+  std::mt19937 rng(27);
+  const std::vector<float> r0 = randf(rng, size_t(HV) * 128 * 128, 0.05f), r1 = randf(rng, size_t(HV) * 128 * 128, 0.05f);
+  const size_t SS = r0.size(), O = size_t(M) * HV * 128;
+  K::SeqBatch sb;
+  sb.n = 2, sb.row0[0] = 0, sb.row0[1] = rows[0], sb.row0[2] = rows[0] + rows[1];
+  float *m1 = upload(in.mixed), *m2 = upload(in.mixed), *dg = upload(in.g), *db = upload(in.beta);
+  bool ok = true;
+  for (const int pn1 : {2, 0}) {
+    const int p0[2] = {4, 14}, pn[2] = {3, pn1};
+    float *ra0 = upload(r0), *ra1 = upload(r1), *rb0 = upload(r0), *rb1 = upload(r1);
+    float *o3 = ragon::test::alloc<float>(O), *o4 = ragon::test::alloc<float>(O), *po1 = ragon::test::alloc<float>(O),
+          *po2 = ragon::test::alloc<float>(O);
+    ragon::test::zero(po1, O * 4), ragon::test::zero(po2, O * 4);
+    K::SeqBatch pb;
+    pb.n = 2;
+    for (int s = 0; s < 2; ++s) pb.row0[s] = p0[s], pb.row1[s] = p0[s] + pn[s];
+    pb.row0[2] = pb.row1[1];
+    K::SeqPtrs<float> sa, sbp;
+    sa.p[0] = ra0, sa.p[1] = ra1, sbp.p[0] = rb0, sbp.p[1] = rb1;
+    K::gdn_recurrent_commit_seqs(m2, dg, db, sa, po1, pb, H, HV, nullptr);
+    K::SeqPtrs<const float> sac;
+    sac.p[0] = ra0, sac.p[1] = ra1;
+    K::gdn_recurrent_seqs(m1, dg, db, sac, o3, sb, H, HV, nullptr);
+    std::vector<int> pend(2 * K::kMaxSeqs, 0);
+    for (int s = 0; s < 2; ++s) pend[s] = p0[s], pend[K::kMaxSeqs + s] = pn[s];
+    int* dpend = upload(pend);
+    K::gdn_recurrent_fused_seqs(m1, dg, db, sbp, o4, sb, H, HV, m2, dg, db, dpend, po2, nullptr);
+    const bool fz = same_dev(o3, o4, O) && same_dev(po1, po2, O) && same_dev(ra0, rb0, SS) && same_dev(ra1, rb1, SS) &&
+                    (pn1 > 0 || same_bytes(download(rb1, SS).data(), r1.data(), SS * 4));
+    ok &= fz;
+    std::printf("gdn_recurrent_fused_seqs identical to the commit then the verify (second sequence %d pending): %s\n",
+                pn1, fz ? "yes ok" : "NO FAIL");
+    hash_dev(o4, O), hash_dev(po2, O), hash_dev(rb0, SS), hash_dev(rb1, SS);
+    for (void* q : {(void*)ra0, (void*)ra1, (void*)rb0, (void*)rb1, (void*)o3, (void*)o4, (void*)po1, (void*)po2,
+                    (void*)dpend})
+      free_bytes(q);
+  }
+  for (void* p : {(void*)m1, (void*)m2, (void*)dg, (void*)db}) free_bytes(p);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -619,6 +812,9 @@ int main() {
   ok &= test_swiglu(67, 256, 512);
   ok &= test_swiglu(1, 384, 1024);
 #endif
+  ok &= test_gdn_recurrent_prefill();
+  ok &= test_gdn_conv_prefill();
+  ok &= test_gdn_fused_seqs();
   std::printf("QHASH %016llx\n", static_cast<unsigned long long>(g_qhash));
   std::printf("HASH %016llx\n", static_cast<unsigned long long>(g_hash));
   std::printf(ok ? "all prefill HIP tests passed\n" : "PREFILL HIP TESTS FAILED\n");
