@@ -214,8 +214,8 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
   const uint32_t koff = (tid / (D / 16)) * ps32 + 16 * (tid % (D / 16)), voff = 4 * (tid % (TK / 4)) * ps32 + 16 * (tid / (TK / 4));
   const auto* k8 = q8.k8 + base;
   const auto* v8 = q8.v8 + base;
-  // As attn_load_run: K's loads, its decodes and stores, then V's (keys fastest); addresses a uniform base a step plus
-  // the thread's 32-bit offset.
+  // As attn_load_run (addresses a uniform base a step plus the thread's 32-bit offset), but K's and V's loads both go
+  // out before K's decodes and stores (the codes are half the registers), then V's (keys fastest).
   uint4 wk[IK], wv[IV][4];
 #pragma unroll
   for (int it = 0; it < IK; ++it) {
@@ -224,6 +224,16 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
     if (i < NK)
       wk[it] = *reinterpret_cast<const uint4*>(k8 + static_cast<size_t>(it * KS) * ps + koff);
   }
+#pragma unroll
+  for (int it = 0; it < IV; ++it) {
+    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      wv[it][u] = make_uint4(0, 0, 0, 0);
+      if (i < NV) wv[it][u] = *reinterpret_cast<const uint4*>(v8 + static_cast<size_t>(u) * ps + 16 * VC * it + voff);
+    }
+  }
+  __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
   for (int it = 0; it < IK; ++it) {
     const int i = tid + it * NT, j = i / (D / 16), c = i % (D / 16);
@@ -240,16 +250,6 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
     uint4* dst = reinterpret_cast<uint4*>(sm.k + j * kHipQS + 16 * c);
     dst[0] = o[0];
     dst[1] = o[1];
-  }
-  __builtin_amdgcn_sched_barrier(0);
-#pragma unroll
-  for (int it = 0; it < IV; ++it) {
-    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
-#pragma unroll
-    for (int u = 0; u < 4; ++u) {
-      wv[it][u] = make_uint4(0, 0, 0, 0);
-      if (i < NV) wv[it][u] = *reinterpret_cast<const uint4*>(v8 + static_cast<size_t>(u) * ps + 16 * VC * it + voff);
-    }
   }
 #pragma unroll
   for (int it = 0; it < IV; ++it) {
