@@ -10,6 +10,8 @@
 // Not the CUDA bits: another order of the same products (exp and the MMA's internal sums are the hardware's).
 // LDS is 64 KB a block on gfx11, so the block holds one tile (K as [key][d], V transposed as [d][key]) and its rows'
 // queries in BF16; no bulk copies (BULK is the plain path here) and no L2 prefetch (pf is ignored).
+// A tile is one round trip: a thread's K rows and V key quads are fixed, addresses are a uniform page-run base a step
+// plus the thread's 32-bit offset (hoisted 64-bit offsets were spilled), and all K loads go out before any LDS store.
 // Included inside attention_body.cuh's namespace, at its end (the CUDA objects' line tables stay put).
 #pragma once
 
