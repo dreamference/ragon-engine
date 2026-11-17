@@ -54,7 +54,8 @@ if(RAGON_BACKEND STREQUAL "hip")
   set(CMAKE_HIP_STANDARD 20)
   set(CMAKE_HIP_STANDARD_REQUIRED ON)
   set(RAGON_HIP_SOURCES src/core/topk.cu src/core/kernels.cu src/core/draft_kernels.cu src/core/sparse_head.cu
-                        src/core/stream_gemm_hip.cu src/core/prefill_gemm_hip.cu src/core/prefill_gdn_hip.cu)
+                        src/core/stream_gemm_hip.cu src/core/prefill_gemm_hip.cu src/core/prefill_gdn_hip.cu
+                        src/core/gemm_bf16_hip.cu)
   set_source_files_properties(${RAGON_HIP_SOURCES} tests/topk_tests.cu tests/kernel_tests.cu tests/w0_tests.cu
                               tests/stream_gemm_hip_tests.cu tests/prefill_hip_tests.cu
                               PROPERTIES LANGUAGE HIP)

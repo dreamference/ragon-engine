@@ -798,6 +798,44 @@ bool test_gdn_fused_seqs() {
   return ok;
 }
 
+// gemm_bf16 against the FP64 host (tolerance scaled by sum |x w|), and a row's bits independent of M.
+bool test_gemm_bf16(int N, int Kd, const std::vector<int>& Ms, uint32_t seed) {
+  std::mt19937 rng(seed);
+  const int Mmax = *std::max_element(Ms.begin(), Ms.end());
+  std::vector<float> x = randf(rng, size_t(Mmax) * Kd, 2.f), w = randf(rng, size_t(N) * Kd, 0.5f);
+  for (auto& v : x) v = bf16r(v);
+  for (auto& v : w) v = bf16r(v);
+  gpu::bf16 *dx = upload_bf16(x), *dw = upload_bf16(w);
+  bool ok = true;
+  std::vector<float> first;
+  for (const int M : Ms) {
+    float* dy = ragon::test::alloc<float>(size_t(M) * N);
+    K::gemm_bf16(dx, M, dw, dy, N, Kd, nullptr);
+    const std::vector<float> y = download(dy, size_t(M) * N);
+    double worst = 0;
+    for (int m = 0; m < M; m += (M > 300 ? 7 : 1))
+      for (int n = 0; n < N; ++n) {
+        double ref = 0, mag = 0;
+        for (int k = 0; k < Kd; ++k) {
+          const double p = double(x[size_t(m) * Kd + k]) * w[size_t(n) * Kd + k];
+          ref += p, mag += std::fabs(p);
+        }
+        worst = std::max(worst, std::fabs(ref - y[size_t(m) * N + n]) / (1e-6 * mag + 1e-30));
+      }
+    bool rows = true;
+    if (first.empty()) first = y;
+    else rows = same_bytes(first.data(), y.data(), std::min(first.size(), y.size()) * 4);
+    const bool good = worst <= 1.0 && rows;
+    std::printf("gemm_bf16 M=%d N=%d K=%d: worst %.3f of tolerance (1e-6 sum|xw|), rows as at M=%d: %s: %s\n", M, N, Kd,
+                worst, Ms[0], rows ? "same" : "DIFFER", good ? "ok" : "FAIL");
+    ok &= good;
+    g_hash = fnv(y.data(), y.size() * 4, g_hash);
+    free_bytes(dy);
+  }
+  free_bytes(dx), free_bytes(dw);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -815,6 +853,9 @@ int main() {
   ok &= test_gdn_recurrent_prefill();
   ok &= test_gdn_conv_prefill();
   ok &= test_gdn_fused_seqs();
+  ok &= test_gemm_bf16(200, 512, {1, 70, 130}, 31);   // a partial column tile and block
+  ok &= test_gemm_bf16(64, 5120, {3, 64}, 33);
+  ok &= test_gemm_bf16(48, 272, {2100, 5}, 35);       // two row slabs; a K % 256 tail
   std::printf("QHASH %016llx\n", static_cast<unsigned long long>(g_qhash));
   std::printf("HASH %016llx\n", static_cast<unsigned long long>(g_hash));
   std::printf(ok ? "all prefill HIP tests passed\n" : "PREFILL HIP TESTS FAILED\n");

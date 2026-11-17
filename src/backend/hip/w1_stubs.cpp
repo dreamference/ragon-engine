@@ -37,8 +37,6 @@ bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const S
     const StreamTarget& down, int I, float* g, float* u, gpu::half* xh2, float* xinv2, unsigned* counters,
     unsigned long long* times, const MkTail* tail, gpu::Stream s) { not_ported("gdn_ffn_persistent"); }
 bool gdn_persistent(const MkGdnParams& p, gpu::Stream s) { not_ported("gdn_persistent"); }
-void gemm_bf16(const gpu::bf16* x, int M, const gpu::bf16* w, float* y, int N, int K,
-    gpu::Stream s) { not_ported("gemm_bf16"); }
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
     const LoraOuts& outs, gpu::Stream stream) { not_ported("lora_expand"); }
 void lora_gemm_parts(const LoraSiteDev& d, const float* t,
