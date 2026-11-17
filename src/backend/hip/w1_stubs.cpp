@@ -33,10 +33,6 @@ void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, cons
 bool ffn_persistent(const gpu::half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
     const StreamTarget& down, int H, int I, float* g, float* u, gpu::half* xh2, float* xinv2, unsigned* counters,
     gpu::Stream s, unsigned long long* times, const MkTail* tail) { not_ported("ffn_persistent"); }
-void gated_rmsnorm_fp8(const float* x, const float* z, const gpu::bf16* w, int rows, int D, float eps,
-    float input_scale, uint8_t* q, gpu::Stream s) { not_ported("gated_rmsnorm_fp8"); }
-void gated_rmsnorm_fp8_bf16(const gpu::bf16* x, const gpu::bf16* z, const gpu::bf16* w, int rows, int D, float eps,
-    float input_scale, uint8_t* q, gpu::Stream s) { not_ported("gated_rmsnorm_fp8_bf16"); }
 void gdn_conv_prefill(const float* in, float* out, float* conv_state, const gpu::bf16* w, int M, int C,
     gpu::Stream s, float* window_at, int at) { not_ported("gdn_conv_prefill"); }
 void gdn_conv_prefill_bf16(const gpu::bf16* in, gpu::bf16* out, float* conv_state, const gpu::bf16* w, int M, int C,
@@ -60,35 +56,6 @@ void lora_shrink(const float* x, int ldx, int M, const LoraRows& rows, const Lor
     int a_rows, float* t, gpu::Stream stream) { not_ported("lora_shrink"); }
 void lora_shrink_prefill(const float* x, int ldx, int M, const LoraRows& rows, const LoraSiteDev* site,
     int slot_stride, float* t, gpu::Stream stream) { not_ported("lora_shrink_prefill"); }
-void narrow_bf16(const float* x, int M, const gpu::bf16* wa, const gpu::bf16* wb, float* ya, float* yb, int N, int K,
-    gpu::Stream s) { not_ported("narrow_bf16"); }
-void narrow_bf16_bf16in(const gpu::bf16* x, int M, const gpu::bf16* wa, const gpu::bf16* wb, float* ya, float* yb,
-    int N, int K, gpu::Stream s) { not_ported("narrow_bf16_bf16in"); }
-void prefill_gemm_fp8(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
-    bool accumulate, gpu::Stream s) { not_ported("prefill_gemm_fp8"); }
-void prefill_gemm_fp8_bf16out(const uint8_t* xq, int M, const uint8_t* w, float alpha, gpu::bf16* y, int ldy, int N,
-    int K, gpu::Stream s) { not_ported("prefill_gemm_fp8_bf16out"); }
-void prefill_gemm_fp8_lora(const uint8_t* xq, int M, const uint8_t* w, float alpha, float* y, int ldy, int N, int K,
-    bool accumulate, const LoraGemm& lora, gpu::Stream s) { not_ported("prefill_gemm_fp8_lora"); }
-void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* w, float alpha, float* y,
-    int ldy, int N, int K, bool accumulate, gpu::Stream s, const uint8_t* wsf) { not_ported("prefill_gemm_nvfp4"); }
-void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
-    const uint8_t* up, float alpha_up, int N, int K, float out_input_scale, uint8_t* q_out, uint8_t* sf_out,
-    gpu::Stream s, const uint8_t* gate_sf, const uint8_t* up_sf) { not_ported("prefill_swiglu_nvfp4"); }
-void quant_act_fp8(const float* x, int M, int K, float input_scale, uint8_t* q,
-    gpu::Stream s) { not_ported("quant_act_fp8"); }
-void quant_act_fp8_bf16in(const gpu::bf16* x, int M, int K, float input_scale, uint8_t* q,
-    gpu::Stream s) { not_ported("quant_act_fp8_bf16in"); }
-void quant_act_nvfp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf,
-    gpu::Stream s) { not_ported("quant_act_nvfp4"); }
-void rmsnorm_quant(const float* x, const gpu::bf16* w, float* out, int M, int H, float eps, bool nvfp4,
-    float input_scale, uint8_t* q, uint8_t* sf, gpu::Stream s) { not_ported("rmsnorm_quant"); }
-void rmsnorm_quant_bf16(const float* x, const gpu::bf16* w, gpu::bf16* out, int M, int H, float eps, bool nvfp4,
-    float input_scale, uint8_t* q, uint8_t* sf, gpu::Stream s) { not_ported("rmsnorm_quant_bf16"); }
-void sigmoid_mul_fp8(const float* x, const float* gate, size_t n, float input_scale, uint8_t* q,
-    gpu::Stream s) { not_ported("sigmoid_mul_fp8"); }
-void silu_mul_quant_nvfp4(const float* g, const float* u, int M, int K, float input_scale, uint8_t* q, uint8_t* sf,
-    gpu::Stream s) { not_ported("silu_mul_quant_nvfp4"); }
 
 }  // namespace ragon::kernels
 
