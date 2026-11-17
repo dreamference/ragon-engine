@@ -240,6 +240,109 @@ __global__ void __launch_bounds__(BW * 32) stream_kernel(const gpu::half* __rest
   }
 }
 
+// The sparse head's gathered launch (stream_gemm_gather_nvfp4_kmajor): one wave per 16 output columns j0 .. j0 + 15 of
+// [0, cap), lane r16's weight row n = rows[j0 + r16] read from its own tile ((k / 64) * (N / 16) + n / 16, row n % 16)
+// instead of the tile column's rows. The staging, decode, swap, WMMA order over K and epilogue are stream_kernel's
+// with S = 1, so a selected row's logit is bit for bit the full head's (WMMA's columns are independent: a column's
+// result depends only on its own B values and A). Columns at or past *nrows read row 0 and are written -inf; a wave
+// whose 16 columns are all past it only stages x.
+template <int BW>
+__global__ void __launch_bounds__(BW * 32) gather_kernel(const gpu::half* __restrict__ xg, const float* __restrict__ xinv,
+                                                         int M, int K, const uint8_t* __restrict__ w, int N, float scale,
+                                                         const int* __restrict__ rows, const int* __restrict__ nrows,
+                                                         int cap, float* __restrict__ y) {
+  __shared__ __attribute__((aligned(16))) hf XS[2 * kRows * kXSt];
+  const hf* x = reinterpret_cast<const hf*>(xg);
+  const u32 tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, half = lane >> 4, r16 = lane & 15;
+  const u32 ntiles = N / 16;
+  const int nr = *nrows;
+  const int j0 = (blockIdx.x * BW + wave) * 16, j = j0 + r16;
+  const bool valid = j0 < nr && j0 < cap;  // wave-uniform
+  const int n = (j < nr && j < cap) ? rows[j] : 0;
+  const u64 rt = n >> 4, rr = n & 15;
+  const uint8_t* __restrict__ sc = w + static_cast<size_t>(N) * K / 2;
+  const int kbeg = 0, kend = K;
+
+  constexpr u32 NV = kRows * kKC / 8;
+  constexpr u32 PER = (NV + BW * 32 - 1) / (BW * 32);
+  v4u pre[PER];
+  auto xload = [&](int kb) {
+    const int kc = min(kKC, kend - kb);
+#pragma unroll
+    for (u32 p = 0; p < PER; p++) {
+      const u32 i = tid + p * BW * 32, r = i / (kKC / 8), c = (i % (kKC / 8)) * 8;
+      v4u v = {0, 0, 0, 0};
+      if (i < NV && (int)r < M && (int)c < kc) v = *(const v4u*)(x + (u64)r * K + kb + c);
+      pre[p] = v;
+    }
+  };
+  auto xstore = [&](hf* buf) {
+#pragma unroll
+    for (u32 p = 0; p < PER; p++) {
+      const u32 i = tid + p * BW * 32, r = i / (kKC / 8), c = (i % (kKC / 8)) * 8;
+      if (i < NV) *(v4u*)(buf + r * kXSt + c) = pre[p];
+    }
+  };
+
+  v8f acc = {};
+  auto step = [&](const hf* xs, int k0, int kk) {
+    const u64 tile = (u64)((k0 + kk) / kTileK) * ntiles + rt;
+    v8u own0, own1;
+    const v4u c = __builtin_nontemporal_load((const v4u*)(w + tile * 512 + rr * 32 + half * 16));
+    const u32 s2 = *(const unsigned short*)(sc + tile * 64 + rr * 4 + half * 2);
+    const v2h sa = e4m3_h2(s2 & 0xFF), sb = e4m3_h2(s2 >> 8);
+    v2h o[8];
+    dec_fp4(c.x, sa, o);
+    dec_fp4(c.y, sa, o + 4);
+#pragma unroll
+    for (int e = 0; e < 8; e++) own0[e] = as_u(o[e]);
+    dec_fp4(c.z, sb, o);
+    dec_fp4(c.w, sb, o + 4);
+#pragma unroll
+    for (int e = 0; e < 8; e++) own1[e] = as_u(o[e]);
+    v8u oth0, oth1;
+#pragma unroll
+    for (int e = 0; e < 8; e++) { oth0[e] = xswap(own0[e]); oth1[e] = xswap(own1[e]); }
+    v16h bq[4];
+    bq[0] = __builtin_bit_cast(v16h, half ? oth0 : own0);
+    bq[1] = __builtin_bit_cast(v16h, half ? oth1 : own1);
+    bq[2] = __builtin_bit_cast(v16h, half ? own0 : oth0);
+    bq[3] = __builtin_bit_cast(v16h, half ? own1 : oth1);
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+      const v16h a = *(const v16h*)(xs + r16 * kXSt + kk + q * 16);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq[q], acc);
+    }
+  };
+
+  xload(kbeg);
+  xstore(XS);
+  bar();
+  for (int k0 = kbeg; k0 < kend; k0 += kKC) {
+    const int c = (k0 - kbeg) / kKC;
+    const hf* xs = XS + (c & 1) * (kRows * kXSt);
+    const bool more = k0 + kKC < kend;
+    if (more) xload(k0 + kKC);
+    if (valid) {
+      if (k0 + kKC <= kend) {
+#pragma unroll 2
+        for (int kk = 0; kk < kKC; kk += kTileK) step(xs, k0, kk);
+      } else {
+        for (int kk = 0; kk < kend - k0; kk += kTileK) step(xs, k0, kk);
+      }
+    }
+    if (more) xstore(XS + ((c + 1) & 1) * (kRows * kXSt));
+    bar();
+  }
+  if (j0 >= cap) return;
+  const bool live = valid && j < nr;
+#pragma unroll
+  for (int r = 0; r < 8; r++) {
+    const int m = 2 * r + half;
+    if (m < M) y[(u64)m * cap + j] = live ? acc[r] * scale * xinv[m] : -INFINITY;
+  }
+}
+
 void check_shape(int N, int K, const char* what) {
   if (N <= 0 || K <= 0 || N % 16 != 0 || K % 128 != 0)
     throw std::runtime_error(std::string(what) + ": N % 16 and K % 128 must be 0");
@@ -547,6 +650,22 @@ void stream_gemm_multi(bool nvfp4, const gpu::half* x, const float* xinv, int M,
                        gpu::Stream s) {
   if (nvfp4) dispatch<true>(x, xinv, M, t, n, K, s);
   else dispatch<false>(x, xinv, M, t, n, K, s);
+}
+
+void stream_gemm_gather_nvfp4_kmajor(const gpu::half* x, const float* xinv, int M, const uint8_t* w, float scale2,
+                                     const int* rows, const int* nrows, int cap, float* y, int N, int K, gpu::Stream s) {
+  check_shape(N, K, "stream_gemm_gather");
+  if (cap < 16 || cap % 16 != 0) throw std::runtime_error("stream_gemm_gather: cap % 16 must be 0");
+  if (M < 1 || M > kMaxStreamRows) throw std::runtime_error("stream_gemm_gather: M must be in [1, 64]");
+  // The full head's bits need its K order: one wave over all of K. A blob that splits K (none at a head's width:
+  // splits() is 1 from kSplitBelow tiles up) would sum its parts in another order.
+  if (splits(N, K) != 1) throw std::runtime_error("stream_gemm_gather: a weight that splits K");
+  constexpr int BW = kFp4Waves;
+  const int blocks = (cap / 16 + BW - 1) / BW;
+  for (int m0 = 0; m0 < M; m0 += kRows)
+    launch_kernel("stream_gemm_gather", gather_kernel<BW>, dim3(blocks), dim3(BW * 32), 0, s,
+                  x + static_cast<size_t>(m0) * K, xinv + m0, std::min(kRows, M - m0), K, w, N, scale2, rows, nrows,
+                  cap, y + static_cast<size_t>(m0) * cap);
 }
 
 void stream_gemm_split_k(const uint8_t* w, int N, int K) {

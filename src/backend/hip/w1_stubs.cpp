@@ -26,8 +26,6 @@ namespace {
 
 namespace ragon::kernels {
 
-void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
-    float* vals, int* ids, gpu::Stream s) { not_ported("draft_head_rows"); }
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
     const LoraOuts& outs, gpu::Stream stream) { not_ported("lora_expand"); }
 void lora_gemm_parts(const LoraSiteDev& d, const float* t,

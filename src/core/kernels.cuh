@@ -667,4 +667,12 @@ void selector_lattice(const float* hp, const int* cand, const float* unary, cons
                       const gpu::bf16* S, int anchor, int E, float* scores, gpu::Stream s,
                       const int* anchor_dev = nullptr);
 
+#if defined(RAGON_BACKEND_HIP)
+// The sparse head's gathered GEMM on HIP (stream_gemm_hip.cu): stream_gemm_gather_nvfp4 over the HIP blob, whose
+// K-major tile index needs the head's N; raw blobs only (no coded scales on HIP), cap % 16 == 0. A selected row's
+// logit is bit for bit the HIP full head's.
+void stream_gemm_gather_nvfp4_kmajor(const gpu::half* x, const float* xinv, int M, const uint8_t* w, float scale2,
+                                     const int* rows, const int* nrows, int cap, float* y, int N, int K, gpu::Stream s);
+#endif
+
 }  // namespace ragon::kernels

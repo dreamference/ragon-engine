@@ -573,6 +573,55 @@ void bench(const std::string& only) {
 
 }  // namespace
 
+// The sparse head's gathered GEMM (stream_gemm_gather_nvfp4_kmajor): every selected column bit for bit the full
+// head's logit of its row, -inf past *nrows, at 1 to 32 rows (the drafter's E), with selections that end inside a
+// 16-column wave, on a wave edge, fill the capacity, or hold one row.
+bool test_gather() {
+  const int N = 4096, Kd = 5120, MMAX = 32;
+  std::mt19937 rng(23);
+  Mat w = make_mat(rng, N, Kd);
+  bool ok = retile(w, "gather");
+  std::vector<float> x(size_t(MMAX) * Kd);
+  for (auto& v : x) v = value(rng);
+  float* dx = upload(x);
+  uint16_t* xh = ragon::test::alloc<uint16_t>(size_t(MMAX) * Kd);
+  float *xinv = ragon::test::alloc<float>(MMAX), *dy = ragon::test::alloc<float>(size_t(MMAX) * N);
+  const float gs = 0.37f;
+  int cases = 0;
+  for (int M : {1, 7, 16, 17, 32}) {
+    run(true, dx, M, Kd, xh, xinv, w, gs, dy);
+    const std::vector<float> full = download(dy, size_t(M) * N);
+    for (int nr : {1, 16, 1000, 1056}) {
+      const int cap = 1056;
+      std::vector<int> all(N);
+      for (int i = 0; i < N; ++i) all[i] = i;
+      std::shuffle(all.begin(), all.end(), rng);
+      std::vector<int> rows(all.begin(), all.begin() + cap);
+      std::sort(rows.begin(), rows.begin() + nr);
+      if (nr == 16) rows[15] = N - 1, std::sort(rows.begin(), rows.begin() + nr);  // the last tile's last row
+      int* drows = upload(rows);
+      int* dn = upload(std::vector<int>{nr});
+      float* dg = ragon::test::alloc<float>(size_t(M) * cap);
+      ragon::test::zero(dg, size_t(M) * cap * 4);
+      K::stream_gemm_gather_nvfp4_kmajor(reinterpret_cast<gpu::half*>(xh), xinv, M, w.dw4, gs, drows, dn, cap, dg, N,
+                                         Kd, nullptr);
+      const std::vector<float> g = download(dg, size_t(M) * cap);
+      int bad = 0;
+      for (int m = 0; m < M; ++m)
+        for (int i = 0; i < cap; ++i) {
+          const float v = g[size_t(m) * cap + i];
+          if (i < nr ? !same_bytes(&v, &full[size_t(m) * N + rows[i]], 4) : !(std::isinf(v) && v < 0)) ++bad;
+        }
+      ++cases;
+      if (bad) std::printf("stream_gemm_gather M=%d nrows=%d cap=%d: %d columns differ FAIL\n", M, nr, cap, bad);
+      ok &= bad == 0;
+    }
+  }
+  std::printf("stream_gemm_gather N=%d K=%d: %d cases, selected columns bit for bit the full head, -inf after %s\n", N,
+              Kd, cases, ok ? "ok" : "FAIL");
+  return ok;
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "--bench") {
     bench(argc > 2 ? argv[2] : "");
@@ -592,6 +641,7 @@ int main(int argc, char** argv) {
   ok &= test_gemm(1280, 5120, 29, true, {1, 16, 64});       // the drafter conv projection: K split in 4
   ok &= test_multi();
   ok &= test_two_streams();
+  ok &= test_gather();
   std::printf("HASH gemm %016llx retile %016llx\n", static_cast<unsigned long long>(g_hash_gemm),
               static_cast<unsigned long long>(g_hash_retile));
   std::printf(ok ? "all HIP stream GEMM tests passed\n" : "HIP STREAM GEMM TESTS FAILED\n");

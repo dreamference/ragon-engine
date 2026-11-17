@@ -310,7 +310,7 @@ void sparse_head_ids(const int* rows, int* ids, int n, gpu::Stream s) {
   launch_kernel("sparse_head ids", ids_kernel, dim3((n + 255) / 256), dim3(256), 0, s, rows, ids, n);
 }
 
-#if !defined(RAGON_BACKEND_HIP)  // W1 (the head GEMMs, stream_gemm): CUDA only until the W1 port (BACKEND §7)
+#if !defined(RAGON_BACKEND_HIP)  // the CUDA form; the HIP one (the K-major gathered GEMM) is at the end of the file
 void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
                      float* vals, int* ids, gpu::Stream s) {
   if (n < 1 || E < 1 || E > kMaxSeqRows) throw std::runtime_error("draft_head_rows: 1 to 32 rows per sequence");
@@ -362,5 +362,55 @@ void sparse_head_mark(uint8_t* mask, const int* ids, int n, gpu::Stream s) {
   if (n <= 0) return;
   launch_kernel("sparse_head mark", mark_kernel, dim3((n + 255) / 256), dim3(256), 0, s, mask, ids, n);
 }
+
+#if defined(RAGON_BACKEND_HIP)
+// draft_head_rows on HIP (W1, w1-hip-drafter): the CUDA form's steps through the facade, with the HIP gathered GEMM
+// (the K-major blob's tile index needs the head's N; no coded blobs on HIP, so no raw scales).
+void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
+                     float* vals, int* ids, gpu::Stream s) {
+  if (n < 1 || E < 1 || E > kMaxSeqRows) throw std::runtime_error("draft_head_rows: 1 to 32 rows per sequence");
+  if (b.table) throw std::runtime_error("draft_head_rows: coded NVFP4 blobs are not built on HIP");
+  auto check = [](gpu::Error e, const char* what) {
+    if (e != gpu::kSuccess) throw std::runtime_error(std::string("draft_head_rows: ") + what + ": " + gpu::error_string(e));
+  };
+  // The full head's sequences, as many at a time as fit 32 rows (contiguous in x: in place; else copied together).
+  const int per = kMaxSeqRows / E;
+  std::vector<int> full;
+  for (int i = 0; i < n; ++i)
+    if (!masks[i]) full.push_back(i);
+  for (size_t c0 = 0; c0 < full.size(); c0 += per) {
+    const int cn = static_cast<int>(std::min(full.size() - c0, size_t(per)));
+    bool contiguous = true;
+    for (int j = 1; j < cn; ++j) contiguous &= full[c0 + j] == full[c0] + j;
+    const float* in = x + size_t(full[c0]) * E * b.K;
+    if (!contiguous) {
+      for (int j = 0; j < cn; ++j)
+        check(gpu::memcpy_async(b.xtmp + size_t(j) * E * b.K, x + size_t(full[c0 + j]) * E * b.K,
+                                size_t(E) * b.K * sizeof(float), gpu::kD2D, s),
+              "copy");
+      in = b.xtmp;
+    }
+    to_half_rows(in, cn * E, b.K, b.xh, b.xinv, s);
+    stream_gemm_nvfp4(b.xh, b.xinv, cn * E, b.w, nullptr, b.scale2, b.logits, b.N, b.K, s);
+    for (int j = 0; j < cn; ++j) {
+      const size_t o = size_t(full[c0 + j]) * E * K16;
+      topk_rows(b.logits + size_t(j) * E * b.N, E, b.N, K16, b.topk_scratch, vals + o, ids + o, s);
+    }
+  }
+  // Each sparse sequence alone: the rank-256 scores choose the rows beyond its mask's; their exact logits (the full
+  // head's bits, read from the same tiled blob) give its top K16, whose columns map back to token ids.
+  for (int i = 0; i < n; ++i) {
+    if (!masks[i]) continue;
+    const float* xi = x + size_t(i) * E * b.K;
+    const size_t o = size_t(i) * E * K16;
+    bf16_rows(xi, E, b.vt, b.p, b.R, b.K, s);
+    sparse_head_select(b.p, E, b.us, b.N, b.R, SelMasks{{masks[i]}, 1}, b.dynamic, b.cap, b.scratch, b.rows, b.nrows, s);
+    to_half_rows(xi, E, b.K, b.xh, b.xinv, s);
+    stream_gemm_gather_nvfp4_kmajor(b.xh, b.xinv, E, b.w, b.scale2, b.rows, b.nrows, b.cap, b.logits, b.N, b.K, s);
+    topk_rows(b.logits, E, b.cap, K16, b.topk_scratch, vals + o, ids + o, s);
+    sparse_head_ids(b.rows, ids + o, E * K16, s);
+  }
+}
+#endif  // RAGON_BACKEND_HIP
 
 }  // namespace ragon::kernels
