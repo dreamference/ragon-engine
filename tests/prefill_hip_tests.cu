@@ -15,8 +15,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <random>
 #include <string>
@@ -42,6 +44,21 @@ uint64_t fnv(const void* p, size_t n, uint64_t h) {
 }
 constexpr uint64_t kFnv0 = 1469598103934665603ull;
 uint64_t g_qhash = kFnv0, g_hash = kFnv0;
+
+// The fused quantizers' bytes, one FHASH line per operation, for the cross-backend comparison (they stay out of
+// QHASH: their norms and exponentials are not the host's bit for bit). RAGON_TEST_DUMP=<dir> also writes them to
+// <dir>/<op>.bin, so two backends' files can be compared byte by byte.
+void fhash(const char* op, std::initializer_list<const std::vector<uint8_t>*> parts) {
+  uint64_t h = kFnv0;
+  const char* dir = std::getenv("RAGON_TEST_DUMP");
+  FILE* f = dir ? std::fopen((std::string(dir) + "/" + op + ".bin").c_str(), "wb") : nullptr;
+  for (const auto* p : parts) {
+    h = fnv(p->data(), p->size(), h);
+    if (f) std::fwrite(p->data(), 1, p->size(), f);
+  }
+  if (f) std::fclose(f);
+  std::printf("FHASH %-22s %016llx\n", op, static_cast<unsigned long long>(h));
+}
 
 float unit(std::mt19937& rng) { return static_cast<float>(rng() >> 8) * (1.f / 16777216.f); }
 float value(std::mt19937& rng) {
@@ -247,6 +264,7 @@ bool test_fused() {
                 far, err ? ", error " : "", err ? err : "", good ? "ok" : "FAIL");
     g_hash = fnv(gq.data(), gq.size(), g_hash);
     g_hash = fnv(gsf.data(), gsf.size(), g_hash);
+    fhash("silu_mul_quant_nvfp4", {&gq, &gsf});
     ok &= good;
     for (void* p : {static_cast<void*>(dg), static_cast<void*>(du), static_cast<void*>(q), static_cast<void*>(s)})
       ragon::test::free_bytes(p);
@@ -289,11 +307,13 @@ bool test_fused() {
       diff = count_diff(gq, hq) + count_diff(gsf, hs);
       total = gq.size() + gsf.size();
       g_hash = fnv(gsf.data(), gsf.size(), g_hash);
+      fhash("rmsnorm_quant_nvfp4", {&gq, &gsf});
     } else {
       hq = host_fp8(v, in);
       far = code_far(gq, hq, false);
       diff = count_diff(gq, hq);
       total = gq.size();
+      fhash("rmsnorm_quant_fp8", {&gq});
     }
     const bool good = !err && far == 0 && diff * 100 <= total && worst < 1e-5;
     std::printf("rmsnorm_quant %s M=%d H=%d: out rel %.2e, %zu bytes differ, %zu beyond a step%s%s %s\n",
@@ -340,6 +360,8 @@ bool test_fused() {
                 rows, diff, far, diff2, far2, err ? ", error " : "", err ? err : "", good ? "ok" : "FAIL");
     g_hash = fnv(gq.data(), gq.size(), g_hash);
     g_hash = fnv(gq2.data(), gq2.size(), g_hash);
+    fhash("gated_rmsnorm_fp8", {&gq});
+    fhash("sigmoid_mul_fp8", {&gq2});
     ok &= good;
     for (void* p : {static_cast<void*>(dx), static_cast<void*>(dz), static_cast<void*>(dw), static_cast<void*>(q),
                     static_cast<void*>(q2)})
@@ -838,6 +860,25 @@ bool test_gemm_bf16(int N, int Kd, const std::vector<int>& Ms, uint32_t seed) {
 
 }  // namespace
 
+#ifdef RAGON_BACKEND_HIP
+// RAGON_LAUNCH_LOG=1 (the Windows display-timeout check): gemm_bf16 at the engine's largest shapes, timed only, the
+// launch log printing the slowest launch: a full 2048-row slab of the FFN shape, and the 64-row floor at the vocabulary.
+void time_gemm_bf16() {
+  const int shapes[][3] = {{4096, 17408, 5120}, {256, 248320, 5120}};
+  for (const auto& sh : shapes) {
+    const int M = sh[0], N = sh[1], Kd = sh[2];
+    auto* x = ragon::test::alloc<gpu::bf16>(size_t(M) * Kd);
+    auto* w = ragon::test::alloc<gpu::bf16>(size_t(N) * Kd);
+    float* y = ragon::test::alloc<float>(size_t(M) * N);
+    (void)hipMemset(x, 0, size_t(M) * Kd * 2), (void)hipMemset(w, 0, size_t(N) * Kd * 2);
+    K::gemm_bf16(x, M, w, y, N, Kd, nullptr);
+    const char* err = ragon::test::sync_error();
+    std::printf("gemm_bf16 timing M=%d N=%d K=%d%s%s\n", M, N, Kd, err ? ": error " : "", err ? err : "");
+    for (void* p : {static_cast<void*>(x), static_cast<void*>(w), static_cast<void*>(y)}) ragon::test::free_bytes(p);
+  }
+}
+#endif
+
 int main() {
   bool ok = test_quant_random();
   ok &= test_quant_sweep();
@@ -856,6 +897,9 @@ int main() {
   ok &= test_gemm_bf16(200, 512, {1, 70, 130}, 31);   // a partial column tile and block
   ok &= test_gemm_bf16(64, 5120, {3, 64}, 33);
   ok &= test_gemm_bf16(48, 272, {2100, 5}, 35);       // two row slabs; a K % 256 tail
+#ifdef RAGON_BACKEND_HIP
+  if (const char* e = std::getenv("RAGON_LAUNCH_LOG"); e && std::atoi(e) != 0) time_gemm_bf16();
+#endif
   std::printf("QHASH %016llx\n", static_cast<unsigned long long>(g_qhash));
   std::printf("HASH %016llx\n", static_cast<unsigned long long>(g_hash));
   std::printf(ok ? "all prefill HIP tests passed\n" : "PREFILL HIP TESTS FAILED\n");
