@@ -32,7 +32,9 @@ inline constexpr unsigned kStreamNonBlocking = hipStreamNonBlocking;
 inline constexpr unsigned kHostAllocDefault = hipHostMallocDefault;
 inline constexpr CaptureMode kCaptureThreadLocal = hipStreamCaptureModeThreadLocal;
 inline constexpr CaptureStatus kCaptureNone = hipStreamCaptureStatusNone;
-inline constexpr unsigned long long kGraphNodePriority = hipGraphInstantiateFlagUseNodePriority;
+// No node priorities on HIP (AMD inventory row 71): the step graphs instantiate without them; the fork stream keeps
+// its stream priority.
+inline constexpr unsigned long long kGraphNodePriority = 0;
 inline constexpr PoolAttr kPoolReleaseThreshold = hipMemPoolAttrReleaseThreshold;
 inline constexpr hipMemAllocationType kAllocPinned = hipMemAllocationTypePinned;
 inline constexpr hipMemLocationType kLocationDevice = hipMemLocationTypeDevice;
@@ -44,7 +46,13 @@ inline const char* error_string(Error e) { return hipGetErrorString(e); }
 // Device and memory
 inline Error device_sync() { return hipDeviceSynchronize(); }
 inline Error get_device(int* d) { return hipGetDevice(d); }
+#ifdef _WIN32
+// The device's free and total memory from the DXGI budget (AMD §1.1, :400): hipMemGetInfo over-reports under WDDM.
+// free = the adapter's local budget less its current usage, total = the budget (backend/hip/mem_info.cpp).
+Error mem_info(size_t* free_b, size_t* total_b);
+#else
 inline Error mem_info(size_t* free_b, size_t* total_b) { return hipMemGetInfo(free_b, total_b); }
+#endif
 template <typename T>
 inline Error device_alloc(T** p, size_t bytes) { return hipMalloc(reinterpret_cast<void**>(p), bytes); }
 inline Error device_free(void* p) { return hipFree(p); }

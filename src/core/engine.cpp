@@ -312,6 +312,11 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (graphs_) std::fprintf(stderr, "step graphs on\n");
   bool pdl = opts_.pdl;
   if (const char* e = std::getenv("RAGON_PDL")) pdl = std::atoi(e) != 0;
+#if defined(RAGON_BACKEND_HIP)
+  // No programmatic dependent launch on HIP (BACKEND §4, kDependentLaunch false): kernels launch plainly.
+  if (pdl) std::fprintf(stderr, "programmatic dependent launch off: not on HIP\n");
+  pdl = false;
+#endif
   kernels::set_pdl(pdl);
   if (pdl) std::fprintf(stderr, "programmatic dependent launch on\n");
   bool bulk = opts_.attention_bulk;
@@ -400,6 +405,16 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("RAGON_MK_ATTN")) mk_attn_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_LAYERS")) mk_layers_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_SPAN")) mk_span_ = std::atoi(e);
+#if defined(RAGON_BACKEND_HIP)
+  // No persistent kernels on HIP (BACKEND §4, kPersistentKernels false): every stage stays off, whatever the
+  // environment asks, and the step runs the rows and graph path (backend/hip/persistent.cpp answers false).
+  if (mk_ffn_ > 0 || mk_gdn_ > 0 || mk_attn_ > 0 || mk_layers_ > 0 || mk_span_ > 0) {
+    if (std::getenv("RAGON_MK_FFN") || std::getenv("RAGON_MK_GDN") || std::getenv("RAGON_MK_ATTN") ||
+        std::getenv("RAGON_MK_LAYERS") || std::getenv("RAGON_MK_SPAN"))
+      std::fprintf(stderr, "megakernel stages off: no persistent kernels on HIP (RAGON_MK_* ignored)\n");
+    mk_ffn_ = mk_gdn_ = mk_attn_ = mk_layers_ = mk_span_ = 0;
+  }
+#endif
   if (mk_span_ > 0) {  // the spanning kernel's own FP16 copies (see kernels::gdn_ffn_persistent)
     xh3_ = alloc<gpu::half>(size_t(kernels::kMaxStreamRows) * c.hidden);
     xinv3_ = alloc<float>(kernels::kMaxStreamRows);

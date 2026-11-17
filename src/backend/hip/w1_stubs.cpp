@@ -26,17 +26,8 @@ namespace {
 
 namespace ragon::kernels {
 
-bool attn_persistent(const MkAttnParams& p, gpu::Stream s) { not_ported("attn_persistent"); }
-void attn_persistent_prepare() { not_ported("attn_persistent_prepare"); }
 void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, const uint8_t* const* masks, int K16,
     float* vals, int* ids, gpu::Stream s) { not_ported("draft_head_rows"); }
-bool ffn_persistent(const gpu::half* xh, const float* xinv, int M, const StreamTarget& gate, const StreamTarget& up,
-    const StreamTarget& down, int H, int I, float* g, float* u, gpu::half* xh2, float* xinv2, unsigned* counters,
-    gpu::Stream s, unsigned long long* times, const MkTail* tail) { not_ported("ffn_persistent"); }
-bool gdn_ffn_persistent(const MkGdnParams& gp, const StreamTarget& gate, const StreamTarget& up,
-    const StreamTarget& down, int I, float* g, float* u, gpu::half* xh2, float* xinv2, unsigned* counters,
-    unsigned long long* times, const MkTail* tail, gpu::Stream s) { not_ported("gdn_ffn_persistent"); }
-bool gdn_persistent(const MkGdnParams& p, gpu::Stream s) { not_ported("gdn_persistent"); }
 void lora_expand(const float* t, int M, const LoraRows& rows, const LoraSiteDev* site, int slot_stride,
     const LoraOuts& outs, gpu::Stream stream) { not_ported("lora_expand"); }
 void lora_gemm_parts(const LoraSiteDev& d, const float* t,

@@ -101,9 +101,13 @@ if(RAGON_BACKEND STREQUAL "hip")
     add_library(ragon_core STATIC src/core/safetensors.cpp src/core/model.cu src/core/drafter.cpp
                 src/core/speculate.cpp src/core/lookup.cpp src/core/accept.cpp src/core/tree.cpp src/core/sampling.cpp
                 src/core/engine.cpp src/core/engine_lora.cpp src/core/engine_fanout.cpp src/core/prefix_kv.cpp
-                src/core/lora.cpp src/core/kv_pool.cpp src/backend/hip/w1_stubs.cpp)
+                src/core/lora.cpp src/core/kv_pool.cpp src/backend/hip/mem_info.cpp src/backend/hip/persistent.cpp
+                src/backend/hip/w1_stubs.cpp)
     target_include_directories(ragon_core PUBLIC src)
     target_link_libraries(ragon_core PUBLIC ragon_kernels_hip hip::host nlohmann_json::nlohmann_json)
+    if(WIN32)
+      target_link_libraries(ragon_core PUBLIC dxgi)  # gpu::mem_info's budget (backend/hip/mem_info.cpp)
+    endif()
     add_library(ragon_tokenizer STATIC src/tokenizer/tokenizer.cpp src/tokenizer/chat_template.cpp)
     target_include_directories(ragon_tokenizer PUBLIC src)
     target_link_libraries(ragon_tokenizer PUBLIC PCRE2::8BIT ICU::uc nlohmann_json::nlohmann_json)
