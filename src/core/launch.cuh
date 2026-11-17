@@ -93,12 +93,21 @@ void launch_kernel(const char* what, void (*kernel)(Params...), dim3 grid, dim3 
 // HIP (BACKEND §7): no programmatic dependent launch (gpu::kDependentLaunch is false) and no RAGON_PROBE_SKIP probe,
 // so every launch is a plain one; pdl_begin() is then a no-op and the kernel computes exactly what it computes
 // under PDL. `pdl` is accepted and ignored.
+//
+// RAGON_LAUNCH_LOG=1 (a measurement, never for serving; launch_log_hip.cu): every launch outside a graph capture is
+// timed alone between two events and waited for, and at exit the slowest launch of each name is printed, so a run
+// shows how far each kernel stays under the Windows display-timeout (TDR) limit.
+bool launch_log_enabled();
+void* launch_log_begin(gpu::Stream s);           // nullptr when the launch is not timed
+void launch_log_end(void* h, const char* what, gpu::Stream s);
 template <typename... Params, typename... Args>
 void launch_kernel_pdl(bool /*pdl*/, const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
                        gpu::Stream s, Args&&... args) {
+  void* h = launch_log_enabled() ? launch_log_begin(s) : nullptr;
   kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
+  if (h) launch_log_end(h, what, s);
 }
 
 template <typename... Params, typename... Args>
