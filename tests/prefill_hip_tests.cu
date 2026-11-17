@@ -47,7 +47,12 @@ uint64_t g_qhash = kFnv0, g_hash = kFnv0;
 
 // The fused quantizers' bytes, one FHASH line per operation, for the cross-backend comparison (they stay out of
 // QHASH: their norms and exponentials are not the host's bit for bit). RAGON_TEST_DUMP=<dir> also writes them to
-// <dir>/<op>.bin, so two backends' files can be compared byte by byte.
+// <dir>/<op>.bin, so two backends' files can be compared byte by byte. Measured (gfx1151 against sm_121a): QHASH
+// 784724f2541519df on both; FHASH equal on both for every op but rmsnorm_quant_fp8, which differs in one byte of
+// 46080 (row 2, column 286: hip 0x5b, the FP64 host recipe's byte, cuda 0x5a, one code step away; attributed to
+// the hardware rsqrtf of each side, not isolated):
+//   silu_mul_quant_nvfp4 48bc8544d74704dc   rmsnorm_quant_nvfp4 5ba420a01f10dcf4   gated_rmsnorm_fp8 dd657847559150f7
+//   sigmoid_mul_fp8      b83469196cb67071   rmsnorm_quant_fp8   hip 7f15f0b7568fab26, cuda fd4ed146c7f7548b
 void fhash(const char* op, std::initializer_list<const std::vector<uint8_t>*> parts) {
   uint64_t h = kFnv0;
   const char* dir = std::getenv("RAGON_TEST_DUMP");
