@@ -896,8 +896,8 @@ int main() {
   ok &= test_gdn_fused_seqs();
   ok &= test_gemm_bf16(200, 512, {1, 70, 130}, 31);   // a partial column tile and block
   ok &= test_gemm_bf16(64, 5120, {3, 64}, 33);
-  ok &= test_gemm_bf16(48, 272, {2100, 5}, 35);       // two row slabs; a K % 256 tail
 #ifdef RAGON_BACKEND_HIP
+  ok &= test_gemm_bf16(48, 272, {2100, 5}, 35);       // two row slabs; a K % 256 tail (cuda's form needs K % 64 == 0)
   if (const char* e = std::getenv("RAGON_LAUNCH_LOG"); e && std::atoi(e) != 0) time_gemm_bf16();
 #endif
   std::printf("QHASH %016llx\n", static_cast<unsigned long long>(g_qhash));
