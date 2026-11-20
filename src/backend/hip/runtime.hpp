@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdlib>
 
 #include "backend/hip/types.hpp"
 
@@ -90,7 +91,44 @@ inline Error stream_priority_range(int* least, int* greatest) {
   return hipDeviceGetStreamPriorityRange(least, greatest);
 }
 inline Error stream_destroy(Stream s) { return hipStreamDestroy(s); }
-inline Error stream_sync(Stream s) { return hipStreamSynchronize(s); }
+// The decode step's waits after a graph (w5, TheRock #8786 on gfx1151/Windows): hipStreamSynchronize returns ~0.7 ms
+// after a large graph has finished, and the graph's last batch reaches the GPU only at a sync or a query.
+// RAGON_HIP_GRAPH_KICK: graph_launch queries the stream once right after hipGraphLaunch (the batch goes out at once).
+// RAGON_HIP_SYNC_SPIN: the first stream_sync of a stream after a graph launch on it waits by querying the stream in a
+// loop instead (one host core busy for the wait). Every other sync (prefill, copies) blocks as before. The macros
+// are the defaults; the environment variables of the same names (0 or 1) override them at start, for an A/B in one build.
+#ifndef RAGON_HIP_GRAPH_KICK
+#define RAGON_HIP_GRAPH_KICK 0
+#endif
+#ifndef RAGON_HIP_SYNC_SPIN
+#define RAGON_HIP_SYNC_SPIN 0
+#endif
+inline bool hip_switch(const char* name, bool def) {
+  const char* e = std::getenv(name);
+  return e && *e ? std::atoi(e) != 0 : def;
+}
+inline bool graph_kick() {
+  static const bool on = hip_switch("RAGON_HIP_GRAPH_KICK", RAGON_HIP_GRAPH_KICK != 0);
+  return on;
+}
+inline bool sync_spin() {
+  static const bool on = hip_switch("RAGON_HIP_SYNC_SPIN", RAGON_HIP_SYNC_SPIN != 0);
+  return on;
+}
+inline thread_local hipStream_t after_graph = nullptr;  // the stream a graph was last launched on (while armed)
+inline thread_local bool after_graph_armed = false;      // a graph launch on after_graph not yet synced
+inline Error stream_sync(Stream s) {
+  if (after_graph_armed && s == after_graph) {
+    after_graph_armed = false;
+    if (sync_spin()) {
+      Error e;
+      while ((e = hipStreamQuery(s)) == hipErrorNotReady) {
+      }
+      return e;
+    }
+  }
+  return hipStreamSynchronize(s);
+}
 inline Error stream_wait_event(Stream s, Event e, unsigned flags) { return hipStreamWaitEvent(s, e, flags); }
 
 // Events
@@ -109,7 +147,13 @@ inline Error is_capturing(Stream s, CaptureStatus* status) { return hipStreamIsC
 inline Error graph_instantiate(GraphExec* exec, Graph g, unsigned long long flags) {
   return hipGraphInstantiateWithFlags(exec, g, flags);
 }
-inline Error graph_launch(GraphExec exec, Stream s) { return hipGraphLaunch(exec, s); }
+inline Error graph_launch(GraphExec exec, Stream s) {
+  const Error e = hipGraphLaunch(exec, s);
+  if (e != hipSuccess) return e;
+  after_graph = s, after_graph_armed = true;
+  if (graph_kick()) (void)hipStreamQuery(s);  // NotReady is the expected answer
+  return e;
+}
 inline Error graph_destroy(Graph g) { return hipGraphDestroy(g); }
 inline Error graph_exec_destroy(GraphExec exec) { return hipGraphExecDestroy(exec); }
 

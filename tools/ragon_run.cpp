@@ -106,6 +106,7 @@
 // --batch-mixed (structured output, stage 3; needs --grammar-schema or --grammar-tools) constrains B, alone and in
 // every batch, and leaves A free: one masked and one unmasked sequence share each verify pass.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -1606,12 +1607,14 @@ int main(int argc, char** argv) {
           const std::vector<int> eager = generate(prompt, gp, true, true, &t_eager);
           const uint64_t h_eager = engine.state_hash();
           const long steps_eager = engine.spec_stats().steps, acc_eager = engine.spec_stats().accepted;
+          const ragon::SpecStats st_eager = engine.spec_stats();
           engine.set_step_graphs(true);
           if (!engine.step_graphs()) throw std::runtime_error("--graph-check: step graphs are unavailable");
           engine.reset_spec_stats();
           const std::vector<int> graph = generate(prompt, gp, true, true, &t_graph);
           const uint64_t h_graph = engine.state_hash();
           const long steps_graph = engine.spec_stats().steps, acc_graph = engine.spec_stats().accepted;
+          const ragon::SpecStats st_graph = engine.spec_stats();
           const bool same = eager == graph, state = h_eager == h_graph;
           const bool accept = steps_eager == steps_graph && acc_eager == acc_graph;
           failures += !same + !state + !accept;
@@ -1620,6 +1623,14 @@ int main(int argc, char** argv) {
                       prompt.size(), sampled ? "sampled" : "greedy", eager.size(), eager.size() / t_eager, steps_eager,
                       acc_eager, graph.size(), graph.size() / t_graph, steps_graph, acc_graph,
                       same ? "identical" : "DIFFER", state ? "identical" : "DIFFERS", accept ? "identical" : "DIFFERS");
+          // The step's split in ms per step (draft, verify, commit), each mode: where the graphs save their time.
+          auto split = [](const ragon::SpecStats& st) {
+            const double n = st.steps > 0 ? 1e3 / st.steps : 0.;
+            return std::array<double, 3>{st.draft_seconds * n, st.verify_seconds * n, st.commit_seconds * n};
+          };
+          const auto se = split(st_eager), sg = split(st_graph);
+          std::printf("  ms/step eager draft %.2f verify %.2f commit %.2f | graphs draft %.2f verify %.2f commit %.2f\n",
+                      se[0], se[1], se[2], sg[0], sg[1], sg[2]);
           if (!same) {
             size_t i = 0;
             while (i < eager.size() && i < graph.size() && eager[i] == graph[i]) ++i;

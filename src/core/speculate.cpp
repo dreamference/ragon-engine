@@ -560,12 +560,28 @@ gpu::GraphExec Engine::capture(const std::function<void()>& body, gpu::Stream st
   return exec;
 }
 
+#if defined(RAGON_BACKEND_HIP)
+namespace kernels {  // launch_log_hip.cu (RAGON_LAUNCH_LOG=1): a graph launch is timed as one launch under its name
+bool launch_log_enabled();
+void* launch_log_begin(gpu::Stream s);
+void launch_log_end(void* h, const char* what, gpu::Stream s);
+}  // namespace kernels
+#endif
+
 void Engine::run_graph(gpu::GraphExec& slot, const char* what, const std::function<void()>& body,
                        gpu::Stream st) {
   if (!st) st = stream_;
   if (graphs_ && !slot) {
     try {
+      const auto t0 = std::chrono::steady_clock::now();
       slot = capture(body, st);
+#if defined(RAGON_BACKEND_HIP)
+      if (kernels::launch_log_enabled())
+        std::fprintf(stderr, "launch log: captured the %s graph in %.3f s\n", what,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+#else
+      (void)t0;
+#endif
     } catch (const std::exception& e) {
       std::fprintf(stderr, "step graphs off: capturing the %s failed: %s\n", what, e.what());
       clear_graphs();
@@ -574,7 +590,13 @@ void Engine::run_graph(gpu::GraphExec& slot, const char* what, const std::functi
   }
   if (graphs_ && slot) {
     NvtxRange range(what);  // the same names as the eager ranges, so a trace attributes graph kernels alike
+#if defined(RAGON_BACKEND_HIP)
+    void* h = kernels::launch_log_enabled() ? kernels::launch_log_begin(st) : nullptr;
     check(gpu::graph_launch(slot, st), what);
+    if (h) kernels::launch_log_end(h, what, st);
+#else
+    check(gpu::graph_launch(slot, st), what);
+#endif
     return;
   }
   body();
