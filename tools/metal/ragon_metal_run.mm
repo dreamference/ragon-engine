@@ -1,6 +1,7 @@
 // ragon-metal-run: greedy decode on the Metal backend (METAL spec, first lane), no drafter.
 //   ragon-metal-run --model DIR --prompts-ids FILE [--check FILE] [--max-tokens N] [--greedy-out FILE]
 //                   [--ban-eos] [--ctx N] [--chunk C]
+//   ragon-metal-run --model DIR --prompts-ids FILE --teacher FILE    (argmax agreement on a reference continuation)
 //   ragon-metal-run --model DIR --prompt-ids 1,2,3 --dump DIR      (per-layer check dumps, .npy f32)
 // A prompts-ids file holds one prompt a line as comma-separated token ids; a check file holds one JSON object a
 // line with an "ids" array (the reference continuation), compared token by token.
@@ -99,7 +100,7 @@ static double now() {
 
 int main(int argc, char** argv) {
   @autoreleasepool {
-    std::string model, prompts_file, check_file, greedy_out, dump_dir;
+    std::string model, prompts_file, check_file, greedy_out, dump_dir, teacher_file;
     std::vector<std::vector<uint32_t>> prompts;
     int max_tokens = 256, ctx = 40960, chunk = 128;
     bool ban_eos = false;
@@ -116,6 +117,7 @@ int main(int argc, char** argv) {
       else if (a == "--prompts-ids") prompts_file = next();
       else if (a == "--prompt-ids") prompts.push_back(parse_ids(next()));
       else if (a == "--check") check_file = next();
+      else if (a == "--teacher") teacher_file = next();
       else if (a == "--greedy-out") greedy_out = next();
       else if (a == "--dump") dump_dir = next();
       else if (a == "--max-tokens") max_tokens = std::stoi(next());
@@ -155,6 +157,38 @@ int main(int argc, char** argv) {
       });
       write_npy(dump_dir + "/logits.npy", m.logits(), {int64_t(ids.size()), m.vocab()});
       std::fprintf(stderr, "dumped to %s\n", dump_dir.c_str());
+      return 0;
+    }
+
+    if (!teacher_file.empty()) {
+      // Teacher forcing: after each prompt, feed the reference continuation and count how often this backend's
+      // argmax equals the reference's next token (a quality comparison that does not stop at the first near tie).
+      std::vector<std::vector<int>> ref = read_check(teacher_file);
+      for (size_t p = 0; p < prompts.size() && p < ref.size(); ++p) {
+        const std::vector<uint32_t>& pr = prompts[p];
+        const int P = int(pr.size());
+        std::vector<uint32_t> cont(ref[p].begin(), ref[p].end());
+        const int R = std::min(int(cont.size()), ctx - P);
+        m.reset();
+        for (int s = 0; s < P; s += chunk) m.forward(pr.data() + s, std::min(chunk, P - s), s, false);
+        int agree = 0;
+        double margin_sum = 0;
+        auto score = [&](const float* lg, int want) {
+          Top t = top2(lg, m.vocab(), {});
+          agree += t.id == want;
+          margin_sum += t.v - lg[want];
+        };
+        score(m.logits(), int(cont[0]));
+        for (int s = 0; s + 1 < R; s += chunk) {
+          const int n = std::min(chunk, R - 1 - s);
+          m.forward(cont.data() + s, n, P + s, true);
+          for (int r = 0; r < n; ++r) score(m.logits() + size_t(r) * m.vocab(), int(cont[s + r + 1]));
+        }
+        std::printf("prompt %zu: %d prompt tokens, teacher-forced %d reference tokens: argmax agrees on %d (%.1f %%), "
+                    "mean logit margin to the reference token %.3f\n",
+                    p, P, R, agree, 100.0 * agree / R, margin_sum / R);
+        std::fflush(stdout);
+      }
       return 0;
     }
 
