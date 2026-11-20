@@ -31,12 +31,12 @@ constexpr int kMmaD = 256;
 #endif
 // RAGON_HIP_ATTN_LAZY (BF16) and RAGON_HIP_ATTN_LAZY_Q8: the online softmax rescales o only when a tile's max passes
 // the running reference by more than 2^kHipAttnSlack in P (so P <= 2^slack, and alpha = 1 on most tiles: the rescale is
-// skipped by wave ballot), in base 2 with the scale folded into one FMA. Off: the exact-max form.
+// skipped by wave ballot), in base 2 with the scale folded into one FMA. Off (default): the exact-max form, bit for bit the previous kernels.
 #ifndef RAGON_HIP_ATTN_LAZY
-#define RAGON_HIP_ATTN_LAZY 1
+#define RAGON_HIP_ATTN_LAZY 0
 #endif
 #ifndef RAGON_HIP_ATTN_LAZY_Q8
-#define RAGON_HIP_ATTN_LAZY_Q8 1
+#define RAGON_HIP_ATTN_LAZY_Q8 0
 #endif
 #ifndef RAGON_HIP_ATTN_LAZY_ACC  // BF16 with LAZY: 1 P V straight into o, 0 from zero then added (Q8: always straight)
 #define RAGON_HIP_ATTN_LAZY_ACC 1
