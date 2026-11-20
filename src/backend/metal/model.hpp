@@ -45,7 +45,7 @@ class Checkpoint {
 };
 
 struct Lin {
-  enum Fmt { kNvfp4, kFp8, kBf16 } fmt = kBf16;
+  enum Fmt { kNvfp4, kFp8, kBf16, kQ4 } fmt = kBf16;  // kQ4: built at load from kFp8
   View w, sc;
   float scale = 1.0f;
   uint32_t N = 0, K = 0;
@@ -60,6 +60,7 @@ struct Layer {
   // full attention
   Lin q, k, v, o;
   View q_norm, k_norm, kc, vc;
+  View ks, vs;  // int8 KV option: f32 scale a position and kv head
   // MLP
   Lin gate, up, down;
 };
@@ -98,6 +99,13 @@ class Model {
   Lin head_;
   int H_ = 0, KV_ = 0, D_ = 0, Hk_ = 0, Hv_ = 0, Dk_ = 0, Dv_ = 0, hidden_ = 0, ffn_ = 0, V_ = 0, rot_ = 0;
   int max_ctx_ = 0, C_ = 0, nchunk_max_ = 32, mm_min_ = 64;
+  bool attn_gqa_ = true;
+  bool kv8_ = false;  // int8 KV cache option (RAGON_METAL_KV=int8)
+  uint32_t flash_dbg_ = 0;  // flash timing probes (RAGON_METAL_FLASH_DBG, wrong results): skip 1 rescale, 2 PV, 4 softmax, 16 QK; 8 QK via registers
+  int attn_flash_ = 8;  // prefill attention (RAGON_METAL_ATTN_FLASH): 0 = S/P matmuls; 4, 8, 128, 192 = flash kernel
+  View kdq_, vdq_;    // int8 KV: bfloat scratch of one layer's cache for the prefill matmuls
+  void to_q4(Lin& l);  // the Mac-native 4-bit projection option (RAGON_METAL_PROJ=q4)
+  int attn_nch_ = 16, attn_chunk_min_ = 64;  // fused decode attention: max key chunks, min keys a chunk
   bool prof_ = false;
   size_t wdq_cap_ = 0;
   float eps_ = 1e-6f;
