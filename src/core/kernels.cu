@@ -697,9 +697,17 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
 }
 
 // The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh (HIP: attention_body_hip.cuh).
+// A rows block's threads: two a query row (HIP: plus the producer waves of the BF16 kernels, attn_block_threads).
+constexpr int attn_rows_threads(int rows, bool q8) {
+#if defined(RAGON_BACKEND_HIP)
+  return attn_block_threads(rows, q8);
+#else
+  return (void)q8, rows * 2;
+#endif
+}
 
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
-__global__ void __launch_bounds__(ROWS * 2)
+__global__ void __launch_bounds__(attn_rows_threads(ROWS, Q8))
     attention_mma_kernel(const float* __restrict__ q, const gpu::bf16* __restrict__ kcache,
                          const gpu::bf16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
                          int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
@@ -717,7 +725,7 @@ struct AttnBlocks {
   int blk0[kMaxSeqs + 1];
 };
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
-__global__ void __launch_bounds__(ROWS * 2)
+__global__ void __launch_bounds__(attn_rows_threads(ROWS, Q8))
     attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc,
                               SeqPtrs<const gpu::bf16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
                               int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
@@ -741,7 +749,7 @@ struct AttnGroups {
   int blk0[kMaxSeqGroups + 1];
 };
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
-__global__ void __launch_bounds__(ROWS * 2)
+__global__ void __launch_bounds__(attn_rows_threads(ROWS, Q8))
     attention_shared_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
                             SeqBatch b, AttnGroups gr, int Hq, int Hkv, int splits, int chunk,
                             float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg,
@@ -764,7 +772,7 @@ struct AttnCuts {
   int zbase;
 };
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
-__global__ void __launch_bounds__(ROWS * 2)
+__global__ void __launch_bounds__(attn_rows_threads(ROWS, Q8))
     attention_suffix_kernel(const float* __restrict__ q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<const gpu::bf16> vc,
                             SeqBatch b, AttnBlocks blocks, AttnCuts cuts, int Hq, int Hkv, int splits, int chunk,
                             float* __restrict__ scratch, size_t hs, size_t ps, int pf, SeqPtrs<const uint64_t> pg,
@@ -1281,7 +1289,7 @@ void attention_rows(const float* q, const gpu::bf16* kcache, const gpu::bf16* vc
                     q8.on()       ? attention_mma_kernel<rows, tk, ns, false, true>
                     : g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true>
                                   : attention_mma_kernel<rows, tk, ns, false>,
-                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kcache, vcache,
+                    dim3((R + rows - 1) / rows, Hkv, splits), dim3(attn_rows_threads(rows, q8.on())), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kcache, vcache,
                     pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td, pages,
                     q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
@@ -1310,7 +1318,7 @@ void attention_rows_seqs(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs<co
                     q8.on()       ? attention_mma_seqs_kernel<rows, tk, ns, false, true>
                     : g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true>
                                   : attention_mma_seqs_kernel<rows, tk, ns, false>,
-                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
+                    dim3(blocks.blk0[b.n], Hkv, splits), dim3(attn_rows_threads(rows, q8.on())), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
                     splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
@@ -1363,13 +1371,13 @@ void attention_rows_cascade(const float* q, SeqPtrs<const gpu::bf16> kc, SeqPtrs
                     : q8.on()     ? attention_shared_kernel<rows, tk, ns, false, true>
                     : g_attn_bulk ? attention_shared_kernel<rows, tk, ns, true>
                                   : attention_shared_kernel<rows, tk, ns, false>,
-                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(srows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
+                    dim3(gr.blk0[groups.n], Hkv, zshared), dim3(attn_rows_threads(srows, q8.on())), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
                     splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_suffix",
                     q8.on()       ? attention_suffix_kernel<rows, tk, ns, false, true>
                     : g_attn_bulk ? attention_suffix_kernel<rows, tk, ns, true>
                                   : attention_suffix_kernel<rows, tk, ns, false>,
-                    dim3(blocks.blk0[b.n], Hkv, splits - cuts.zbase), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks,
+                    dim3(blocks.blk0[b.n], Hkv, splits - cuts.zbase), dim3(attn_rows_threads(rows, q8.on())), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks,
                     cuts, Hq, Hkv, splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);

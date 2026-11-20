@@ -16,6 +16,19 @@
 #pragma once
 
 constexpr int kMmaD = 256;
+// Study switch (lane hip-attn-overlap): RAGON_HIP_ATTN_OVERLAP 1 gives the BF16 kernels kHipAttnProd extra threads (two
+// waves) that only move tiles: they hold the next tile in their own registers while the row waves compute this one,
+// and store it after the "consumed" barrier (attn_run_pf). RAGON_HIP_ATTN_ABL (ablation builds): 1 no compute, 2 no
+// global loads. Default off.
+#ifndef RAGON_HIP_ATTN_OVERLAP
+#define RAGON_HIP_ATTN_OVERLAP 1
+#endif
+#ifndef RAGON_HIP_ATTN_ABL
+#define RAGON_HIP_ATTN_ABL 0
+#endif
+constexpr int kHipAttnProd = RAGON_HIP_ATTN_OVERLAP ? 64 : 0;
+// A block's threads: two a query row, plus the producer waves on the BF16 kernels.
+constexpr int attn_block_threads(int rows, bool q8) { return rows * 2 + (q8 ? 0 : kHipAttnProd); }
 constexpr int kHipQS = kMmaD + 8;  // padded row stride (bf16) of the Q and K tiles in LDS: conflict-free 32-byte reads
 // The LDS of a block is static (attention_mma_body's own arrays): the launches pass no dynamic shared memory.
 constexpr size_t mma_smem(int, int) { return 0; }
@@ -240,6 +253,59 @@ __device__ __forceinline__ void attn_load_run(AttnLds<ROWS, TK>& sm, const gpu::
     }
   }
 }
+
+// attn_load_run split for the producer waves (NT threads, t their index): load() puts the tile in registers (V already
+// in its V^T word order), store() writes it to LDS: the same LDS bytes as attn_load_run.
+template <int ROWS, int TK, int NT>
+struct AttnRunPf {
+  static constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS, KR = D / 8, VQ = TK / 4;
+  static constexpr int NK = TK * KR, NV = VQ * KR, IK = NK / NT, IV = NV / NT, KS = NT / KR, VC = NT / VQ;
+  static_assert(NK % NT == 0 && NV % NT == 0 && NT % KR == 0 && NT % VQ == 0, "fixed shares");
+  uint4 wk[IK];
+  uint2 wv[IV][8];
+  __device__ __forceinline__ void load(const gpu::bf16* __restrict__ kcache, const gpu::bf16* __restrict__ vcache,
+                                       int k0, int khi, size_t kbase, size_t ps, int t) {
+    const int kj = t / KR, kc = t % KR, jq = t % VQ, vc = t / VQ;
+    const uint32_t ps32 = static_cast<uint32_t>(ps);
+    const uint32_t koff = kj * ps32 + 8 * kc, voff = 4 * jq * ps32 + 8 * vc;
+    const gpu::bf16* kt = kcache + kbase;
+    const gpu::bf16* vt = vcache + kbase;
+#pragma unroll
+    for (int it = 0; it < IK; ++it) {
+      const int key = k0 + kj + it * KS;
+      wk[it] = make_uint4(0, 0, 0, 0);
+      if (key < khi) wk[it] = *reinterpret_cast<const uint4*>(kt + static_cast<size_t>(it * KS) * ps + koff);
+    }
+    uint4 w[IV][4];
+#pragma unroll
+    for (int it = 0; it < IV; ++it)
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int key = k0 + 4 * jq + u;
+        w[it][u] = make_uint4(0, 0, 0, 0);
+        if (key < khi) w[it][u] = *reinterpret_cast<const uint4*>(vt + static_cast<size_t>(u) * ps + 8 * VC * it + voff);
+      }
+#pragma unroll
+    for (int it = 0; it < IV; ++it)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        auto half = [&](const uint4& x) {
+          const uint32_t d = e < 2 ? x.x : e < 4 ? x.y : e < 6 ? x.z : x.w;
+          return (e & 1) ? d >> 16 : d & 0xffffu;
+        };
+        wv[it][e] = make_uint2(half(w[it][0]) | (half(w[it][1]) << 16), half(w[it][2]) | (half(w[it][3]) << 16));
+      }
+  }
+  __device__ __forceinline__ void store(AttnLds<ROWS, TK>& sm, int t) const {
+    const int kj = t / KR, kc = t % KR, jq = t % VQ, vc = t / VQ;
+#pragma unroll
+    for (int it = 0; it < IK; ++it) *reinterpret_cast<uint4*>(sm.k + (kj + it * KS) * kHipQS + 8 * kc) = wk[it];
+#pragma unroll
+    for (int it = 0; it < IV; ++it)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) *reinterpret_cast<uint2*>(sm.vt + (8 * (vc + it * VC) + e) * VS + 4 * jq) = wv[it][e];
+  }
+};
 
 // M2: a sealed tile (keys [k0, k0 + TK), all below khi) from the layer's FP8 mirror, into LDS in FP16: the values
 // attn_code_tile leaves for the BF16 tile, bit for bit. The mirror holds a code at each pool element's offset.
@@ -560,9 +626,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // zeroed, as a launch whose last key is pa holds it (zero-filled from khi on): the row's bytes then do not depend on
   // the launch's other rows (the zero-product note above). parts: do the cut rows (not when every row taking the tile
   // sees all of it). Block-uniform (it meets barriers); returns whether it zeroed V.
-  auto tile_rows = [&](int k0, bool ca, bool parts) {
+  auto tile_rows = [&](int k0, bool ca, bool parts, auto act) {
+    constexpr bool ACT = decltype(act)::value;  // false: a producer wave (barriers and shares only, never o)
     const int top = min(k0 + TK, khi) - 1;
-    if (active) tile_compute(k0, ca && pa >= top);
+    if (ACT && active) tile_compute(k0, ca && pa >= top);
     bool cut = false;
     if (!parts || pmin >= top) return cut;
     int zcur = top;  // the tile's keys past zcur hold zeros
@@ -577,7 +644,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       __syncthreads();
       zcur = pc;
       cut = true;
-      if (active) tile_compute(k0, ca && pa == pc);
+      if (ACT && active) tile_compute(k0, ca && pa == pc);
     }
     return cut;
   };
@@ -600,7 +667,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       attn_f16_tile<ROWS, TK>(sm);
       __syncthreads();
       codes = false;
-      tile_rows(k0, ca && Pa <= k0, true);
+      tile_rows(k0, ca && Pa <= k0, true, AttnFix<true>{});
     }
     if (rnd) {
       codes = true;
@@ -613,10 +680,57 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         attn_code_tile<ROWS, TK>(sm, q8);
         __syncthreads();
       }
-      tile_rows(k0, ca && Pa > k0, false);
+      tile_rows(k0, ca && Pa > k0, false, AttnFix<true>{});
     }
   };
   const int kctx = td ? min(khi, klo + max(0, (pos0 - klo) / TK) * TK) : khi;
+  // The tail of a tree: per variant present in this block, its tile, taken by that variant's rows only.
+  auto tree_tail = [&](auto act) {
+  if (td != nullptr && kctx < khi) {
+    const int first_m = r0 / G;
+    for (int k0 = kctx; k0 < khi; k0 += TK) {
+      for (int v = 0; v < td->nvar; ++v) {
+        bool any = false;
+        for (int m = first_m; m <= last_m; ++m) any = any || td->var[m] == v;
+        if (!any) continue;
+        const int* path = td->path[v];
+        auto tree_src = [&](int key) {
+          const int src = key < pos0 ? key : pos0 + path[min(key - pos0, kMaxSeqRows - 1)];
+          return kv_off(pages, kvh, src, hs, ps);
+        };
+        __syncthreads();
+        if (Q8 || CQ || kHipAttnProd == 0 || tid < ROWS * 2) attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src);
+        __syncthreads();
+        const bool cv = va && td->var[ra / G] == v;
+        if constexpr (Q8) tile_q8(k0, cv, false, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); });
+        else tile_rows(k0, cv, true, act);
+      }
+    }
+  }
+  };
+  if constexpr (!Q8 && !CQ && kHipAttnProd > 0) {  // not the megakernel (CQ): its blocks have rows * 2 threads
+    if (tid >= ROWS * 2) {  // a producer wave: tile k0 + TK into registers while the row waves compute tile k0
+      const int t = tid - ROWS * 2;
+      AttnRunPf<ROWS, TK, kHipAttnProd> pf;
+      if (RAGON_HIP_ATTN_ABL != 2 && kfirst < kctx)
+        pf.load(kcache, vcache, kfirst, khi, kv_off(pages, kvh, kfirst, hs, ps), ps, t);
+      for (int k0 = kfirst; k0 < kctx; k0 += TK) {
+        __syncthreads();  // the previous tile is consumed
+        if (RAGON_HIP_ATTN_ABL != 2) pf.store(sm, t);
+        __syncthreads();
+        if (RAGON_HIP_ATTN_ABL != 2 && k0 + TK < kctx)
+          pf.load(kcache, vcache, k0 + TK, khi, kv_off(pages, kvh, k0 + TK, hs, ps), ps, t);
+        if (RAGON_HIP_ATTN_ABL != 1) tile_rows(k0, true, true, AttnFix<false>{});
+      }
+      tree_tail(AttnFix<false>{});
+      return;
+    }
+    for (int k0 = kfirst; k0 < kctx; k0 += TK) {
+      __syncthreads();
+      __syncthreads();  // the producers stored tile k0
+      if (RAGON_HIP_ATTN_ABL != 1) tile_rows(k0, true, true, AttnFix<true>{});
+    }
+  } else {
   for (int k0 = kfirst; k0 < kctx; k0 += TK) {
     // A tile never crosses a page (TK divides kKvPageTokens): one page-table read a tile, every key base + j * ps (the
     // addresses kv_off gives per key, without a dependent read before each load).
@@ -624,14 +738,18 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     __syncthreads();  // the previous tile is consumed (and the queries are staged, the first time)
     bool f8 = false;
     if constexpr (Q8) f8 = sealed_tile(k0, kctx);
-    if (f8) attn_load_tile_f8<ROWS, TK>(sm, q8, k0, kvh, hs, ps, pages);
-    else attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps);
+    if (RAGON_HIP_ATTN_ABL != 2) {
+      if (f8) attn_load_tile_f8<ROWS, TK>(sm, q8, k0, kvh, hs, ps, pages);
+      else attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps);
+    }
     __syncthreads();
+    if (RAGON_HIP_ATTN_ABL == 1) continue;
     if constexpr (Q8) {
       tile_q8(k0, true, f8, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); });
     } else {
-      tile_rows(k0, true, true);
+      tile_rows(k0, true, true, AttnFix<true>{});
     }
+  }
   }
   // The tail of a tree: per variant present in this block, its tile, taken by that variant's rows only.
   if (td != nullptr && kctx < khi) {
@@ -651,7 +769,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         __syncthreads();
         const bool cv = va && td->var[ra / G] == v;
         if constexpr (Q8) tile_q8(k0, cv, false, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); });
-        else tile_rows(k0, cv, true);
+        else tile_rows(k0, cv, true, AttnFix<true>{});
       }
     }
   }
