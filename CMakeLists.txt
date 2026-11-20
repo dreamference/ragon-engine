@@ -3,13 +3,17 @@ project(ragon_engine LANGUAGES CXX VERSION 0.1.0)
 
 # The compute backend (specs/DREAMFERENCE_RAGON_ENGINE_BACKEND.md): one kernel interface (src/backend/backend.hpp,
 # core/kernels.cuh), one implementation per build. cuda is today's engine, unchanged; hip (the Windows node) and
-# metal (the Mac node) build on the same interface and are not implemented yet.
+# metal (the Mac node) build on the same interface; hip is not implemented yet, metal is in its first lane.
 set(RAGON_BACKEND cuda CACHE STRING "Compute backend: cuda, hip or metal")
 set_property(CACHE RAGON_BACKEND PROPERTY STRINGS cuda hip metal)
 if(RAGON_BACKEND STREQUAL "cuda")
   enable_language(CUDA)
-elseif(RAGON_BACKEND STREQUAL "hip" OR RAGON_BACKEND STREQUAL "metal")
-  message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: not implemented yet (BACKEND §7, §8); cuda is the only backend")
+elseif(RAGON_BACKEND STREQUAL "metal")
+  # The Mac node (BACKEND §8, METAL spec): its own targets, none of the CUDA ones below.
+  include(src/backend/metal/metal.cmake)
+  return()
+elseif(RAGON_BACKEND STREQUAL "hip")
+  message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: not implemented yet (BACKEND §7)")
 else()
   message(FATAL_ERROR "RAGON_BACKEND=${RAGON_BACKEND}: unknown backend (cuda, hip or metal)")
 endif()

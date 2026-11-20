@@ -1,0 +1,492 @@
+#include "backend/metal/model.hpp"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace ragon::metal {
+
+[[noreturn]] static void fail(const std::string& msg) {
+  std::fprintf(stderr, "metal model: %s\n", msg.c_str());
+  std::exit(2);
+}
+
+static NSDictionary* read_json(const std::string& path) {
+  NSData* d = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]];
+  if (!d) fail("cannot read " + path);
+  NSError* err = nil;
+  id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:&err];
+  if (![j isKindOfClass:[NSDictionary class]]) fail("bad json " + path);
+  return j;
+}
+
+static float bf16_to_f32(uint16_t v) {
+  uint32_t u = uint32_t(v) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+// ---- checkpoint ---------------------------------------------------------------------------------
+
+void Checkpoint::open(Queue& q, const std::string& dir) {
+  q_ = &q;
+  NSDictionary* idx = read_json(dir + "/model.safetensors.index.json");
+  NSDictionary* wm = idx[@"weight_map"];
+  std::map<std::string, int> file_ix;
+  for (NSString* k in wm) {
+    std::string f = [wm[k] UTF8String];
+    if (!file_ix.count(f)) {
+      file_ix[f] = int(shards_.size());
+      Shard s;
+      s.path = dir + "/" + f;
+      shards_.push_back(s);
+    }
+    where_[[k UTF8String]] = file_ix[f];
+  }
+  const size_t page = size_t(getpagesize());
+  for (Shard& s : shards_) {
+    int fd = ::open(s.path.c_str(), O_RDONLY);
+    if (fd < 0) fail("cannot open " + s.path);
+    struct stat st;
+    fstat(fd, &st);
+    s.size = size_t(st.st_size);
+    const size_t len = (s.size + page - 1) / page * page;
+    void* p = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (p == MAP_FAILED) fail("mmap " + s.path);
+    s.base = static_cast<const uint8_t*>(p);
+    uint64_t n;
+    std::memcpy(&n, s.base, 8);
+    s.data = 8 + n;
+    NSData* hd = [NSData dataWithBytesNoCopy:(void*)(s.base + 8) length:n freeWhenDone:NO];
+    NSError* err = nil;
+    s.hdr = [NSJSONSerialization JSONObjectWithData:hd options:0 error:&err];
+    if (!s.hdr) fail("bad header " + s.path);
+    s.buf = [q.dev newBufferWithBytesNoCopy:(void*)s.base length:len options:MTLResourceStorageModeShared
+                                deallocator:nil];
+    if (!s.buf) {  // the OS refused to wrap the mapping: copy (slower load, same result)
+      std::fprintf(stderr, "metal model: no-copy wrap refused for %s, copying\n", s.path.c_str());
+      s.buf = [q.dev newBufferWithBytes:s.base length:s.size options:MTLResourceStorageModeShared];
+      if (!s.buf) fail("buffer for " + s.path);
+    }
+    mapped_ += s.size;
+  }
+}
+
+Tensor Checkpoint::get(const std::string& name) {
+  auto it = where_.find(name);
+  if (it == where_.end()) fail("missing tensor " + name);
+  Shard& s = shards_[it->second];
+  NSDictionary* e = s.hdr[[NSString stringWithUTF8String:name.c_str()]];
+  Tensor t;
+  t.dtype = [e[@"dtype"] UTF8String];
+  for (NSNumber* d in e[@"shape"]) t.shape.push_back([d longLongValue]);
+  NSArray* offs = e[@"data_offsets"];
+  const size_t a = [offs[0] unsignedLongLongValue], b = [offs[1] unsignedLongLongValue];
+  t.bytes = b - a;
+  const size_t off = s.data + a;
+  if (off % 16 == 0) {
+    t.v = {s.buf, off};
+  } else {
+    t.v = q_->alloc(t.bytes);
+    std::memcpy(t.v.host<uint8_t>(), s.base + off, t.bytes);
+  }
+  return t;
+}
+
+View Checkpoint::f32(const std::string& name) {
+  Tensor t = get(name);
+  size_t n = 1;
+  for (int64_t d : t.shape) n *= size_t(d);
+  View out = q_->alloc(n * 4);
+  float* o = out.host<float>();
+  if (t.dtype == "BF16") {
+    const uint16_t* p = t.v.host<uint16_t>();
+    for (size_t i = 0; i < n; ++i) o[i] = bf16_to_f32(p[i]);
+  } else if (t.dtype == "F32") {
+    std::memcpy(o, t.v.host<float>(), n * 4);
+  } else {
+    fail(name + ": unexpected dtype " + t.dtype);
+  }
+  return out;
+}
+
+float Checkpoint::scalar(const std::string& name) {
+  Tensor t = get(name);
+  if (t.dtype == "F32") return *t.v.host<float>();
+  if (t.dtype == "BF16") return bf16_to_f32(*t.v.host<uint16_t>());
+  fail(name + ": unexpected scalar dtype " + t.dtype);
+}
+
+// ---- model --------------------------------------------------------------------------------------
+
+static const char* kPfx = "model.language_model.";
+
+Lin Model::lin(const std::string& prefix) {
+  Lin l;
+  Tensor w = ck_.get(prefix + ".weight");
+  l.w = w.v;
+  l.N = uint32_t(w.shape[0]);
+  if (w.dtype == "U8") {
+    l.fmt = Lin::kNvfp4;
+    l.K = uint32_t(w.shape[1] * 2);
+    l.sc = ck_.get(prefix + ".weight_scale").v;
+    l.scale = ck_.scalar(prefix + ".weight_scale_2");
+  } else if (w.dtype == "F8_E4M3") {
+    l.fmt = Lin::kFp8;
+    l.K = uint32_t(w.shape[1]);
+    l.scale = ck_.scalar(prefix + ".weight_scale");
+  } else if (w.dtype == "BF16") {
+    l.fmt = Lin::kBf16;
+    l.K = uint32_t(w.shape[1]);
+  } else {
+    fail(prefix + ": unsupported weight dtype " + w.dtype);
+  }
+  if (l.K % 256) fail(prefix + ": K not a multiple of 256");
+  return l;
+}
+
+void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
+  q_ = &q;
+  max_ctx_ = max_ctx;
+  C_ = chunk;
+  NSDictionary* cfg = read_json(dir + "/config.json");
+  NSDictionary* tc = cfg[@"text_config"] ? cfg[@"text_config"] : cfg;
+  auto I = [&](NSString* k) { return [tc[k] intValue]; };
+  hidden_ = I(@"hidden_size");
+  ffn_ = I(@"intermediate_size");
+  V_ = I(@"vocab_size");
+  H_ = I(@"num_attention_heads");
+  KV_ = I(@"num_key_value_heads");
+  D_ = I(@"head_dim");
+  Hk_ = I(@"linear_num_key_heads");
+  Hv_ = I(@"linear_num_value_heads");
+  Dk_ = I(@"linear_key_head_dim");
+  Dv_ = I(@"linear_value_head_dim");
+  eps_ = [tc[@"rms_norm_eps"] floatValue];
+  NSDictionary* rp = tc[@"rope_parameters"] ? tc[@"rope_parameters"] : tc;
+  double theta = rp[@"rope_theta"] ? [rp[@"rope_theta"] doubleValue] : 1e7;
+  double prf = rp[@"partial_rotary_factor"] ? [rp[@"partial_rotary_factor"] doubleValue] : 0.25;
+  rot_ = int(D_ * prf);
+  if (D_ != 256 || Dk_ != 128 || hidden_ % 256) fail("kernel shape assumptions (head_dim 256, Dk 128) do not hold");
+  id eos = tc[@"eos_token_id"] ? tc[@"eos_token_id"] : cfg[@"eos_token_id"];
+  if ([eos isKindOfClass:[NSArray class]]) {
+    for (NSNumber* e in eos) eos_ids.push_back([e intValue]);
+  } else if (eos) {
+    eos_ids.push_back([eos intValue]);
+  }
+  // generation_config.json lists every end id (end of text and end of turn); the recipe bans them all
+  if (NSDictionary* gen = [[NSFileManager defaultManager]
+                              fileExistsAtPath:[NSString stringWithUTF8String:(dir + "/generation_config.json").c_str()]]
+                              ? read_json(dir + "/generation_config.json")
+                              : nil) {
+    id ge = gen[@"eos_token_id"];
+    NSArray* gl = [ge isKindOfClass:[NSArray class]] ? ge : (ge ? @[ ge ] : @[]);
+    for (NSNumber* x in gl)
+      if (std::find(eos_ids.begin(), eos_ids.end(), [x intValue]) == eos_ids.end()) eos_ids.push_back([x intValue]);
+  }
+  NSArray* types = tc[@"layer_types"];
+  const int L = I(@"num_hidden_layers");
+
+  ck_.open(q, dir);
+  Tensor emb = ck_.get(std::string(kPfx) + "embed_tokens.weight");
+  if (emb.dtype != "BF16") fail("embedding is not BF16");
+  embed_ = emb.v;
+  final_norm_ = ck_.f32(std::string(kPfx) + "norm.weight");
+  head_ = lin(ck_.has("lm_head.weight") ? "lm_head" : std::string(kPfx) + "embed_tokens");
+
+  layers_.resize(L);
+  for (int i = 0; i < L; ++i) {
+    Layer& Ly = layers_[i];
+    const std::string p = std::string(kPfx) + "layers." + std::to_string(i) + ".";
+    Ly.attn = [types[i] isEqualToString:@"full_attention"];
+    Ly.in_norm = ck_.f32(p + "input_layernorm.weight");
+    Ly.post_norm = ck_.f32(p + "post_attention_layernorm.weight");
+    if (Ly.attn) {
+      const std::string a = p + "self_attn.";
+      Ly.q = lin(a + "q_proj");
+      Ly.k = lin(a + "k_proj");
+      Ly.v = lin(a + "v_proj");
+      Ly.o = lin(a + "o_proj");
+      Ly.q_norm = ck_.f32(a + "q_norm.weight");
+      Ly.k_norm = ck_.f32(a + "k_norm.weight");
+      Ly.kc = q.alloc(size_t(max_ctx) * KV_ * D_ * 2);
+      Ly.vc = q.alloc(size_t(max_ctx) * KV_ * D_ * 2);
+    } else {
+      const std::string a = p + "linear_attn.";
+      Ly.qkv = lin(a + "in_proj_qkv");
+      Ly.z = lin(a + "in_proj_z");
+      Ly.a = lin(a + "in_proj_a");
+      Ly.b = lin(a + "in_proj_b");
+      Ly.out = lin(a + "out_proj");
+      Ly.conv_w = ck_.f32(a + "conv1d.weight");
+      Ly.A_log = ck_.f32(a + "A_log");
+      Ly.dt_bias = ck_.f32(a + "dt_bias");
+      Ly.gnorm = ck_.f32(a + "norm.weight");
+      Ly.conv_state = q.alloc(size_t(3) * Ly.qkv.N * 4);
+      Ly.S = q.alloc(size_t(Hv_) * Dv_ * Dk_ * 4);
+    }
+    Ly.gate = lin(p + "mlp.gate_proj");
+    Ly.up = lin(p + "mlp.up_proj");
+    Ly.down = lin(p + "mlp.down_proj");
+  }
+
+  const size_t C = size_t(C_);
+  const size_t conv_w = size_t(2 * Hk_ * Dk_ + Hv_ * Dv_);
+  ids_ = q.alloc(C * 4);
+  h_ = q.alloc(C * hidden_ * 4);
+  xn_ = q.alloc(C * hidden_ * 4);
+  qkv_ = q.alloc(C * std::max(conv_w, size_t(H_) * 2 * D_) * 4);
+  zb_ = q.alloc(C * Hv_ * Dv_ * 4);
+  ab_ = q.alloc(C * Hv_ * 4);
+  bb_ = q.alloc(C * Hv_ * 4);
+  core_ = q.alloc(C * Hv_ * Dv_ * 4);
+  gated_ = q.alloc(C * std::max(Hv_ * Dv_, H_ * D_) * 4);
+  qg_ = qkv_;  // attention layers reuse the GDN projection buffer
+  kb_ = q.alloc(C * KV_ * D_ * 4);
+  vb_ = q.alloc(C * KV_ * D_ * 4);
+  ob_ = core_;
+  part_ = q.alloc(C * H_ * nchunk_max_ * (2 + D_) * 4);
+  gb_ = q.alloc(C * ffn_ * 4);
+  ub_ = q.alloc(C * ffn_ * 4);
+  logits_ = q.alloc(C * size_t(V_) * 4);
+  // RoPE table in double: inv_freq_i = theta^(-2i/rot), pairs (i, i + rot/2)
+  const int hr = rot_ / 2;
+  cos_ = q.alloc(size_t(max_ctx) * hr * 4);
+  sin_ = q.alloc(size_t(max_ctx) * hr * 4);
+  float* cs = cos_.host<float>();
+  float* sn = sin_.host<float>();
+  for (int p = 0; p < max_ctx; ++p)
+    for (int i = 0; i < hr; ++i) {
+      const double ang = double(p) * std::pow(theta, -2.0 * i / rot_);
+      cs[size_t(p) * hr + i] = float(std::cos(ang));
+      sn[size_t(p) * hr + i] = float(std::sin(ang));
+    }
+}
+
+void Model::reset() {
+  for (Layer& L : layers_) {
+    if (L.attn) continue;
+    std::memset(L.conv_state.host<uint8_t>(), 0, [L.conv_state.buf length]);
+    std::memset(L.S.host<uint8_t>(), 0, [L.S.buf length]);
+  }
+}
+
+struct GemvArgs {
+  uint32_t N, K, ldx, ldy, rows;
+  float scale;
+  uint32_t add;
+};
+
+void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add) {
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  const char* k = l.fmt == Lin::kNvfp4 ? "gemv_nvfp4" : l.fmt == Lin::kFp8 ? "gemv_fp8" : "gemv_bf16";
+  for (int m0 = 0; m0 < T; m0 += 8) {
+    const int rows = std::min(8, T - m0);
+    [e setComputePipelineState:q_->pipe(k, rows == 1 ? 1 : 8)];
+    GemvArgs a{l.N, l.K, uint32_t(ldx), uint32_t(ldy), uint32_t(rows), l.scale, add ? 1u : 0u};
+    View xo = x.at(size_t(m0) * ldx * 4), yo = y.at(size_t(m0) * ldy * 4);
+    if (l.fmt == Lin::kNvfp4) {
+      bind(e, {xo, l.w, l.sc, yo});
+      bind_args(e, 4, a);
+    } else {
+      bind(e, {xo, l.w, yo});
+      bind_args(e, 3, a);
+    }
+    [e dispatchThreadgroups:MTLSizeMake((l.N + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+}
+
+struct NormArgs {
+  uint32_t n, rpt, ldt, ldh, ldo_t, ldo_h;
+  float eps;
+  uint32_t mode;
+  float scale;
+};
+
+void Model::norm(View x, View w, View z, View out, int rows, int n, int rpt, int ldt, int ldh, int ldo_t,
+                 int ldo_h, int mode, float scale) {
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("rmsnorm_rows")];
+  NormArgs a{uint32_t(n), uint32_t(rpt), uint32_t(ldt), uint32_t(ldh), uint32_t(ldo_t), uint32_t(ldo_h), eps_,
+             uint32_t(mode), scale};
+  bind(e, {x, w.empty() ? x : w, z.empty() ? x : z, out});
+  bind_args(e, 4, a);
+  [e dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+struct GdnArgs {
+  uint32_t T, Hk, Hv, Dk, Dv, ldc;
+};
+
+void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
+  const int cw = int(L.qkv.N), vw = Hv_ * Dv_;
+  gemv(L.qkv, xn_, qkv_, T, hidden_, cw, false);
+  gemv(L.z, xn_, zb_, T, hidden_, vw, false);
+  gemv(L.a, xn_, ab_, T, hidden_, Hv_, false);
+  gemv(L.b, xn_, bb_, T, hidden_, Hv_, false);
+  if (dump) {
+    q_->sync();
+    dump(tag + "qkv", qkv_, {T, cw});
+  }
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("gdn_conv")];
+  bind(e, {qkv_, L.conv_state, L.conv_w});
+  uint32_t ca[2] = {uint32_t(cw), uint32_t(T)};
+  [e setBytes:ca length:8 atIndex:3];
+  [e dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [e setComputePipelineState:q_->pipe("gdn_gates")];
+  bind(e, {ab_, bb_, L.A_log, L.dt_bias});
+  uint32_t ga[2] = {uint32_t(Hv_), uint32_t(T)};
+  [e setBytes:ga length:8 atIndex:4];
+  [e dispatchThreads:MTLSizeMake(Hv_ * T, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  if (dump) {
+    q_->sync();
+    dump(tag + "conv", qkv_, {T, cw});
+    dump(tag + "g", ab_, {T, Hv_});
+    dump(tag + "beta", bb_, {T, Hv_});
+    e = q_->encoder();
+  }
+  [e setComputePipelineState:q_->pipe("gdn_recurrent")];
+  bind(e, {qkv_, ab_, bb_, L.S, core_});
+  GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw)};
+  bind_args(e, 5, g);
+  [e dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (dump) {
+    q_->sync();
+    dump(tag + "core", core_, {T, vw});
+    dump(tag + "state", L.S, {Hv_, Dv_, Dk_});
+  }
+  // gated norm: rms over Dv with weight, times silu(z)
+  norm(core_, L.gnorm, zb_, gated_, T * Hv_, Dv_, Hv_, vw, Dv_, vw, Dv_, 1);
+  gemv(L.out, gated_, h_, T, vw, hidden_, true);
+}
+
+struct RopeArgs {
+  uint32_t heads, ldt, ldh, half_rot, pos0;
+};
+struct AttnArgs {
+  uint32_t H, KV, D, ldq, qh, pos0, chunk, nchunks;
+  float scale;
+};
+
+void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::string& tag) {
+  const int qw = H_ * 2 * D_, kw = KV_ * D_;
+  gemv(L.q, xn_, qg_, T, hidden_, qw, false);
+  gemv(L.k, xn_, kb_, T, hidden_, kw, false);
+  gemv(L.v, xn_, vb_, T, hidden_, kw, false);
+  norm(qg_, L.q_norm, View{}, qg_, T * H_, D_, H_, qw, 2 * D_, qw, 2 * D_, 0);
+  norm(kb_, L.k_norm, View{}, kb_, T * KV_, D_, KV_, kw, D_, kw, D_, 0);
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("rope_rows")];
+  RopeArgs rq{uint32_t(H_), uint32_t(qw), uint32_t(2 * D_), uint32_t(rot_ / 2), uint32_t(pos0)};
+  bind(e, {qg_, cos_, sin_});
+  bind_args(e, 3, rq);
+  [e dispatchThreads:MTLSizeMake(rot_ / 2, T * H_, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+  RopeArgs rk{uint32_t(KV_), uint32_t(kw), uint32_t(D_), uint32_t(rot_ / 2), uint32_t(pos0)};
+  bind(e, {kb_, cos_, sin_});
+  bind_args(e, 3, rk);
+  [e dispatchThreads:MTLSizeMake(rot_ / 2, T * KV_, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+  [e setComputePipelineState:q_->pipe("kv_write")];
+  bind(e, {kb_, vb_, L.kc, L.vc});
+  uint32_t kva[2] = {uint32_t(kw), uint32_t(pos0)};
+  [e setBytes:kva length:8 atIndex:4];
+  [e dispatchThreads:MTLSizeMake(kw, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (dump) {
+    q_->sync();
+    dump(tag + "qg", qg_, {T, H_, 2 * D_});
+    dump(tag + "k", kb_, {T, KV_, D_});
+    dump(tag + "v", vb_, {T, KV_, D_});
+    e = q_->encoder();
+  }
+  const int kvlen = pos0 + T;
+  int chunk = std::max(64, (kvlen + nchunk_max_ - 1) / nchunk_max_);
+  chunk = (chunk + 7) / 8 * 8;
+  const int nch = (kvlen + chunk - 1) / chunk;
+  AttnArgs a{uint32_t(H_), uint32_t(KV_), uint32_t(D_), uint32_t(qw), uint32_t(2 * D_), uint32_t(pos0),
+             uint32_t(chunk), uint32_t(nch), 1.0f / std::sqrt(float(D_))};
+  [e setComputePipelineState:q_->pipe("attn_partial")];
+  bind(e, {qg_, L.kc, L.vc, part_});
+  bind_args(e, 4, a);
+  [e dispatchThreadgroups:MTLSizeMake(nch, H_, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [e setComputePipelineState:q_->pipe("attn_combine")];
+  bind(e, {part_, ob_});
+  bind_args(e, 2, a);
+  [e dispatchThreadgroups:MTLSizeMake(H_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (dump) {
+    q_->sync();
+    dump(tag + "attn", ob_, {T, H_ * D_});
+    e = q_->encoder();
+  }
+  [e setComputePipelineState:q_->pipe("sigmoid_gate")];
+  uint32_t hd[4] = {uint32_t(H_), uint32_t(D_), 0, 0};
+  bind(e, {ob_, qg_});
+  [e setBytes:hd length:16 atIndex:2];
+  [e dispatchThreads:MTLSizeMake(H_ * D_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  gemv(L.o, ob_, h_, T, H_ * D_, hidden_, true);
+}
+
+void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const Dump& dump) {
+  if (T > C_) fail("forward: T exceeds the chunk");
+  if (pos0 + T > max_ctx_) fail("forward: context exceeds max_ctx");
+  std::memcpy(ids_.host<uint32_t>(), ids, size_t(T) * 4);
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("embed_bf16")];
+  bind(e, {ids_, embed_, h_});
+  const uint32_t dim = uint32_t(hidden_);
+  [e setBytes:&dim length:4 atIndex:3];
+  [e dispatchThreads:MTLSizeMake(hidden_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (dump) {
+    q_->sync();
+    dump("embed", h_, {T, hidden_});
+  }
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    Layer& L = layers_[i];
+    const bool inner = dump && (i == 0 || i == 3);
+    const std::string tag = "l" + std::to_string(i) + ".";
+    norm(h_, L.in_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0);
+    if (inner) {
+      q_->sync();
+      dump(tag + "in_norm", xn_, {T, hidden_});
+    }
+    if (L.attn) attention(L, T, pos0, inner ? dump : nullptr, tag);
+    else gdn(L, T, inner ? dump : nullptr, tag);
+    norm(h_, L.post_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0);
+    if (inner) {
+      q_->sync();
+      dump(tag + "post_norm", xn_, {T, hidden_});
+    }
+    gemv(L.gate, xn_, gb_, T, hidden_, ffn_, false);
+    gemv(L.up, xn_, ub_, T, hidden_, ffn_, false);
+    e = q_->encoder();
+    [e setComputePipelineState:q_->pipe("silu_mul")];
+    bind(e, {gb_, ub_, gb_});
+    const uint32_t n = uint32_t(T * ffn_);
+    [e setBytes:&n length:4 atIndex:3];
+    [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    gemv(L.down, gb_, h_, T, ffn_, hidden_, true);
+    if (dump) {
+      q_->sync();
+      dump("h" + std::to_string(i), h_, {T, hidden_});
+    }
+  }
+  const int r0 = all_logits ? 0 : T - 1, rows = all_logits ? T : 1;
+  View hr = h_.at(size_t(r0) * hidden_ * 4);
+  norm(hr, final_norm_, View{}, xn_, rows, hidden_, 1, hidden_, 0, hidden_, 0, 0);
+  if (dump) {
+    q_->sync();
+    dump("final_norm", xn_, {rows, hidden_});
+  }
+  gemv(head_, xn_, logits_, rows, hidden_, V_, false);
+  q_->sync();
+}
+
+}  // namespace ragon::metal
