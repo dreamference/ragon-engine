@@ -77,9 +77,14 @@ class Model {
   int vocab() const { return V_; }
   int chunk() const { return C_; }
   std::vector<int> eos_ids;
+  // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head.
+  double prof[4] = {0, 0, 0, 0};
 
  private:
+  // y[T][N] (=|+=) x[T][K] W^T: GEMV kernels for decode and short chunks, tensor-op matmul for T >= mm_min_.
   void gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add);
+  bool use_mm(const Lin& l, int T) const;
+  void attention_mm(Layer& L, int T, int pos0);
   void norm(View x, View w, View z, View out, int rows, int n, int rpt, int ldt, int ldh, int ldo_t, int ldo_h,
             int mode, float scale = 1.0f);
   void gdn(Layer& L, int T, const Dump& dump, const std::string& tag);
@@ -92,10 +97,14 @@ class Model {
   View embed_, final_norm_;
   Lin head_;
   int H_ = 0, KV_ = 0, D_ = 0, Hk_ = 0, Hv_ = 0, Dk_ = 0, Dv_ = 0, hidden_ = 0, ffn_ = 0, V_ = 0, rot_ = 0;
-  int max_ctx_ = 0, C_ = 0, nchunk_max_ = 32;
+  int max_ctx_ = 0, C_ = 0, nchunk_max_ = 32, mm_min_ = 64;
+  bool prof_ = false;
+  size_t wdq_cap_ = 0;
   float eps_ = 1e-6f;
   // activations [C][...] f32
   View ids_, h_, xn_, qkv_, zb_, ab_, bb_, core_, gated_, qg_, kb_, vb_, ob_, part_, gb_, ub_, logits_, cos_, sin_;
+  // prefill matmul scratch: half weights, half activations, f32 product; attention Q, scores, probabilities
+  View wdq_, xh_, mmc_, qb_, S_, P_;
 };
 
 }  // namespace ragon::metal

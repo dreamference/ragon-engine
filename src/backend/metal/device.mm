@@ -19,6 +19,7 @@ void Queue::open() {
   q = [dev newCommandQueue];
   MTLCompileOptions* opts = [MTLCompileOptions new];
   opts.mathMode = MTLMathModeSafe;
+  opts.languageVersion = MTLLanguageVersion4_0;  // tensor ops (MetalPerformancePrimitives) for prefill
   NSError* err = nil;
   lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kMetalKernelsSource] options:opts error:&err];
   if (!lib) die("kernel compile", err);
