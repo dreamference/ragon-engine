@@ -29,6 +29,23 @@ constexpr int kMmaD = 256;
 #ifndef RAGON_HIP_ATTN_OVERLAP_Q8
 #define RAGON_HIP_ATTN_OVERLAP_Q8 1
 #endif
+// RAGON_HIP_ATTN_LAZY (BF16) and RAGON_HIP_ATTN_LAZY_Q8: the online softmax rescales o only when a tile's max passes
+// the running reference by more than 2^kHipAttnSlack in P (so P <= 2^slack, and alpha = 1 on most tiles: the rescale is
+// skipped by wave ballot), in base 2 with the scale folded into one FMA. Off: the exact-max form.
+#ifndef RAGON_HIP_ATTN_LAZY
+#define RAGON_HIP_ATTN_LAZY 1
+#endif
+#ifndef RAGON_HIP_ATTN_LAZY_Q8
+#define RAGON_HIP_ATTN_LAZY_Q8 1
+#endif
+#ifndef RAGON_HIP_ATTN_LAZY_ACC  // BF16 with LAZY: 1 P V straight into o, 0 from zero then added (Q8: always straight)
+#define RAGON_HIP_ATTN_LAZY_ACC 1
+#endif
+#ifndef RAGON_HIP_ATTN_SLACK
+#define RAGON_HIP_ATTN_SLACK 8
+#endif
+constexpr int kHipAttnSlack = RAGON_HIP_ATTN_SLACK;  // log2 of P's bound; Q8 shifts its P scales down by as much
+static_assert(kHipAttnSlack >= 0 && kHipAttnSlack <= 12, "Q8 shifts its P scales down by the slack: past 12, small P leave FP16 normals");
 constexpr int kHipAttnProd = RAGON_HIP_ATTN_OVERLAP ? 64 : 0;
 constexpr int kHipAttnProdQ8 = RAGON_HIP_ATTN_OVERLAP_Q8 ? 64 : 0;  // Q8: producers prefetch the sealed (mirror) tiles
 // A block's threads: two a query row, plus the producer waves on the BF16 kernels.
@@ -569,13 +586,17 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // its P goes into the WMMA as p vs 2^8 2^S, a raw tile's as p 2^S, so o is held in units of 2^-S. S (the launch's,
   // so a row's bits do not depend on its block) puts a code tile's largest P in [2^13, 2^14): FP16's range, normal down
   // to p ~ 2^-27. ma and la are in true units; the partials leave in true units (and CASC 2 takes them back), exactly.
+  // LZ (the lazy rescale): P reaches 2^kHipAttnSlack, so S drops by as much (normal down to p ~ 2^(slack - 27)).
+  constexpr bool LZ = Q8 ? RAGON_HIP_ATTN_LAZY_Q8 != 0 : RAGON_HIP_ATTN_LAZY != 0;
+  constexpr int lzs = LZ ? kHipAttnSlack : 0;
+  constexpr bool LZA = LZ && (Q8 || RAGON_HIP_ATTN_LAZY_ACC != 0);  // P V accumulates straight into o
   [[maybe_unused]] float kscale = 1.f, pcode = 1.f, praw = 1.f, ounit = 1.f;
   [[maybe_unused]] bool codes = true;
   if constexpr (Q8) {
     int e = 0;
     (void)frexpf(fmaxf(q8.vs * 256.f, 1.f), &e);
-    praw = ldexpf(1.f, 14 - e);
-    ounit = ldexpf(1.f, e - 14);
+    praw = ldexpf(1.f, 14 - lzs - e);
+    ounit = ldexpf(1.f, e + lzs - 14);
     pcode = q8.vs * 256.f * praw;
     kscale = q8.ks * 256.f;
   }
@@ -646,16 +667,35 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       }
     ta = fmaxf(ta, attn_xswapf(ta));
     const float ksc = Q8 && codes ? kscale : 1.f, psc = codes ? pcode : praw;  // Q8's scales (above)
-    const float na = Q8 ? fmaxf(ma, ta * ksc) : fmaxf(ma, ta);
-    const float alpha = na == -INFINITY ? 1.f : __expf(ma - na);
-    float sa = 0.f;
+    float na, alpha, sa = 0.f;
+    bool up = false;  // LZ: the reference moves (o rescales) on this row
+    if constexpr (LZ) {
+      // ma is a reference, not the max: it moves to the tile's max only when that passes it by more than 2^slack in P
+      // (always from -inf). P = 2^(s ksc log2e - ma log2e), masked keys 2^-inf = 0; ma stays in true units (partials).
+      constexpr float l2e = 1.4426950408889634f, slack = kHipAttnSlack * 0.6931471805599453f;
+      const float tk = Q8 ? ta * ksc : ta;
+      up = tk > ma + slack;
+      na = up ? tk : ma;
+      alpha = up ? __builtin_amdgcn_exp2f((ma - na) * l2e) : 1.f;
+      const float nl = (na == -INFINITY ? 0.f : na) * l2e, c2 = ksc * l2e;
 #pragma unroll
-    for (int n = 0; n < KT; ++n)
+      for (int n = 0; n < KT; ++n)
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        sc[n][j] = sc[n][j] == -INFINITY ? 0.f : __expf(Q8 ? __builtin_fmaf(sc[n][j], ksc, -na) : sc[n][j] - na);
-        sa += sc[n][j];
-      }
+        for (int j = 0; j < 8; ++j) {
+          sc[n][j] = __builtin_amdgcn_exp2f(__builtin_fmaf(sc[n][j], c2, -nl));
+          sa += sc[n][j];
+        }
+    } else {
+      na = Q8 ? fmaxf(ma, ta * ksc) : fmaxf(ma, ta);
+      alpha = na == -INFINITY ? 1.f : __expf(ma - na);
+#pragma unroll
+      for (int n = 0; n < KT; ++n)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          sc[n][j] = sc[n][j] == -INFINITY ? 0.f : __expf(Q8 ? __builtin_fmaf(sc[n][j], ksc, -na) : sc[n][j] - na);
+          sa += sc[n][j];
+        }
+    }
     sa += attn_xswapf(sa);  // even keys' sum + odd keys' sum, the same float on both lanes
     if (ca) {
       la = la * alpha + sa;
@@ -684,9 +724,20 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     // The tile's P V apart (from zero), then o = o alpha + P V on the rows that take the tile; the others keep o bit
     // for bit. gfx11's WMMA is not exact for zero products (a zero P times a negative V moves the sum down an ulp), so a
     // row's o never meets products it does not take, and tile_rows zeroes the V its masked keys would multiply.
+    // LZ: o = o alpha (only when a stored row of the wave moved its reference: ballot), then P V straight into o; a
+    // wave with a stored row that does not take the tile writes back only the rows that do (the same chain for them).
+    bool mixed = false;
+    if constexpr (LZ) {
+      if (__builtin_amdgcn_ballot_w32(va && ca && up) != 0)
+#pragma unroll
+        for (int i = 0; i < D / 16; ++i)
+#pragma unroll
+          for (int j = 0; j < 8; ++j) o[i][j] *= ca && up ? alpha : 1.f;
+      if constexpr (LZA) mixed = __builtin_amdgcn_ballot_w32(va && !ca) != 0;
+    }
 #pragma unroll
     for (int i = 0; i < D / 16; ++i) {
-      attn_v8f t = attn_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+      attn_v8f t = LZA ? o[i] : attn_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int n = 0; n < KT; ++n)
         if constexpr (Q8)
@@ -694,9 +745,18 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
                                                          __builtin_bit_cast(attn_v16h, pb[n]), t);
         else
           t = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(attn_lds16(sm.vt + (16 * i + col) * VS + 16 * n), pb[n], t);
-      if (ca)
+      if constexpr (LZA) {
+        if (mixed)
+#pragma unroll
+          for (int j = 0; j < 8; ++j) t[j] = ca ? t[j] : o[i][j];
+        o[i] = t;
+      } else if (LZ && ca) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[i][j] += t[j];
+      } else if (ca) {
 #pragma unroll
         for (int j = 0; j < 8; ++j) o[i][j] = __builtin_fmaf(o[i][j], alpha, t[j]);
+      }
     }
   };
   // A tile in LDS for the block's rows, `ca` the lane's flag. A row that sees every key the tile holds (to its last
