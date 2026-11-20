@@ -39,6 +39,8 @@ Log& log() {
 struct Pair {
   hipEvent_t a, b;
 };
+// The open profiler ranges of this thread (trace.hpp): a timed launch is logged under "<innermost range>/<name>".
+thread_local std::vector<const char*> ranges;
 
 }  // namespace
 
@@ -48,6 +50,14 @@ bool launch_log_enabled() {
     return e && std::atoi(e) != 0;
   }();
   return on;
+}
+
+void launch_log_range_push(const char* name) {
+  if (launch_log_enabled()) ranges.push_back(name);
+}
+
+void launch_log_range_pop() {
+  if (launch_log_enabled() && !ranges.empty()) ranges.pop_back();
 }
 
 void* launch_log_begin(gpu::Stream s) {
@@ -68,8 +78,9 @@ void launch_log_end(void* h, const char* what, gpu::Stream s) {
   (void)hipEventElapsedTime(&ms, p->a, p->b);
   (void)hipEventDestroy(p->a), (void)hipEventDestroy(p->b);
   delete p;
+  const std::string key = ranges.empty() ? std::string(what) : std::string(ranges.back()) + "/" + what;
   std::lock_guard<std::mutex> g(log().mu);
-  Entry& e = log().by_name[what];
+  Entry& e = log().by_name[key];
   e.max_ms = std::max(e.max_ms, ms), e.total_ms += ms, ++e.n;
 }
 
