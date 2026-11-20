@@ -26,9 +26,13 @@ constexpr int kMmaD = 256;
 #ifndef RAGON_HIP_ATTN_ABL
 #define RAGON_HIP_ATTN_ABL 0
 #endif
+#ifndef RAGON_HIP_ATTN_OVERLAP_Q8
+#define RAGON_HIP_ATTN_OVERLAP_Q8 1
+#endif
 constexpr int kHipAttnProd = RAGON_HIP_ATTN_OVERLAP ? 64 : 0;
+constexpr int kHipAttnProdQ8 = RAGON_HIP_ATTN_OVERLAP_Q8 ? 64 : 0;  // Q8: producers prefetch the sealed (mirror) tiles
 // A block's threads: two a query row, plus the producer waves on the BF16 kernels.
-constexpr int attn_block_threads(int rows, bool q8) { return rows * 2 + (q8 ? 0 : kHipAttnProd); }
+constexpr int attn_block_threads(int rows, bool q8) { return rows * 2 + (q8 ? kHipAttnProdQ8 : kHipAttnProd); }
 constexpr int kHipQS = kMmaD + 8;  // padded row stride (bf16) of the Q and K tiles in LDS: conflict-free 32-byte reads
 // The LDS of a block is static (attention_mma_body's own arrays): the launches pass no dynamic shared memory.
 constexpr size_t mma_smem(int, int) { return 0; }
@@ -385,6 +389,80 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
   else convert(AttnFix<false>{});
 }
 
+// attn_load_tile_f8 split for the producer waves (NT threads, t their index): load() puts the codes in registers,
+// store() converts them into LDS: the same bytes as attn_load_tile_f8.
+template <int ROWS, int TK, int NT>
+struct AttnF8Pf {
+  static constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS;
+  static constexpr int NK = TK * (D / 16), NV = (TK / 4) * (D / 16), IK = (NK + NT - 1) / NT, IV = (NV + NT - 1) / NT;
+  static constexpr int KS = NT / (D / 16), VC = NT / (TK / 4);
+  static_assert(NT % (D / 16) == 0 && NT % (TK / 4) == 0, "a thread's K row and V key quad are fixed");
+  uint4 wk[IK], wv[IV][4];
+  __device__ __forceinline__ void load(const KvQ8& q8, int k0, int kvh, size_t hs, size_t ps,
+                                       const uint64_t* __restrict__ pages, int t) {
+    const size_t base = kv_off(pages, kvh, k0, hs, ps);
+    const uint32_t ps32 = static_cast<uint32_t>(ps);
+    const uint32_t koff = (t / (D / 16)) * ps32 + 16 * (t % (D / 16)), voff = 4 * (t % (TK / 4)) * ps32 + 16 * (t / (TK / 4));
+    const auto* k8 = q8.k8 + base;
+    const auto* v8 = q8.v8 + base;
+#pragma unroll
+    for (int it = 0; it < IK; ++it) {
+      wk[it] = make_uint4(0, 0, 0, 0);
+      if (t + it * NT < NK) wk[it] = *reinterpret_cast<const uint4*>(k8 + static_cast<size_t>(it * KS) * ps + koff);
+    }
+#pragma unroll
+    for (int it = 0; it < IV; ++it)
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        wv[it][u] = make_uint4(0, 0, 0, 0);
+        if (t + it * NT < NV) wv[it][u] = *reinterpret_cast<const uint4*>(v8 + static_cast<size_t>(u) * ps + 16 * VC * it + voff);
+      }
+  }
+  __device__ __forceinline__ void store(AttnLds<ROWS, TK>& sm, int t) const {
+  // Whether any of the thread's codes is a NaN code: then its pairs go through attn_f16_nan (a branch: rare).
+  uint32_t nan = 0;
+#pragma unroll
+  for (int it = 0; it < IK; ++it) nan |= attn_e4m3_nan(wk[it].x) | attn_e4m3_nan(wk[it].y) | attn_e4m3_nan(wk[it].z) |
+                                         attn_e4m3_nan(wk[it].w);
+#pragma unroll
+  for (int it = 0; it < IV; ++it)
+#pragma unroll
+    for (int u = 0; u < 4; ++u)
+      nan |= attn_e4m3_nan(wv[it][u].x) | attn_e4m3_nan(wv[it][u].y) | attn_e4m3_nan(wv[it][u].z) |
+             attn_e4m3_nan(wv[it][u].w);
+  auto convert = [&](auto fix) {
+    constexpr bool FIX = decltype(fix)::value;
+    auto f = [](uint32_t h) { return FIX ? attn_f16_nan(h) : h; };
+#pragma unroll
+    for (int it = 0; it < IK; ++it) {
+      const int i = t + it * NT, j = i / (D / 16), c = i % (D / 16);
+      if (i >= NK) continue;
+      const uint4 w = wk[it];
+      uint4* dst = reinterpret_cast<uint4*>(sm.k + j * kHipQS + 16 * c);
+      dst[0] = make_uint4(f(attn_e4m3_f16_lo(w.x)), f(attn_e4m3_f16_hi(w.x)), f(attn_e4m3_f16_lo(w.y)),
+                          f(attn_e4m3_f16_hi(w.y)));
+      dst[1] = make_uint4(f(attn_e4m3_f16_lo(w.z)), f(attn_e4m3_f16_hi(w.z)), f(attn_e4m3_f16_lo(w.w)),
+                          f(attn_e4m3_f16_hi(w.w)));
+    }
+#pragma unroll
+    for (int it = 0; it < IV; ++it) {
+      const int i = t + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
+      if (i >= NV) continue;
+      const uint4* w = wv[it];
+#pragma unroll
+      for (int e = 0; e < 16; ++e) {
+        auto word = [&](const uint4& x) { return e < 4 ? x.x : e < 8 ? x.y : e < 12 ? x.z : x.w; };
+        const uint2 o = make_uint2(f(attn_e4m3_pair(word(w[0]), word(w[1]), e & 3)),
+                                   f(attn_e4m3_pair(word(w[2]), word(w[3]), e & 3)));
+        *reinterpret_cast<uint2*>(sm.vt + (16 * c + e) * VS + 4 * jq) = o;
+      }
+    }
+  };
+    if (nan & kE4m3Nan) convert(AttnFix<true>{});
+    else convert(AttnFix<false>{});
+  }
+};
+
 // The staged BF16 tile in FP16, in place, for the Q8 kernels: a raw tile (attn_bf16_f16; K in the dim order of
 // attn_e4m3_f16_lo/hi, V^T as it is).
 template <int ROWS, int TK>
@@ -661,13 +739,13 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   // false, rnd true) and every row's position past its end, so this is one tile_compute(k0, ca && Pa > k0). It runs
   // through the rounded branch without the rounding: one compute site less in the kernel (with the separate site the
   // compiler spilled the O accumulators in the tile loop).
-  auto tile_q8 = [&](int k0, bool ca, bool f8, auto&& reload) {
+  auto tile_q8 = [&](int k0, bool ca, bool f8, auto&& reload, auto act) {
     const bool raw = !f8 && k0 >= minP, rnd = f8 || k0 < maxP;
     if (raw) {
       attn_f16_tile<ROWS, TK>(sm);
       __syncthreads();
       codes = false;
-      tile_rows(k0, ca && Pa <= k0, true, AttnFix<true>{});
+      tile_rows(k0, ca && Pa <= k0, true, act);
     }
     if (rnd) {
       codes = true;
@@ -680,7 +758,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         attn_code_tile<ROWS, TK>(sm, q8);
         __syncthreads();
       }
-      tile_rows(k0, ca && Pa > k0, false, AttnFix<true>{});
+      tile_rows(k0, ca && Pa > k0, false, act);
     }
   };
   const int kctx = td ? min(khi, klo + max(0, (pos0 - klo) / TK) * TK) : khi;
@@ -699,10 +777,10 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
           return kv_off(pages, kvh, src, hs, ps);
         };
         __syncthreads();
-        if (Q8 || CQ || kHipAttnProd == 0 || tid < ROWS * 2) attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src);
+        if constexpr (decltype(act)::value) attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src);
         __syncthreads();
         const bool cv = va && td->var[ra / G] == v;
-        if constexpr (Q8) tile_q8(k0, cv, false, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); });
+        if constexpr (Q8) tile_q8(k0, cv, false, [] {}, act);
         else tile_rows(k0, cv, true, act);
       }
     }
@@ -730,6 +808,33 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       __syncthreads();  // the producers stored tile k0
       if (RAGON_HIP_ATTN_ABL != 1) tile_rows(k0, true, true, AttnFix<true>{});
     }
+  } else if constexpr (Q8 && !CQ && kHipAttnProdQ8 > 0) {
+    if (tid >= ROWS * 2) {  // a producer wave: the next sealed tile's codes into registers while the rows compute
+      const int t = tid - ROWS * 2;
+      AttnF8Pf<ROWS, TK, kHipAttnProdQ8> pf;
+      bool nf = kfirst < kctx && sealed_tile(kfirst, kctx);
+      if (RAGON_HIP_ATTN_ABL != 2 && nf) pf.load(q8, kfirst, kvh, hs, ps, pages, t);
+      for (int k0 = kfirst; k0 < kctx; k0 += TK) {
+        const bool f8 = nf;
+        __syncthreads();  // the previous tile is consumed
+        if (RAGON_HIP_ATTN_ABL != 2 && f8) pf.store(sm, t);
+        __syncthreads();
+        nf = k0 + TK < kctx && sealed_tile(k0 + TK, kctx);
+        if (RAGON_HIP_ATTN_ABL != 2 && nf) pf.load(q8, k0 + TK, kvh, hs, ps, pages, t);
+        if (RAGON_HIP_ATTN_ABL != 1) tile_q8(k0, true, f8, [] {}, AttnFix<false>{});
+      }
+      tree_tail(AttnFix<false>{});
+      return;
+    }
+    for (int k0 = kfirst; k0 < kctx; k0 += TK) {
+      const size_t kbase = kv_off(pages, kvh, k0, hs, ps);
+      __syncthreads();
+      const bool f8 = sealed_tile(k0, kctx);
+      if (RAGON_HIP_ATTN_ABL != 2 && !f8) attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps);
+      __syncthreads();  // the producers stored a sealed tile k0
+      if (RAGON_HIP_ATTN_ABL == 1) continue;
+      tile_q8(k0, true, f8, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); }, AttnFix<true>{});
+    }
   } else {
   for (int k0 = kfirst; k0 < kctx; k0 += TK) {
     // A tile never crosses a page (TK divides kKvPageTokens): one page-table read a tile, every key base + j * ps (the
@@ -745,7 +850,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     __syncthreads();
     if (RAGON_HIP_ATTN_ABL == 1) continue;
     if constexpr (Q8) {
-      tile_q8(k0, true, f8, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); });
+      tile_q8(k0, true, f8, [&] { attn_load_run<ROWS, TK>(sm, kcache, vcache, k0, khi, kbase, ps); }, AttnFix<true>{});
     } else {
       tile_rows(k0, true, true, AttnFix<true>{});
     }
@@ -768,7 +873,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src);
         __syncthreads();
         const bool cv = va && td->var[ra / G] == v;
-        if constexpr (Q8) tile_q8(k0, cv, false, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); });
+        if constexpr (Q8) tile_q8(k0, cv, false, [&] { attn_load_tile<ROWS, TK>(sm, kcache, vcache, k0, khi, tree_src); }, AttnFix<true>{});
         else tile_rows(k0, cv, true, AttnFix<true>{});
       }
     }
