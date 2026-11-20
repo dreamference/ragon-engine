@@ -6,6 +6,9 @@
 // and pages; a graph's device position; a tree verify whose rows straddle a unit). attention_rows_seqs and the cascade
 // with a KvQ8 against attention_rows per sequence. M2: the same rows with the E4M3 page mirror (kv_seal) read for the
 // tiles every row of a block takes rounded, all pages or every other one sealed. Exits 0 when everything is identical.
+// HIP: the Q8 kernels compute on FP16 tiles (attention_body_hip.cuh), so there the rows are compared with the plain
+// kernel within a tolerance R(v) itself misses, and byte for byte with each other (mirror and rounding in place); the
+// FP16 converts are checked against kv_q8_code_float on all 256 codes, and the FP16 WMMA on subnormal operands.
 #include "gpu_test.hpp"
 
 #include <algorithm>
@@ -79,6 +82,59 @@ __global__ void idem_kernel(const ragon::gpu::bf16x2* v, int n, float s, float i
   if (*reinterpret_cast<const unsigned*>(&r1) != *reinterpret_cast<const unsigned*>(&r2)) atomicAdd(bad, 1);
 }
 
+#if defined(RAGON_BACKEND_HIP)
+// ---- HIP: the codes in FP16 ----
+__device__ float f16_value(uint32_t h) { return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(h))); }
+// Code c at every byte of a word (with three other codes), through attn_e4m3_f16_lo/hi and attn_e4m3_pair, the NaN
+// fix applied as the loader applies it: each half's value times 2^8 is kv_q8_code_float(code) (NaN for NaN), and its
+// value times s 2^8 (the folded scale) is float(code) s, at both scales.
+__global__ void f16_codes_kernel(float ks, float vs, int* bad) {
+  const uint32_t c = threadIdx.x, b[4] = {c, c ^ 0x55u, c ^ 0xaau, c ^ 0xffu};
+  const uint32_t q = b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24), r = q ^ 0x3c3c3c3cu;
+  const bool nan = (k::attn_e4m3_nan(q) & k::kE4m3Nan) != 0, nanr = (k::attn_e4m3_nan(r) & k::kE4m3Nan) != 0;
+  auto fix = [](uint32_t h, bool f) { return f ? k::attn_f16_nan(h) : h; };
+  auto check = [&](uint32_t h, uint32_t code) {
+    const float v = f16_value(h), want = k::kv_q8_code_float(code);
+    if ((code & 0x7fu) == 0x7fu) {
+      if (!(v != v)) atomicAdd(bad, 1);
+      return;
+    }
+    if (v * 256.f != want) atomicAdd(bad, 1);
+    for (float s : {ks, vs})
+      if (v * (s * 256.f) != want * s) atomicAdd(bad, 1);
+  };
+  const uint32_t lo = fix(k::attn_e4m3_f16_lo(q), nan), hi = fix(k::attn_e4m3_f16_hi(q), nan);
+  check(lo & 0xffffu, b[0]);
+  check(lo >> 16, b[2]);
+  check(hi & 0xffffu, b[1]);
+  check(hi >> 16, b[3]);
+  for (uint32_t j = 0; j < 4; ++j) {
+    const uint32_t v = fix(k::attn_e4m3_pair(q, r, j), nan || nanr);
+    check(v & 0xffffu, (q >> (8 * j)) & 0xffu);
+    check(v >> 16, (r >> (8 * j)) & 0xffu);
+  }
+  // A word without NaN codes is flagged clean, and attn_f16_nan leaves its pairs as they are.
+  const uint32_t clean = q & 0x7e7e7e7eu;
+  if ((k::attn_e4m3_nan(clean) & k::kE4m3Nan) != 0) atomicAdd(bad, 1);
+  if (k::attn_f16_nan(k::attn_e4m3_f16_lo(clean)) != k::attn_e4m3_f16_lo(clean)) atomicAdd(bad, 1);
+  if (k::attn_f16_nan(k::attn_e4m3_f16_hi(clean)) != k::attn_e4m3_f16_hi(clean)) atomicAdd(bad, 1);
+}
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
+typedef float v8f __attribute__((ext_vector_type(8)));
+// The FP16 WMMA on the codes' subnormals (E4M3's subnormals / 2^8 are FP16 subnormals): A all a (the bits), B all 1,
+// so each of D's values is 16 a, exact; out[0] = that value of lane 0.
+__global__ void f16_wmma_kernel(uint32_t a, float* out) {
+  v16h x, y;
+  for (int i = 0; i < 16; ++i) {
+    x[i] = __builtin_bit_cast(_Float16, static_cast<unsigned short>(a));
+    y[i] = static_cast<_Float16>(1.f);
+  }
+  const v8f z = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const v8f d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(x, y, z);
+  if (threadIdx.x == 0) out[0] = d[0];
+}
+#endif
+
 // ---- a cache ----
 // One layer's KV, flat ([Hkv][max_ctx][D]) or in pages of a pool (table: element offsets, kv_off's addressing).
 struct Cache {
@@ -149,8 +205,16 @@ Cache make_cache(int max_ctx, bool paged, k::KvQ8* scales) {
 
 // The rows' output under q8, and the reference: per row, the plain kernel over the cache with the keys that row reads
 // rounded (committed keys below its unit; with a tree, its path's rows whose positions are below it) rounded first.
+#if defined(RAGON_BACKEND_HIP)
+// HIP's tolerance (the kernels compute in FP16 there, the reference in BF16): over the rows that read rounded keys,
+// the RMS distance to the reference at most a quarter, and the largest at most half, of the reference's own distance
+// to the plain kernel over the unrounded cache (R's effect); a row that reads none within 2^-6 of its largest value (BF16's P and Q in the reference: ~2^-9 each).
+// worst_*: the largest ratios seen (the report prints them).
+double worst_rms = 0.0, worst_max = 0.0, worst_raw = 0.0;
+#endif
 bool rows_case(const Cache& c, const float* dq, int P, int M, const k::KvQ8& q8, float* scratch, float* out,
-               const k::TreeDesc* htd = nullptr, const k::TreeDesc* dtd = nullptr, bool graph = false) {
+               const k::TreeDesc* htd = nullptr, const k::TreeDesc* dtd = nullptr, bool graph = false,
+               std::vector<float>* keep = nullptr) {
   layout(c);
   const size_t rowf = size_t(Hq) * D, n = size_t(M) * rowf;
   int* dpos = graph ? upload(std::vector<int>{P}) : nullptr;
@@ -159,7 +223,15 @@ bool rows_case(const Cache& c, const float* dq, int P, int M, const k::KvQ8& q8,
   restore(c);
   k::attention_rows(dq, c.k, c.v, pos, M, Hq, Hkv, D, scratch, out, nullptr, fixed, dtd, c.table, q8);
   const std::vector<float> got = download(out, n);
+  if (keep) *keep = got;
   bool ok = cuda_ok();
+#if defined(RAGON_BACKEND_HIP)
+  restore(c);
+  ragon::test::fill(out, 0, n * 4);
+  k::attention_rows(dq, c.k, c.v, pos, M, Hq, Hkv, D, scratch, out, nullptr, fixed, dtd, c.table);
+  const std::vector<float> plain = download(out, n);
+  double e2 = 0.0, d2 = 0.0, emax = 0.0, dmax = 0.0;
+#endif
   // Rows grouped by their unit: one reference launch per unit.
   std::vector<int> units;
   for (int m = 0; m < M; ++m) units.push_back((P + (htd ? htd->depth[m] : m)) & ~31);
@@ -180,12 +252,45 @@ bool rows_case(const Cache& c, const float* dq, int P, int M, const k::KvQ8& q8,
     k::attention_rows(dq, c.k, c.v, pos, M, Hq, Hkv, D, scratch, out, nullptr, fixed, dtd, c.table);
     const std::vector<float> ref = download(out, n);
     ok &= cuda_ok();
-    for (int m = 0; m < M; ++m)
-      if (units[m] == U && std::memcmp(&got[m * rowf], &ref[m * rowf], rowf * 4) != 0) {
+    for (int m = 0; m < M; ++m) {
+      if (units[m] != U) continue;
+#if defined(RAGON_BACKEND_HIP)
+      double mx = 0.0, em = 0.0;
+      for (size_t i = m * rowf; i < (m + 1) * rowf; ++i) {
+        const double e = double(got[i]) - ref[i], d = double(ref[i]) - plain[i];
+        mx = std::max(mx, std::fabs(double(ref[i])));
+        em = std::max(em, std::isfinite(e) ? std::fabs(e) : 1e30);
+        if (U > 0) e2 += e * e, d2 += d * d, dmax = std::max(dmax, std::fabs(d));
+      }
+      if (U > 0) {
+        emax = std::max(emax, em);
+        continue;
+      }
+      const double rel = em / std::max(mx, 1e-30);
+      worst_raw = std::max(worst_raw, rel);
+      if (rel > 1.0 / 64) {
+        if (ok) std::printf("  P %d M %d: row %d (unit 0) off by %.3e of its largest\n", P, M, m, rel);
+        ok = false;
+      }
+#else
+      if (std::memcmp(&got[m * rowf], &ref[m * rowf], rowf * 4) != 0) {
         if (ok) std::printf("  P %d M %d: row %d (unit %d) differs\n", P, M, m, U);
         ok = false;
       }
+#endif
+    }
   }
+#if defined(RAGON_BACKEND_HIP)
+  if (d2 > 0.0) {
+    const double r = std::sqrt(e2 / d2), x = emax / dmax;
+    worst_rms = std::max(worst_rms, r);
+    worst_max = std::max(worst_max, x);
+    if (r > 0.25 || x > 0.5) {
+      if (ok) std::printf("  P %d M %d: distance RMS %.3f, largest %.3f of R's effect\n", P, M, r, x);
+      ok = false;
+    }
+  }
+#endif
   restore(c);
   if (dpos) ragon::test::free_bytes(dpos);
   return ok;
@@ -221,6 +326,28 @@ int main() {
     }
     report("R(R(v)) == R(v) for 2M random values at five scales and three spreads (saturation included)", ok);
   }
+#if defined(RAGON_BACKEND_HIP)
+  {
+    bool ok = true;
+    for (float s : {1e-3f, 0.0123f, 0.37f, 1.f, 3.3f, 17.5f}) {
+      ragon::test::fill(bad, 0, 4);
+      f16_codes_kernel<<<1, 256>>>(s, 0.7f * s, bad);
+      ok &= download(bad, 1)[0] == 0 && cuda_ok();
+    }
+    report("all 256 E4M3 codes at every byte through the FP16 converts: code/2^8 exact, NaN as NaN, both scales folded", ok);
+    float* dw = upload(std::vector<float>{0.f});
+    bool okw = true;
+    for (uint32_t a : {0x0001u, 0x0080u, 0x0300u, 0x3c00u}) {  // 2^-24, 2^-17, the largest subnormal code, 1
+      f16_wmma_kernel<<<1, 32>>>(a, dw);
+      const float want = 16.f * static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(a)));
+      const float got = download(dw, 1)[0];
+      if (got != want) std::printf("  FP16 WMMA on 0x%04x: %.9g, want %.9g\n", a, got, want);
+      okw &= cuda_ok() && got == want;
+    }
+    report("the FP16 WMMA keeps subnormal operands (E4M3 subnormals / 2^8)", okw);
+    ragon::test::free_bytes(dw);
+  }
+#endif
 
   const int kMaxCtx = 8192 + 64;
   k::KvQ8 q8;
@@ -301,13 +428,32 @@ int main() {
       (void)ragon::test::sync_error();
       for (int pf : {0, 2}) {
         k::set_attention_prefetch(pf);
-        bool ok = cuda_ok();
+        bool ok = cuda_ok(), same = true;
         for (int ctx : {1, 33, 64, 65, 100, 129, 4095, 4096, 4097, 4127, 8192})
-          for (int M : {1, 5, 16, 40})
-            if (ctx >= M) ok &= rows_case(paged, dq, ctx - M, M, m8, scratch, out);
+          for (int M : {1, 5, 16, 40}) {
+            if (ctx < M) continue;
+#if defined(RAGON_BACKEND_HIP)
+            // On HIP the mirror's tiles and the tiles rounded in place are the same FP16 values: the same bytes out.
+            std::vector<float> a, b;
+            ok &= rows_case(paged, dq, ctx - M, M, m8, scratch, out, nullptr, nullptr, false, &a);
+            ok &= rows_case(paged, dq, ctx - M, M, q8, scratch, out, nullptr, nullptr, false, &b);
+            if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
+              if (same) std::printf("  ctx %d M %d: the mirror's rows differ from the rows rounded in place\n", ctx, M);
+              same = false;
+            }
+#else
+            ok &= rows_case(paged, dq, ctx - M, M, m8, scratch, out);
+#endif
+          }
         char what[160];
         std::snprintf(what, sizeof what, "attention_rows with the E4M3 mirror, %s pages sealed, prefetch %d", pass ? "all" : "odd", pf);
         report(what, ok);
+#if defined(RAGON_BACKEND_HIP)
+        std::snprintf(what, sizeof what, "  the same bytes as the tiles rounded in place (%s sealed, prefetch %d)", pass ? "all" : "odd", pf);
+        report(what, same);
+#else
+        (void)same;
+#endif
       }
     }
     k::set_attention_prefetch(2);
@@ -403,6 +549,10 @@ int main() {
     const std::vector<float> b = download(out, n);
     report("a KvQ8 with no scale: the BF16 path", cuda_ok() && std::memcmp(a.data(), b.data(), n * 4) == 0);
   }
+#if defined(RAGON_BACKEND_HIP)
+  std::printf("HIP tolerance: worst RMS %.4f (bar 0.25) and largest %.4f (bar 0.5) of R's effect; rows reading no "
+              "rounded key: worst %.3e of the row's largest (bar 2^-6)\n", worst_rms, worst_max, worst_raw);
+#endif
   std::printf("%s\n", failures ? "FAILED" : "all identical");
   return failures ? 1 : 0;
 }

@@ -82,6 +82,48 @@ __device__ __forceinline__ gpu::bf16x2 kv_q8_round2(gpu::bf16x2 v, float s, floa
   return attn_bf16x2_of(kv_q8_round2_bits(b, s, inv));
 }
 
+// ---- The Q8 kernels' tiles in FP16 (their WMMA runs on FP16 operands; the BF16 kernels' code is untouched) ----
+// A code's FP16 is its bits moved into place, the value float(e) / 2^8, exact (E4M3's subnormals become FP16
+// subnormals). The 2^8 and the scales are not applied to the tile: the K side goes into the scores' scale (the
+// softmax's exp argument), the V side into P (see attention_mma_body). Q is FP16 too, in K's dim order.
+typedef _Float16 attn_v16h __attribute__((ext_vector_type(16)));
+__device__ __forceinline__ attn_v16h attn_lds16h(const gpu::bf16* p) { return __builtin_bit_cast(attn_v16h, attn_lds16(p)); }
+// A word's four codes (low byte first) as two FP16 pairs (low half first): lo holds codes 0 and 2, hi codes 1 and 3.
+// So a K row lies in LDS as dims d0, d2, d1, d3 of every four, and the queries are staged in that order.
+__device__ __forceinline__ uint32_t attn_e4m3_f16_lo(uint32_t q) {
+  return ((q << 8) & 0x80008000u) | ((q << 7) & 0x3f803f80u);
+}
+__device__ __forceinline__ uint32_t attn_e4m3_f16_hi(uint32_t q) {
+  return (q & 0x80008000u) | ((q >> 1) & 0x3f803f80u);
+}
+// The FP16 pair of byte b of x (low half) and byte b of y: v_perm puts them at bytes 1 and 3 (selector values 0-3 pick
+// the second operand's bytes, 4-7 the first's, 12 a zero), attn_e4m3_f16_hi reads those. V^T's four keys a dim.
+__device__ __forceinline__ uint32_t attn_e4m3_pair(uint32_t x, uint32_t y, uint32_t b) {
+  return attn_e4m3_f16_hi(__builtin_amdgcn_perm(y, x, ((4u + b) << 24) | 0x000c000cu | (b << 8)));
+}
+// The NaN codes (0x7f, 0xff) come out of the moves as the finite s|0x3f80: a word's bytes that are NaN codes have bit 7
+// set in attn_e4m3_nan(q) (or'ed over a thread's words, masked with kE4m3Nan once), and attn_f16_nan turns the halves
+// s|0x3f80 of a pair into the FP16 NaN s|0x7f80, every other value as it was (no other code reaches 0x3f80 there).
+constexpr uint32_t kE4m3Nan = 0x80808080u;
+template <bool B>
+struct AttnFix {  // a compile-time flag for a lambda's auto parameter
+  static constexpr bool value = B;
+};
+__device__ __forceinline__ uint32_t attn_e4m3_nan(uint32_t q) { return (q & 0x7f7f7f7fu) + 0x01010101u; }
+__device__ __forceinline__ uint32_t attn_f16_nan(uint32_t h) {
+  return h | (((h & 0x3f803f80u) + 0x00800080u) & 0x40004000u);
+}
+// Two floats to an FP16 pair (low first), rounded to nearest even.
+__device__ __forceinline__ uint32_t attn_f16x2(float lo, float hi) {
+  return static_cast<uint32_t>(__builtin_bit_cast(unsigned short, static_cast<_Float16>(lo))) |
+         (static_cast<uint32_t>(__builtin_bit_cast(unsigned short, static_cast<_Float16>(hi))) << 16);
+}
+// A BF16 pair (bits, low first) in FP16: exact in FP16's normal range (BF16's 8 bits fit), truncated below it, 65504
+// above it (round toward zero: one v_cvt_pkrtz a pair).
+__device__ __forceinline__ uint32_t attn_bf16_f16(uint32_t v) {
+  return __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(attn_bf16_float(v & 0xffffu), attn_bf16_float(v >> 16)));
+}
+
 // One block's LDS: its rows' queries (BF16, scaled), one tile's K ([key][d]) and V^T ([d][key]).
 template <int ROWS, int TK>
 struct AttnLds {
@@ -199,8 +241,8 @@ __device__ __forceinline__ void attn_load_run(AttnLds<ROWS, TK>& sm, const gpu::
   }
 }
 
-// M2: a sealed tile (keys [k0, k0 + TK), all below khi) from the layer's FP8 mirror, decoded into LDS: the values
-// attn_round_tile leaves for the BF16 tile, bit for bit. The mirror holds a code at each pool element's offset.
+// M2: a sealed tile (keys [k0, k0 + TK), all below khi) from the layer's FP8 mirror, into LDS in FP16: the values
+// attn_code_tile leaves for the BF16 tile, bit for bit. The mirror holds a code at each pool element's offset.
 template <int ROWS, int TK>
 __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const KvQ8& q8, int k0, int kvh, size_t hs,
                                                   size_t ps, const uint64_t* __restrict__ pages) {
@@ -215,7 +257,7 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
   const auto* k8 = q8.k8 + base;
   const auto* v8 = q8.v8 + base;
   // As attn_load_run (addresses a uniform base a step plus the thread's 32-bit offset), but K's and V's loads both go
-  // out before K's decodes and stores (the codes are half the registers), then V's (keys fastest).
+  // out before K's converts and stores (the codes are half the registers), then V's (keys fastest).
   uint4 wk[IK], wv[IV][4];
 #pragma unroll
   for (int it = 0; it < IK; ++it) {
@@ -234,62 +276,96 @@ __device__ __forceinline__ void attn_load_tile_f8(AttnLds<ROWS, TK>& sm, const K
     }
   }
   __builtin_amdgcn_sched_barrier(0);
+  // Whether any of the thread's codes is a NaN code: then its pairs go through attn_f16_nan (a branch: rare).
+  uint32_t nan = 0;
 #pragma unroll
-  for (int it = 0; it < IK; ++it) {
-    const int i = tid + it * NT, j = i / (D / 16), c = i % (D / 16);
-    if (i >= NK) continue;
-    const uint4 w = wk[it];
-    const uint32_t e[4] = {w.x, w.y, w.z, w.w};
-    uint4 o[2];
-    uint32_t* h = reinterpret_cast<uint32_t*>(o);
+  for (int it = 0; it < IK; ++it) nan |= attn_e4m3_nan(wk[it].x) | attn_e4m3_nan(wk[it].y) | attn_e4m3_nan(wk[it].z) |
+                                         attn_e4m3_nan(wk[it].w);
 #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-      h[2 * u] = kv_q8_decode2_bits(e[u] & 0xffffu, q8.ks);
-      h[2 * u + 1] = kv_q8_decode2_bits(e[u] >> 16, q8.ks);
+  for (int it = 0; it < IV; ++it)
+#pragma unroll
+    for (int u = 0; u < 4; ++u)
+      nan |= attn_e4m3_nan(wv[it][u].x) | attn_e4m3_nan(wv[it][u].y) | attn_e4m3_nan(wv[it][u].z) |
+             attn_e4m3_nan(wv[it][u].w);
+  auto convert = [&](auto fix) {
+    constexpr bool FIX = decltype(fix)::value;
+    auto f = [](uint32_t h) { return FIX ? attn_f16_nan(h) : h; };
+#pragma unroll
+    for (int it = 0; it < IK; ++it) {
+      const int i = tid + it * NT, j = i / (D / 16), c = i % (D / 16);
+      if (i >= NK) continue;
+      const uint4 w = wk[it];
+      uint4* dst = reinterpret_cast<uint4*>(sm.k + j * kHipQS + 16 * c);
+      dst[0] = make_uint4(f(attn_e4m3_f16_lo(w.x)), f(attn_e4m3_f16_hi(w.x)), f(attn_e4m3_f16_lo(w.y)),
+                          f(attn_e4m3_f16_hi(w.y)));
+      dst[1] = make_uint4(f(attn_e4m3_f16_lo(w.z)), f(attn_e4m3_f16_hi(w.z)), f(attn_e4m3_f16_lo(w.w)),
+                          f(attn_e4m3_f16_hi(w.w)));
     }
-    uint4* dst = reinterpret_cast<uint4*>(sm.k + j * kHipQS + 16 * c);
-    dst[0] = o[0];
-    dst[1] = o[1];
+#pragma unroll
+    for (int it = 0; it < IV; ++it) {
+      const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
+      if (i >= NV) continue;
+      const uint4* w = wv[it];
+#pragma unroll
+      for (int e = 0; e < 16; ++e) {
+        auto word = [&](const uint4& x) { return e < 4 ? x.x : e < 8 ? x.y : e < 12 ? x.z : x.w; };
+        const uint2 o = make_uint2(f(attn_e4m3_pair(word(w[0]), word(w[1]), e & 3)),
+                                   f(attn_e4m3_pair(word(w[2]), word(w[3]), e & 3)));
+        *reinterpret_cast<uint2*>(sm.vt + (16 * c + e) * VS + 4 * jq) = o;
+      }
+    }
+  };
+  if (nan & kE4m3Nan) convert(AttnFix<true>{});
+  else convert(AttnFix<false>{});
+}
+
+// The staged BF16 tile in FP16, in place, for the Q8 kernels: a raw tile (attn_bf16_f16; K in the dim order of
+// attn_e4m3_f16_lo/hi, V^T as it is).
+template <int ROWS, int TK>
+__device__ __forceinline__ void attn_f16_tile(AttnLds<ROWS, TK>& sm) {
+  constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS;
+  // A word pair (d0 d1, d2 d3) to (d0 d2, d1 d3).
+  auto mix = [](uint32_t a, uint32_t b, uint32_t& x, uint32_t& y) {
+    x = (a & 0xffffu) | (b << 16);
+    y = (a >> 16) | (b & 0xffff0000u);
+  };
+  for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
+    uint4* p = reinterpret_cast<uint4*>(sm.k + (i / (D / 8)) * kHipQS + 8 * (i % (D / 8)));
+    uint4 w = *p, m;
+    mix(w.x, w.y, m.x, m.y);
+    mix(w.z, w.w, m.z, m.w);
+    *p = make_uint4(attn_bf16_f16(m.x), attn_bf16_f16(m.y), attn_bf16_f16(m.z), attn_bf16_f16(m.w));
   }
-#pragma unroll
-  for (int it = 0; it < IV; ++it) {
-    const int i = tid + it * NT, jq = i % (TK / 4), c = i / (TK / 4);
-    if (i >= NV) continue;
-    const uint4* w = wv[it];
-#pragma unroll
-    for (int e = 0; e < 16; ++e) {
-      auto code = [&](const uint4& x) {
-        const uint32_t d = e < 4 ? x.x : e < 8 ? x.y : e < 12 ? x.z : x.w;
-        return (d >> (8 * (e & 3))) & 0xffu;
-      };
-      const uint2 o = make_uint2(kv_q8_decode2_bits(code(w[0]) | (code(w[1]) << 8), q8.vs),
-                                 kv_q8_decode2_bits(code(w[2]) | (code(w[3]) << 8), q8.vs));
-      *reinterpret_cast<uint2*>(sm.vt + (16 * c + e) * VS + 4 * jq) = o;
-    }
+  for (int i = threadIdx.x; i < D * (TK / 8); i += blockDim.x) {
+    uint4* p = reinterpret_cast<uint4*>(sm.vt + (i / (TK / 8)) * VS + 8 * (i % (TK / 8)));
+    const uint4 w = *p;
+    *p = make_uint4(attn_bf16_f16(w.x), attn_bf16_f16(w.y), attn_bf16_f16(w.z), attn_bf16_f16(w.w));
   }
 }
 
-// The staged tile replaced by R of its values, in place (K with the K scale, V^T with the V scale).
+// The staged BF16 tile replaced by its codes in FP16, in place (K with the K scale, V^T with the V scale; K in the dim
+// order of attn_e4m3_f16_lo/hi): the bits attn_load_tile_f8 gives for the codes the mirror holds of it.
 template <int ROWS, int TK>
-__device__ __forceinline__ void attn_round_tile(AttnLds<ROWS, TK>& sm, const KvQ8& q8) {
+__device__ __forceinline__ void attn_code_tile(AttnLds<ROWS, TK>& sm, const KvQ8& q8) {
   constexpr int D = kMmaD, VS = AttnLds<ROWS, TK>::VS;
+  auto codes = [](uint32_t v, float inv) {  // a BF16 pair's two codes
+    return static_cast<uint32_t>(kv_q8_encode2(make_float2(attn_bf16_float(v & 0xffffu), attn_bf16_float(v >> 16)), inv));
+  };
   for (int i = threadIdx.x; i < TK * (D / 8); i += blockDim.x) {
     uint4* p = reinterpret_cast<uint4*>(sm.k + (i / (D / 8)) * kHipQS + 8 * (i % (D / 8)));
-    uint4 w = *p;
-    w.x = kv_q8_round2_bits(w.x, q8.ks, q8.kinv);
-    w.y = kv_q8_round2_bits(w.y, q8.ks, q8.kinv);
-    w.z = kv_q8_round2_bits(w.z, q8.ks, q8.kinv);
-    w.w = kv_q8_round2_bits(w.w, q8.ks, q8.kinv);
-    *p = w;
+    const uint4 w = *p;
+    const uint32_t a = codes(w.x, q8.kinv) | (codes(w.y, q8.kinv) << 16), b = codes(w.z, q8.kinv) | (codes(w.w, q8.kinv) << 16);
+    *p = make_uint4(attn_f16_nan(attn_e4m3_f16_lo(a)), attn_f16_nan(attn_e4m3_f16_hi(a)),
+                    attn_f16_nan(attn_e4m3_f16_lo(b)), attn_f16_nan(attn_e4m3_f16_hi(b)));
   }
   for (int i = threadIdx.x; i < D * (TK / 8); i += blockDim.x) {
     uint4* p = reinterpret_cast<uint4*>(sm.vt + (i / (TK / 8)) * VS + 8 * (i % (TK / 8)));
     uint4 w = *p;
-    w.x = kv_q8_round2_bits(w.x, q8.vs, q8.vinv);
-    w.y = kv_q8_round2_bits(w.y, q8.vs, q8.vinv);
-    w.z = kv_q8_round2_bits(w.z, q8.vs, q8.vinv);
-    w.w = kv_q8_round2_bits(w.w, q8.vs, q8.vinv);
-    *p = w;
+    auto pair = [&](uint32_t v) {  // codes at bytes 0 and 2: attn_e4m3_f16_lo gives the pair in key order
+      const uint32_t e = codes(v, q8.vinv);
+      return attn_f16_nan(attn_e4m3_f16_lo((e & 0xffu) | ((e & 0xff00u) << 8)));
+    };
+    *p = make_uint4(pair(w.x), pair(w.y), pair(w.z), pair(w.w));
   }
 }
 
@@ -344,6 +420,21 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       maxP = (pos0 + last_m) & ~31;
     }
   }
+  // Q8: a tile in LDS holds FP16 codes (value / 2^8: attn_load_tile_f8, attn_code_tile; `codes`) or raw values
+  // (attn_f16_tile). A code tile's scores are its raw products times kscale = ks 2^8, folded into the exp's argument;
+  // its P goes into the WMMA as p vs 2^8 2^S, a raw tile's as p 2^S, so o is held in units of 2^-S. S (the launch's,
+  // so a row's bits do not depend on its block) puts a code tile's largest P in [2^13, 2^14): FP16's range, normal down
+  // to p ~ 2^-27. ma and la are in true units; the partials leave in true units (and CASC 2 takes them back), exactly.
+  [[maybe_unused]] float kscale = 1.f, pcode = 1.f, praw = 1.f, ounit = 1.f;
+  [[maybe_unused]] bool codes = true;
+  if constexpr (Q8) {
+    int e = 0;
+    (void)frexpf(fmaxf(q8.vs * 256.f, 1.f), &e);
+    praw = ldexpf(1.f, 14 - e);
+    ounit = ldexpf(1.f, e - 14);
+    pcode = q8.vs * 256.f * praw;
+    kscale = q8.ks * 256.f;
+  }
   int pmin = INT_MAX;  // the block's first row position (tile_rows)
   for (int m = r0 / G; m <= last_m; ++m) pmin = min(pmin, pos0 + (td ? td->depth[m] : m));
   // The block's queries into LDS in BF16, scaled by 1 / sqrt(D) (a power of two: exact); rows past nrows are zeros.
@@ -351,8 +442,12 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     const int r = i / (D / 4), c = i % (D / 4), row = r0 + r;
     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
     if (r < nrows) v = *reinterpret_cast<const float4*>(q + (static_cast<size_t>(row / G) * Hq + kvh * G + row % G) * D + 4 * c);
-    *reinterpret_cast<uint2*>(sm.q + r * kHipQS + 4 * c) =
-        make_uint2(pack_bf16(v.x * 0.0625f, v.y * 0.0625f), pack_bf16(v.z * 0.0625f, v.w * 0.0625f));
+    if constexpr (Q8)  // FP16, in the K tiles' dim order (d0 d2, d1 d3)
+      *reinterpret_cast<uint2*>(sm.q + r * kHipQS + 4 * c) =
+          make_uint2(attn_f16x2(v.x * 0.0625f, v.z * 0.0625f), attn_f16x2(v.y * 0.0625f, v.w * 0.0625f));
+    else
+      *reinterpret_cast<uint2*>(sm.q + r * kHipQS + 4 * c) =
+          make_uint2(pack_bf16(v.x * 0.0625f, v.y * 0.0625f), pack_bf16(v.z * 0.0625f, v.w * 0.0625f));
   }
   // O^T for this lane's row: dim tile i holds dims 16 i + 2 j + half in o[i][j].
   attn_v8f o[D / 16];
@@ -368,6 +463,11 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       for (int i = 0; i < D / 16; ++i)
 #pragma unroll
         for (int j = 0; j < 8; ++j) o[i][j] = part[2 + 16 * i + 2 * j + half];
+      if constexpr (Q8)
+#pragma unroll
+        for (int i = 0; i < D / 16; ++i)
+#pragma unroll
+          for (int j = 0; j < 8; ++j) o[i][j] *= praw;
     }
   }
   const gpu::bf16* qrow = sm.q + (warp * 16 + col) * kHipQS;
@@ -378,10 +478,17 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
     for (int n = 0; n < KT; ++n) sc[n] = attn_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll 2
     for (int s = 0; s < D / 16; ++s) {
-      const attn_v16s b = attn_lds16(qrow + 16 * s);
+      if constexpr (Q8) {
+        const attn_v16h b = attn_lds16h(qrow + 16 * s);
 #pragma unroll
-      for (int n = 0; n < KT; ++n)
-        sc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(attn_lds16(sm.k + (16 * n + col) * kHipQS + 16 * s), b, sc[n]);
+        for (int n = 0; n < KT; ++n)
+          sc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(attn_lds16h(sm.k + (16 * n + col) * kHipQS + 16 * s), b, sc[n]);
+      } else {
+        const attn_v16s b = attn_lds16(qrow + 16 * s);
+#pragma unroll
+        for (int n = 0; n < KT; ++n)
+          sc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(attn_lds16(sm.k + (16 * n + col) * kHipQS + 16 * s), b, sc[n]);
+      }
     }
     // sc[n][j] is the score of key k0 + 16 n + 2 j + half. Mask (causal, and the range end), then the online softmax.
     float ta = -INFINITY;
@@ -394,14 +501,15 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
         ta = fmaxf(ta, sc[n][j]);
       }
     ta = fmaxf(ta, attn_xswapf(ta));
-    const float na = fmaxf(ma, ta);
+    const float ksc = Q8 && codes ? kscale : 1.f, psc = codes ? pcode : praw;  // Q8's scales (above)
+    const float na = Q8 ? fmaxf(ma, ta * ksc) : fmaxf(ma, ta);
     const float alpha = na == -INFINITY ? 1.f : __expf(ma - na);
     float sa = 0.f;
 #pragma unroll
     for (int n = 0; n < KT; ++n)
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        sc[n][j] = sc[n][j] == -INFINITY ? 0.f : __expf(sc[n][j] - na);
+        sc[n][j] = sc[n][j] == -INFINITY ? 0.f : __expf(Q8 ? __builtin_fmaf(sc[n][j], ksc, -na) : sc[n][j] - na);
         sa += sc[n][j];
       }
     sa += attn_xswapf(sa);  // even keys' sum + odd keys' sum, the same float on both lanes
@@ -409,14 +517,15 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       la = la * alpha + sa;
       ma = na;
     }
-    // P^T as the B operand, 16 keys a step: key 2 j from the even lane's value, key 2 j + 1 from the odd one's, in BF16.
+    // P^T as the B operand, 16 keys a step: key 2 j from the even lane's value, key 2 j + 1 from the odd one's, in BF16
+    // (Q8: in FP16, times psc).
     attn_v16s pb[KT];
 #pragma unroll
     for (int n = 0; n < KT; ++n) {
       uint32_t own[4], oth[4];
 #pragma unroll
       for (int u = 0; u < 4; ++u) {
-        own[u] = pack_bf16(sc[n][2 * u], sc[n][2 * u + 1]);
+        own[u] = Q8 ? attn_f16x2(sc[n][2 * u] * psc, sc[n][2 * u + 1] * psc) : pack_bf16(sc[n][2 * u], sc[n][2 * u + 1]);
         oth[u] = attn_xswap(own[u]);
       }
       attn_v8u w;
@@ -436,7 +545,11 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
       attn_v8f t = attn_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int n = 0; n < KT; ++n)
-        t = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(attn_lds16(sm.vt + (16 * i + col) * VS + 16 * n), pb[n], t);
+        if constexpr (Q8)
+          t = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(attn_lds16h(sm.vt + (16 * i + col) * VS + 16 * n),
+                                                         __builtin_bit_cast(attn_v16h, pb[n]), t);
+        else
+          t = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(attn_lds16(sm.vt + (16 * i + col) * VS + 16 * n), pb[n], t);
       if (ca)
 #pragma unroll
         for (int j = 0; j < 8; ++j) o[i][j] = __builtin_fmaf(o[i][j], alpha, t[j]);
@@ -475,24 +588,29 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
                 q8.sealed[pages[k0 / kKvPageTokens] / q8.unit] != 0;
   };
   // Q8: a tile in the rows' two domains, as on CUDA: first as stored for the rows whose unit is not past the tile's,
-  // then rounded in place for the rows past it. Block-uniform branches (every thread meets the barriers).
-  // A tile whose V tile_rows cut is loaded again for the rows past its unit (every one of them sees the whole tile).
-  // f8: the tile came from the mirror, already R(v); sealed_tile put every row of the block past its unit (raw is
+  // then rounded for the rows past it. Block-uniform branches (every thread meets the barriers). The raw pass takes
+  // the tile in FP16 (attn_f16_tile, in place), so the rounded pass loads it again before attn_code_tile.
+  // f8: the tile came from the mirror, already the codes; sealed_tile put every row of the block past its unit (raw is
   // false, rnd true) and every row's position past its end, so this is one tile_compute(k0, ca && Pa > k0). It runs
   // through the rounded branch without the rounding: one compute site less in the kernel (with the separate site the
   // compiler spilled the O accumulators in the tile loop).
   auto tile_q8 = [&](int k0, bool ca, bool f8, auto&& reload) {
     const bool raw = !f8 && k0 >= minP, rnd = f8 || k0 < maxP;
-    bool cut = false;
-    if (raw) cut = tile_rows(k0, ca && Pa <= k0, true);
+    if (raw) {
+      attn_f16_tile<ROWS, TK>(sm);
+      __syncthreads();
+      codes = false;
+      tile_rows(k0, ca && Pa <= k0, true);
+    }
     if (rnd) {
-      if (cut) {
+      codes = true;
+      if (raw) {
         __syncthreads();
         reload();
+        __syncthreads();
       }
-      if (raw) __syncthreads();
       if (!f8) {
-        attn_round_tile<ROWS, TK>(sm, q8);
+        attn_code_tile<ROWS, TK>(sm, q8);
         __syncthreads();
       }
       tile_rows(k0, ca && Pa > k0, false);
@@ -547,7 +665,7 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
 #pragma unroll
   for (int i = 0; i < D / 16; ++i)
 #pragma unroll
-    for (int j = 0; j < 8; ++j) part[2 + 16 * i + 2 * j + half] = o[i][j];
+    for (int j = 0; j < 8; ++j) part[2 + 16 * i + 2 * j + half] = Q8 ? o[i][j] * ounit : o[i][j];
 }
 
 // attention_combine_kernel's output (row-head mh, dimension d): the CUDA combine (the partials of `splits` key ranges

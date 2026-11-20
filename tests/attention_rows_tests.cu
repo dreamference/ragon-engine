@@ -59,8 +59,8 @@ float bf16_float(uint16_t b) {
   return f;
 }
 // R(x) on the host: bf16(float(e4m3(x * inv)) * s), the value the FP8 KV paths compute with (round to nearest even,
-// saturated to 448, as kv_seal; finite inputs).
-float q8_round(float x, float s, float inv) {
+// saturated to 448, as kv_seal; finite inputs). exact: float(e4m3(x * inv)) * s in double, no BF16 rounding.
+double q8_round(float x, float s, float inv, bool exact = false) {
   const float v = x * inv;
   uint32_t u;
   std::memcpy(&u, &v, 4);
@@ -75,6 +75,7 @@ float q8_round(float x, float s, float inv) {
     std::memcpy(&e, &r, 4);
     e = std::min(e, 448.f);
   }
+  if (exact) return double(u >> 31 ? -e : e) * s;
   return bf16_float(bf16_bits((u >> 31 ? -e : e) * s));
 }
 uint64_t fnv(const uint8_t* p, size_t n) {
@@ -259,10 +260,13 @@ std::vector<float> rows(const Pool& p, const Bufs& b, int P, int m0, int M, cons
 // and of the probabilities (relative to the row's maximum) before the V product.
 // q8: the FP8 formats' scales, or nullptr for BF16. With them the keys of every 32-key unit below the row's own
 // (j < pos & ~31) are taken as R of their values, its own unit's as stored (LOWBIT §8).
-std::vector<double> reference(const Pool& p, const std::vector<float>& hq, int m, int pos, const k::KvQ8* q8) {
-  const auto kv = [&](uint16_t b, bool v, int j) {
+// exact: no rounding of q / 16 nor of the probabilities, and an FP8 value as its code times the scale (the
+// attention the format means, whatever the kernel's operand types).
+std::vector<double> reference(const Pool& p, const std::vector<float>& hq, int m, int pos, const k::KvQ8* q8,
+                              bool exact = false) {
+  const auto kv = [&](uint16_t b, bool v, int j) -> double {
     const float x = bf16_float(b);
-    return q8 && j < (pos & ~31) ? q8_round(x, v ? q8->vs : q8->ks, v ? q8->vinv : q8->kinv) : x;
+    return q8 && j < (pos & ~31) ? q8_round(x, v ? q8->vs : q8->ks, v ? q8->vinv : q8->kinv, exact) : x;
   };
   std::vector<double> o(size_t(Hq) * D, 0.0);
   const std::vector<uint64_t> t = download(p.table, p.np);
@@ -270,7 +274,10 @@ std::vector<double> reference(const Pool& p, const std::vector<float>& hq, int m
   for (int h = 0; h < Hq; ++h) {
     const int kvh = h / (Hq / Hkv);
     float qb[D];
-    for (int d = 0; d < D; ++d) qb[d] = bf16_float(bf16_bits(hq[(size_t(m) * Hq + h) * D + d] * 0.0625f));
+    for (int d = 0; d < D; ++d) {
+      const float x = hq[(size_t(m) * Hq + h) * D + d] * 0.0625f;
+      qb[d] = exact ? x : bf16_float(bf16_bits(x));
+    }
     double mx = -1e300;
     for (int j = 0; j <= pos; ++j) {
       const size_t off = size_t(kvh) * p.hs + t[j / PT] + size_t(j % PT) * D;
@@ -286,7 +293,7 @@ std::vector<double> reference(const Pool& p, const std::vector<float>& hq, int m
     }
     for (int j = 0; j <= pos; ++j) {
       const size_t off = size_t(kvh) * p.hs + t[j / PT] + size_t(j % PT) * D;
-      const double pj = bf16_float(bf16_bits(float(s[j])));
+      const double pj = exact ? s[j] : bf16_float(bf16_bits(float(s[j])));
       for (int d = 0; d < D; ++d) o[size_t(h) * D + d] += pj * kv(p.hv[off + d], true, j);
     }
     for (int d = 0; d < D; ++d) o[size_t(h) * D + d] /= l;
@@ -365,26 +372,31 @@ void rows_checks() {
     report(std::string("two runs byte-identical, ") + names[f], det_ok, "identical", "DIFFERENT");
   }
   // The rows against the double reference (for FP8 over R of the keys and values).
-  for (int f = 0; f < 3; ++f) {
-    double worst = 0.0;
-    for (int P : {0, 41, 4085}) {
-      const std::vector<float> got = rows(p, b, P, 0, kRows, formats[f]);
-      for (int m : {0, 7, kRows - 1}) {
-        const std::vector<double> ref = reference(p, hq, m, P + m, f == 0 ? nullptr : &q8);
-        double mx = 0.0, err = 0.0;
-        for (size_t i = 0; i < rowf; ++i) {
-          mx = std::max(mx, std::fabs(ref[i]));
-          err = std::max(err, std::fabs(got[size_t(m) * rowf + i] - ref[i]));
+  // Twice: with the BF16 kernel's roundings, and exact (no roundings; the FP8 values as code times scale), where the
+  // RMS error over the rows is printed too.
+  for (bool exact : {false, true})
+    for (int f = 0; f < 3; ++f) {
+      double worst = 0.0, e2 = 0.0, r2 = 0.0;
+      for (int P : {0, 41, 4085}) {
+        const std::vector<float> got = rows(p, b, P, 0, kRows, formats[f]);
+        for (int m : {0, 7, kRows - 1}) {
+          const std::vector<double> ref = reference(p, hq, m, P + m, f == 0 ? nullptr : &q8, exact);
+          double mx = 0.0, err = 0.0;
+          for (size_t i = 0; i < rowf; ++i) {
+            const double e = got[size_t(m) * rowf + i] - ref[i];
+            mx = std::max(mx, std::fabs(ref[i]));
+            err = std::max(err, std::fabs(e));
+            e2 += e * e, r2 += ref[i] * ref[i];
+          }
+          worst = std::max(worst, err / std::max(mx, 1e-30));
         }
-        worst = std::max(worst, err / std::max(mx, 1e-30));
       }
+      const double tol = 1e-2;
+      char what[200];
+      std::snprintf(what, sizeof what, "against the %s reference, %s: worst error %.2e of the row's largest, RMS %.2e "
+                    "(tol %.0e)", exact ? "exact" : "double", names[f], worst, std::sqrt(e2 / std::max(r2, 1e-300)), tol);
+      report(what, worst < tol && std::isfinite(worst));
     }
-    const double tol = 1e-2;
-    char what[160];
-    std::snprintf(what, sizeof what, "against the double reference, %s: worst error %.2e of the row's largest (tol %.0e)",
-                  names[f], worst, tol);
-    report(what, worst < tol && std::isfinite(worst));
-  }
   free_bufs(b);
   free_pool(p);
 }
