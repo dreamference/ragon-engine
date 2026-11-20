@@ -13,6 +13,8 @@ import sys
 
 import numpy as np
 
+STEPS = ["in_norm", "qkv", "conv", "g", "beta", "core", "state", "qg", "k", "v", "attn", "post_norm"]
+
 
 def order_key(name):
     if name == "embed":
@@ -24,7 +26,8 @@ def order_key(name):
         return (int(m.group(1)), 9, "")
     m = re.match(r"l(\d+)\.(.+)$", name)
     if m:
-        return (int(m.group(1)), 0, m.group(2))
+        step = m.group(2)
+        return (int(m.group(1)), STEPS.index(step) if step in STEPS else len(STEPS), step)
     return (10 ** 7, 0, name)
 
 

@@ -112,7 +112,7 @@ kernel void gemv_fp8(device const float* x [[buffer(0)]], device const uchar* w 
       acc[m] += b;
     }
   }
-  gemv_store(y, a, n, acc, 1.0f / kFp8Unscale, lane);
+  gemv_store(y, a, n, acc, kFp8Unscale, lane);
 }
 
 // BF16 rows: each lane takes 16 bytes (8 values) a step.
@@ -314,8 +314,8 @@ kernel void attn_partial(device const float* q [[buffer(0)]], device const bfloa
 // Combine the chunks: grid (H, T), 256 threads (one per dim); out [T][H*D].
 kernel void attn_combine(device const float* part [[buffer(0)]], device float* out [[buffer(1)]],
                          constant AttnArgs& a [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
-                         uint d [[thread_position_in_threadgroup]]) {
-  const uint h = tg.x, t = tg.y;
+                         uint2 tid [[thread_position_in_threadgroup]]) {
+  const uint h = tg.x, t = tg.y, d = tid.x;
   device const float* pr = part + ((ulong)t * a.H + h) * a.nchunks * (2 + a.D);
   float M = -INFINITY;
   for (uint c = 0; c < a.nchunks; ++c) M = max(M, pr[c * (2 + a.D)]);
