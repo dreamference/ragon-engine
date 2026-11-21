@@ -81,6 +81,14 @@ class Model {
   // weights are dequantized once for all chunks. Same kernels on the same inputs as forward() chunk by chunk, so
   // the same results; RAGON_METAL_LAYER_MAJOR=0 runs the chunk loop instead. Leaves the last row's logits.
   void prefill(const uint32_t* ids, int P);
+  // Greedy decode without a CPU round trip a token: greedy_begin(id0, banned, n) puts the first id on the device;
+  // each greedy_step(pos) encodes one token, picks the next id on the GPU (the largest logit outside banned, ties to
+  // the lower id) into the device's id slot and commits without waiting, so the next step is encoded while this one
+  // runs. greedy_wait(k) blocks until step k has run; greedy_out(k) is then {id, top, second} (floats as bits).
+  void greedy_begin(uint32_t id0, const std::vector<int>& banned, int steps);
+  void greedy_step(int pos);
+  void greedy_wait(int k);
+  const uint32_t* greedy_out(int k) const { return gout_.host<uint32_t>() + size_t(k) * 3; }
   const float* logits() const { return logits_.host<float>(); }
   int vocab() const { return V_; }
   int chunk() const { return C_; }
@@ -88,6 +96,7 @@ class Model {
   // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head;
   // prof[4] = the GDN recurrence alone (part of prof[1]).
   double prof[5] = {0, 0, 0, 0, 0};
+  double gpu_s = 0;  // GPU time of forward()'s last command buffer, summed (a decode step is one command buffer)
   // RAGON_METAL_PROF=2 also syncs after each prefill matmul pass: pm[0..4] = weight dequant, x to half, matmul,
   // store, silu_mul; pm[5] = the other work queued before each matmul (these seconds are then missing from
   // prof[0..3]). RAGON_METAL_PROF=4 also syncs around each GEMV (decode): pm[2] = the GEMVs, pm[5] = the rest.
@@ -141,12 +150,18 @@ class Model {
   size_t wdq_cap_ = 0;
   float eps_ = 1e-6f;
   // activations [C][...] f32
+  View gout_;
+  std::vector<id<MTLCommandBuffer>> gcb_;  // the last command buffer of each greedy step
+  std::vector<uint32_t> gban_;
+  int gstep_ = 0;
+  bool greedy_ = false;  // inside greedy_step: forward() ends with the pick and a commit instead of a sync
   View ids_, h_, xn_, qkv_, zb_, ab_, bb_, core_, gated_, qg_, kb_, vb_, ob_, part_, gb_, ub_, logits_, cos_, sin_;
   // prefill matmul scratch: half weights, half activations, f32 product; attention Q, scores, probabilities
   View wdq_, xh_, mmc_, qb_, S_, P_;
   // layer-major prefill: the whole prompt's hidden rows and one layer's half weights
   View hall_, wlay_;
   bool layer_major_ = true;
+  int flush_ = 4;  // decode: commit the command buffer every flush_ layers so the GPU starts while the CPU encodes
   // chunked GDN prefill (RAGON_METAL_GDN_OLD=1 keeps the token loop): half q/k/v, per (sub-chunk, head) W, Uv, A2, lg
   View gq_, gk_, gv_, gW_, gU_, gA2_, glg_;
   double gtp_[3] = {0, 0, 0};  // RAGON_METAL_PROF=3: the chunked kernels apart (measurement only)

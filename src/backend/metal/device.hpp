@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "backend/metal/types.hpp"
 
@@ -33,6 +34,7 @@ struct Queue {
   id<MTLLibrary> lib = nil;
   id<MTLCommandBuffer> cb = nil;
   id<MTLComputeCommandEncoder> enc = nil;
+  std::vector<id<MTLCommandBuffer>> flushed;
   std::map<std::string, id<MTLComputePipelineState>> pipes;
 
   // Opens the default device and compiles the kernels with safe math (no fast-math: correctness first).
@@ -41,7 +43,13 @@ struct Queue {
   id<MTLComputePipelineState> pipe(const char* name, uint32_t rows = 0);
   View alloc(size_t bytes);  // shared storage, zeroed
   id<MTLComputeCommandEncoder> encoder();
-  // Ends the encoder, commits and waits; returns the GPU time of the buffer in seconds.
+  // Ends the encoder and commits without waiting, so the GPU starts while the caller encodes the rest.
+  void flush();
+  // Waits for the flushed buffer b and retires it with every buffer committed before it (one queue: they complete
+  // in commit order); dies on a buffer error.
+  void wait_for(id<MTLCommandBuffer> b);
+  // Ends the encoder, commits and waits; returns the GPU time of the buffer in seconds (with flushed buffers before
+  // it: from the first one's start to the last one's end).
   double sync();
 };
 

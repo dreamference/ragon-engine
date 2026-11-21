@@ -59,15 +59,43 @@ id<MTLComputeCommandEncoder> Queue::encoder() {
   return enc;
 }
 
+void Queue::flush() {
+  if (enc) [enc endEncoding];
+  enc = nil;
+  if (!cb) return;
+  [cb commit];
+  flushed.push_back(cb);
+  cb = nil;
+}
+
+void Queue::wait_for(id<MTLCommandBuffer> b) {
+  [b waitUntilCompleted];
+  size_t n = 0;
+  while (n < flushed.size()) {
+    id<MTLCommandBuffer> f = flushed[n++];
+    if ([f status] == MTLCommandBufferStatusError) die("command buffer", [f error]);
+    if (f == b) break;
+  }
+  flushed.erase(flushed.begin(), flushed.begin() + long(n));
+}
+
 double Queue::sync() {
   if (enc) [enc endEncoding];
   enc = nil;
-  if (!cb) return 0;
-  [cb commit];
-  [cb waitUntilCompleted];
-  double t = [cb GPUEndTime] - [cb GPUStartTime];
-  if ([cb status] == MTLCommandBufferStatusError) die("command buffer", [cb error]);
-  cb = nil;
+  if (!cb && flushed.empty()) return 0;
+  if (cb) {
+    [cb commit];
+    flushed.push_back(cb);
+    cb = nil;
+  }
+  id<MTLCommandBuffer> last = flushed.back();
+  [last waitUntilCompleted];  // one queue: the buffers complete in commit order
+  for (id<MTLCommandBuffer> b : flushed) {
+    [b waitUntilCompleted];
+    if ([b status] == MTLCommandBufferStatusError) die("command buffer", [b error]);
+  }
+  const double t = [last GPUEndTime] - [flushed.front() GPUStartTime];
+  flushed.clear();
   return t;
 }
 

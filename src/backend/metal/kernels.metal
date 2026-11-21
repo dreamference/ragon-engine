@@ -1480,3 +1480,56 @@ kernel void gdn_chunk_seq(device const half* kr [[buffer(0)]], device const half
   }
   cS.store(tS);
 }
+
+// ---- greedy pick on the GPU (pipelined decode) ---------------------------------------------------------------
+// One threadgroup of 1024 threads over the logits: the largest value (lowest index on ties, as the host loop) and the
+// second largest of the multiset, skipping the banned ids. Writes the id to ids[0] (the next step's embedding input)
+// and {id, top, second} to out.
+struct Top2Args {
+  uint n, nb;
+  uint banned[8];
+};
+struct Top2 {
+  float v, s;
+  uint id;
+};
+inline Top2 top2_merge(Top2 a, Top2 b) {
+  const bool bw = b.v > a.v || (b.v == a.v && b.id < a.id);  // ties: the lower index
+  Top2 r;
+  r.v = bw ? b.v : a.v;
+  r.id = bw ? b.id : a.id;
+  r.s = bw ? max(a.v, b.s) : max(a.s, b.v);
+  return r;
+}
+kernel void top2_ban(device const float* x [[buffer(0)]], device uint* ids [[buffer(1)]],
+                     device uint* out [[buffer(2)]], constant Top2Args& a [[buffer(3)]],
+                     uint tid [[thread_index_in_threadgroup]]) {
+  Top2 t{-INFINITY, -INFINITY, 0};
+  const uint per = (a.n + 1023) / 1024, i0 = tid * per, i1 = min(i0 + per, a.n);  // a contiguous slice a thread
+  for (uint i = i0; i < i1; ++i) {
+    const float v = x[i];
+    if (!(v > t.s)) continue;
+    bool ban = false;
+    for (uint b = 0; b < a.nb; ++b) ban = ban || a.banned[b] == i;
+    if (ban) continue;
+    if (v > t.v) {
+      t.s = t.v;
+      t.v = v;
+      t.id = i;
+    } else {
+      t.s = v;
+    }
+  }
+  threadgroup Top2 sh[1024];
+  sh[tid] = t;
+  for (uint w = 512; w > 0; w >>= 1) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < w) sh[tid] = top2_merge(sh[tid], sh[tid + w]);
+  }
+  if (tid == 0) {
+    ids[0] = sh[0].id;
+    out[0] = sh[0].id;
+    out[1] = as_type<uint>(sh[0].v);
+    out[2] = as_type<uint>(sh[0].s);
+  }
+}

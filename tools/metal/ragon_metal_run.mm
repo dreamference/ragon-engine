@@ -82,6 +82,7 @@ struct Top {
 static Top top2(const float* x, int n, const std::vector<int>& banned) {
   Top t;
   for (int i = 0; i < n; ++i) {
+    if (!(x[i] > t.second)) continue;  // the banned check only for a value that would enter the top two
     if (std::find(banned.begin(), banned.end(), i) != banned.end()) continue;
     if (x[i] > t.v) {
       t.second = t.v;
@@ -229,9 +230,36 @@ int main(int argc, char** argv) {
       double td = 0;
       std::fill(m.prof, m.prof + 5, 0.0);
       std::fill(m.pm, m.pm + 6, 0.0);
-      for (int k = 0; k < max_tokens; ++k) {
+      m.gpu_s = 0;
+      double top_s = 0;
+      // Greedy on the GPU, pipelined two steps deep (RAGON_METAL_PIPE=0: the CPU picks each token). The CPU path
+      // stays for the reference check (it needs the logits) and the profiles (they sync inside each step).
+      const char* pe = std::getenv("RAGON_METAL_PIPE");
+      const bool pipe = !(pe && std::atoi(pe) == 0) && !ref && !std::getenv("RAGON_METAL_PROF") && max_tokens > 1;
+      if (pipe) {
+        const Top t = top2(m.logits(), m.vocab(), banned);
+        min_gap = std::min(min_gap, t.v - t.second);
+        gen.push_back(t.id);
+        const int steps = max_tokens - 1;
+        td = now();
+        m.greedy_begin(uint32_t(t.id), banned, steps);
+        for (int j = 0; j < std::min(steps, 2); ++j) m.greedy_step(P + j);
+        for (int j = 0; j < steps; ++j) {
+          m.greedy_wait(j);
+          if (j + 2 < steps) m.greedy_step(P + j + 2);
+          const uint32_t* o = m.greedy_out(j);
+          float v, s2;
+          std::memcpy(&v, o + 1, 4);
+          std::memcpy(&s2, o + 2, 4);
+          min_gap = std::min(min_gap, v - s2);
+          gen.push_back(int(o[0]));
+        }
+      }
+      for (int k = 0; k < (pipe ? 0 : max_tokens); ++k) {
         const float* lg = m.logits();
+        const double tt = now();
         Top t = top2(lg, m.vocab(), banned);
+        if (k) top_s += now() - tt;
         min_gap = std::min(min_gap, t.v - t.second);
         if (ref && div < 0 && k < int(ref->size()) && (*ref)[k] != t.id) {
           div = k;
@@ -247,6 +275,9 @@ int main(int argc, char** argv) {
       }
       const double decode_s = now() - td;
       const double dec_tps = max_tokens > 1 ? (max_tokens - 1) / decode_s : 0;
+      if (max_tokens > 1)
+        std::fprintf(stderr, "decode ms a step: wall %.3f, GPU (step command buffers) %.3f, top-2 %.3f\n",
+                     decode_s * 1e3 / (max_tokens - 1), m.gpu_s * 1e3 / max_tokens, top_s * 1e3 / (max_tokens - 1));
       if (std::getenv("RAGON_METAL_PROF") && max_tokens > 1) {
         const double st = 1e3 / (max_tokens - 1);
         std::fprintf(stderr, "decode GPU ms a step: attention %.3f, GDN %.3f, MLP %.3f, head %.3f (wall %.3f)\n",
