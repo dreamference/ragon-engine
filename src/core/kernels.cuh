@@ -589,6 +589,8 @@ size_t kv_pos_stride(int Hkv, int D);
 int attention_prefetch_tiles();
 bool attention_bulk_enabled();
 int attention_chunk();
+// The live chunk's target (RAGON_ATTN_LIVE_CHUNK; 0: off, the fixed chunk everywhere): see kernels.cu.
+int attention_live_target();
 // The megakernel's stage 3 in the step (RAGON_MK_ATTN, BACKLOG 28): one verify sequence's full-attention layer, from the
 // input norm's FP16 copy (xh/xinv) to the out-projection's output (o.y), as one persistent kernel: q|k|v into q.y,
 // k.y, v.y, the prepare step (q/k norms, RoPE, the rows' K and V into the caches at pos0 ..) into q_out, gate and the

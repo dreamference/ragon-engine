@@ -698,14 +698,41 @@ __global__ void attn_prepare_seqs_kernel(const float* __restrict__ q_gate, const
 
 // The rows path's attention (attention_mma_body and its tiles): core/attention_body.cuh.
 
+// The live chunk (RAGON_ATTN_LIVE_CHUNK): a decode or verify launch (at most kAttnLiveRows rows a sequence) halves a
+// sequence's chunk (down to lmin, on the 32-key grid) while its ranges over keys [0, p0 + kAttnLiveRows) stay within
+// target / Hkv, so one sequence's ranges and KV heads fill one wave of the SMs. A graph launches ranges up to the fixed
+// context; at a short live context most are empty and the few real ones hold the 4096-key chunks serially (8K: 8
+// blocks on 48 SMs). The chunk depends only on the sequence's position at the launch (read on the device) and Hkv,
+// never on the grid, the row count or the other sequences of a batch, so a sequence's floats are those of its own
+// launch with any rows up to kAttnLiveRows, alone or batched; a launch of more rows (prefill) keeps the fixed chunk.
+// The chunk follows the launch's first position, not the row's: a token's floats differ in the last bits between a
+// decode step, a verify pass starting elsewhere and prefill (chunk-check and prefix-check compare those). With the
+// value 1 the BF16 and FP8 targets differ, so the FP8 path is then not the BF16 kernel over rounded keys bit for bit.
+// Other split points than the fixed chunk's move the floats: off by default.
+constexpr int kAttnLiveRows = 32;
+struct AttnLive {
+  int target, lmin;
+};
+__device__ __forceinline__ int attention_live_chunk(int chunk, int p0, int m, int Hkv, int splits, AttnLive lv) {
+  if (lv.target <= 0 || m > kAttnLiveRows) return chunk;
+  const int cap = min(splits, lv.target / Hkv), ctx = p0 + kAttnLiveRows;
+  for (;;) {
+    const int c = chunk / 2;
+    if (c < lv.lmin || c % 32 || (ctx + c - 1) / c > cap) return chunk;
+    chunk = c;
+  }
+}
+
 template <int ROWS, int TK, int NS, bool BULK, bool Q8 = false>
 __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_kernel(const float* __restrict__ q, const __nv_bfloat16* __restrict__ kcache,
                          const __nv_bfloat16* __restrict__ vcache, DevPos pos0_arg, int M, int Hq, int Hkv,
                          int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
-                         const TreeDesc* __restrict__ td, const uint64_t* __restrict__ pages, KvQ8 q8) {
+                         const TreeDesc* __restrict__ td, const uint64_t* __restrict__ pages, KvQ8 q8, AttnLive lv) {
   pdl_begin();  // first statement: see launch.cuh
-  attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q, kcache, vcache, pos_value(pos0_arg), M, Hq, Hkv, splits, chunk,
+  const int p0 = pos_value(pos0_arg);
+  chunk = attention_live_chunk(chunk, p0, M, Hkv, splits, lv);
+  attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q, kcache, vcache, p0, M, Hq, Hkv, splits, chunk,
                                                        scratch, hs, ps, pf, blockIdx.x, blockIdx.y, blockIdx.z, td, pages,
                                                        0, q8);
 }
@@ -721,14 +748,16 @@ __global__ void __launch_bounds__(ROWS * 2)
     attention_mma_seqs_kernel(const float* __restrict__ q, SeqPtrs<const __nv_bfloat16> kc,
                               SeqPtrs<const __nv_bfloat16> vc, SeqBatch b, AttnBlocks blocks, int Hq, int Hkv,
                               int splits, int chunk, float* __restrict__ scratch, size_t hs, size_t ps, int pf,
-                              SeqPtrs<const uint64_t> pg, KvQ8 q8) {
+                              SeqPtrs<const uint64_t> pg, KvQ8 q8, AttnLive lv) {
   pdl_begin();  // first statement: see launch.cuh
   int sq = 0;
   while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
   constexpr int D = kMmaD;
   const size_t r0 = b.row0[sq];
-  attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq),
-                                                       b.row0[sq + 1] - b.row0[sq], Hq, Hkv, splits, chunk,
+  const int p0 = seq_pos(b, sq), m = b.row0[sq + 1] - b.row0[sq];
+  chunk = attention_live_chunk(chunk, p0, m, Hkv, splits, lv);  // each sequence its own
+  attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], p0,
+                                                       m, Hq, Hkv, splits, chunk,
                                                        scratch + r0 * Hq * splits * (D + 2), hs, ps, pf,
                                                        blockIdx.x - blocks.blk0[sq], blockIdx.y, blockIdx.z, nullptr, pg.p[sq],
                                                        0, q8);
@@ -1077,8 +1106,56 @@ int attention_chunk() {
 
 int attention_rows_splits(int ctx) { return (ctx + attention_chunk() - 1) / attention_chunk(); }
 
+// RAGON_ATTN_LIVE_CHUNK (default 0, off; 1: the SM count with --kv-fp8, two thirds of it with the BF16 cache; N > 1: N
+// blocks a sequence for both): see attention_live_chunk. Measured on GB10 (48 SMs, 1 sequence, ms a layer, base ->
+// live): BF16 16 rows 4K 0.348 -> 0.114, 8K 0.353 -> 0.204, 12K 0.352 -> 0.298, 16K and up unchanged (48 blocks: 16K
+// 7% slower); FP8 16 rows 4K 0.382 -> 0.087, 8K 0.386 -> 0.134, 16K 0.392 -> 0.227. Not bit-exact against the fixed
+// chunk (other split points move the floats), so off by default. Served agent turns at 28K-62K take the same ms a
+// step, but the generated tokens differ on 7 of 16 turns (cause not identified: no decode chunk halves there by
+// design) and that workload fell 6.76 -> 6.37 tokens a step (-4.6% tok/s). The switch is for short contexts.
+static int attention_live_env() {
+  static const int t = [] {
+    const char* e = std::getenv("RAGON_ATTN_LIVE_CHUNK");
+    int v = e ? std::max(0, std::atoi(e)) : 0;
+    if (v == 1) {
+      int dev = 0;
+      check(cudaGetDevice(&dev), "device");
+      check(cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev), "SM count");
+      v = -v;  // the SM count: the BF16 target is two thirds of it
+    }
+    if (v) std::fprintf(stderr, "attention live chunk: up to %d blocks a sequence (BF16), %d (FP8 KV)\n",
+                        v < 0 ? -v * 2 / 3 : v, std::abs(v));
+    return v;
+  }();
+  return t;
+}
+int attention_live_target() { return std::abs(attention_live_env()); }
+static int attention_live_target(bool q8) {
+  const int v = attention_live_env();
+  return v < 0 && !q8 ? -v * 2 / 3 : std::abs(v);
+}
+
+// RAGON_ATTN_LIVE_MIN (default 512): the smallest live chunk, on the 32-key grid.
+int attention_live_min() {
+  static const int m = [] {
+    const char* e = std::getenv("RAGON_ATTN_LIVE_MIN");
+    const int v = e ? std::atoi(e) : 512;
+    return std::max(32, v / 32 * 32);
+  }();
+  return m;
+}
+
+// The grid's ranges for a launch over keys [0, ctx) whose sequences have at most `rows` rows each: with the live chunk
+// and a decode-sized launch, room for the target / Hkv ranges a smaller chunk may take (empty past a sequence's keys).
+int attention_rows_grid_splits(int ctx, int rows, int Hkv, bool q8) {
+  const int s = attention_rows_splits(ctx), t = attention_live_target(q8);
+  return t && rows <= kAttnLiveRows ? std::max(s, t / std::max(1, Hkv)) : s;
+}
+
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx) {
-  return static_cast<size_t>(M) * Hq * attention_rows_splits(ctx) * (D + 2);
+  const int t = attention_live_target(), hkv = std::max(1, Hq / 6);
+  const int splits = std::max(attention_rows_splits(ctx), t / hkv);  // the fewest blocks a range: one row block
+  return static_cast<size_t>(M) * Hq * splits * (D + 2);
 }
 
 // 32-key tiles, double-buffered. Measured at 24K context, 16 rows, realistic data: 0.57 ms per layer;
@@ -1300,12 +1377,13 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (td && g_attn_bulk) throw std::runtime_error("attention_rows: a tree verify needs the cp.async tiles (no --attn-bulk)");
   // The grid: the ranges covering the rows' keys, or (in a graph) every range up to fixed_ctx.
-  const int splits = attention_rows_splits(fixed_ctx > 0 ? fixed_ctx : pos0.host + M);
   constexpr int tk = kAttnTk, ns = kAttnNs;
   prepare_kernels();
   const int R = M * 6;
   const bool wide = attention_wide(R, q8.on(), td != nullptr);
   const int rows = wide ? kAttnPrefillRows : kAttnRows;
+  const int splits = attention_rows_grid_splits(fixed_ctx > 0 ? fixed_ctx : pos0.host + M, M, Hkv, q8.on());
+  const AttnLive lv{attention_live_target(q8.on()), attention_live_min()};
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
                     wide          ? attention_mma_kernel<kAttnPrefillRows, tk, ns, false>
                     : q8.on()     ? attention_mma_kernel<kAttnRows, tk, ns, false, true>
@@ -1313,7 +1391,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                                   : attention_mma_kernel<kAttnRows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kcache, vcache,
                     pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, wide), td, pages,
-                    q8);
+                    q8, lv);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
 }
@@ -1326,8 +1404,11 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   if (b.pos_dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
   constexpr int tk = kAttnTk, ns = kAttnNs;
-  int most = 0;
-  for (int i = 0; i < b.n; ++i) most = std::max(most, (b.row0[i + 1] - b.row0[i]) * 6);
+  int most = 0, least = 1 << 30;
+  for (int i = 0; i < b.n; ++i) {
+    most = std::max(most, (b.row0[i + 1] - b.row0[i]) * 6);
+    least = std::min(least, b.row0[i + 1] - b.row0[i]);
+  }
   const bool wide = attention_wide(most, q8.on(), false);
   const int rows = wide ? kAttnPrefillRows : kAttnRows;
   // One set of ranges for every sequence: those covering the furthest sequence's keys (or, in a graph, every range
@@ -1336,9 +1417,11 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   int ctx = fixed_ctx;
   if (ctx <= 0)
     for (int i = 0; i < b.n; ++i) ctx = std::max(ctx, b.pos[i] + b.row0[i + 1] - b.row0[i]);
-  const int splits = attention_rows_splits(ctx);
   AttnBlocks blocks{};
   for (int i = 0; i < b.n; ++i) blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
+  // The live chunk's room whenever any sequence is decode-sized (its chunk then never depends on its batch-mates).
+  const int splits = attention_rows_grid_splits(ctx, least, Hkv, q8.on());
+  const AttnLive lv{attention_live_target(q8.on()), attention_live_min()};
   prepare_kernels();
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
                     wide          ? attention_mma_seqs_kernel<kAttnPrefillRows, tk, ns, false>
@@ -1346,7 +1429,7 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
                     : g_attn_bulk ? attention_mma_seqs_kernel<kAttnRows, tk, ns, true>
                                   : attention_mma_seqs_kernel<kAttnRows, tk, ns, false>,
                     dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
-                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, wide), pages, q8);
+                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, wide), pages, q8, lv);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
@@ -1359,6 +1442,9 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
   if (b.pos_dev) throw std::runtime_error("attention_rows_cascade: positions on the host only (no captured graph)");
   if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
   if (groups.n < 1 || groups.n > kMaxSeqGroups) throw std::runtime_error("attention_rows_cascade: no groups");
+  // The live chunk is a sequence's own (its position's): a group's shared ranges have no one chunk, so with the
+  // switch on each sequence takes its own launch's ranges (the result per sequence is the cascade's contract).
+  if (attention_live_target()) return attention_rows_seqs(q, kc, vc, b, Hq, Hkv, D, scratch, out, s, 0, pages, q8);
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
   const int chunk = attention_chunk();
   int ctx = 0;
