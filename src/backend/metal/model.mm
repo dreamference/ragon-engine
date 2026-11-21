@@ -290,6 +290,7 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   ub_ = q.alloc(C * ffn_ * 4);
   logits_ = q.alloc(C * size_t(V_) * 4);
   if (const char* pr = std::getenv("RAGON_METAL_PROF")) prof_ = std::max(1, std::atoi(pr));
+  if (const char* c = std::getenv("RAGON_METAL_CONC")) conc_ = std::atoi(c) != 0;
   if (const char* mm = std::getenv("RAGON_METAL_MM_MIN")) mm_min_ = std::max(1, std::atoi(mm));
   mm_old_ = std::getenv("RAGON_METAL_MM_OLD") != nullptr;
   // Prefill: the norms and the MLP up matmul write the next matmul's half A themselves; =1 keeps the x_half passes.
@@ -364,7 +365,7 @@ void Model::to_q4(Lin& l) {
   [e setComputePipelineState:q_->pipe("q4_quant")];
   bind(e, {l.w, w, sb});
   [e setBytes:&ng length:4 atIndex:3];
-  [e dispatchThreads:MTLSizeMake(ng, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(ng, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
   l.fmt = Lin::kQ4;
   l.w = w;
   l.sc = sb;  // l.scale (the per-tensor FP8 scale) stays
@@ -405,13 +406,13 @@ void Model::dequant(id<MTLComputeCommandEncoder> e, const Lin& l, View out) {
     [e setComputePipelineState:q_->pipe(l.fmt == Lin::kQ4 ? "dq_q4" : "dq_nvfp4")];
     bind(e, {l.w, l.sc, out});
     [e setBytes:&n32 length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake(n32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(n32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   } else {
     const uint32_t n16 = l.N * (l.K / 16);
     [e setComputePipelineState:q_->pipe("dq_fp8")];
     bind(e, {l.w, out});
     [e setBytes:&n16 length:4 atIndex:2];
-    [e dispatchThreads:MTLSizeMake(n16, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(n16, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 }
 
@@ -434,7 +435,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
       [e setComputePipelineState:q_->pipe("x_half")];
       bind(e, {x, xh_});
       [e setBytes:xa length:16 atIndex:2];
-      [e dispatchThreads:MTLSizeMake(l.K, Mp, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [q_->pre(e) dispatchThreads:MTLSizeMake(l.K, Mp, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       xh_buf_ = (__bridge const void*)x.buf;
       xh_off_ = x.off;
       xh_k_ = l.K;
@@ -451,7 +452,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
       bind(e, {xa.empty() ? xh_ : xa, wd, y});
       [e setBytes:&ea length:sizeof(ea) atIndex:3];
       [e setBuffer:(mode == 3 ? xh2_ : y).buf offset:(mode == 3 ? xh2_ : y).off atIndex:4];
-      [e dispatchThreadgroups:MTLSizeMake(l.N / (wide ? 128 : 64), Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [q_->pre(e) dispatchThreadgroups:MTLSizeMake(l.N / (wide ? 128 : 64), Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       e = pm_sync(e, 2);
       return;
     }
@@ -459,7 +460,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     [e setComputePipelineState:q_->pipe("mm_nt_h")];
     bind(e, {xh_, wd, mmc_});
     bind_args(e, 3, m);
-    [e dispatchThreadgroups:MTLSizeMake(l.N / 64, Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(l.N / 64, Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     e = pm_sync(e, 2);
     const uint32_t sa[4] = {l.N, uint32_t(T), uint32_t(ldy), add ? 1u : 0u};
     const float f[2] = {l.scale, 0};
@@ -467,7 +468,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     bind(e, {mmc_, y});
     [e setBytes:sa length:16 atIndex:2];
     [e setBytes:f length:8 atIndex:3];
-    [e dispatchThreads:MTLSizeMake(l.N, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(l.N, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     e = pm_sync(e, 3);
     return;
   }
@@ -486,7 +487,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     bind_args(e, 3, a);
   }
   // one dispatch: threadgroup (x, y) takes output rows 8x.. and activation rows 8y..
-  [e dispatchThreadgroups:MTLSizeMake((l.N + 7) / 8, (T + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake((l.N + 7) / 8, (T + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   if (prof_ == 4) pm_sync(e, 2);
 }
 
@@ -511,7 +512,7 @@ void Model::norm(View x, View w, View z, View out, int rows, int n, int rpt, int
   bind_args(e, 4, a);
   const View oh = xh_.empty() ? out : xh_;  // xh_ exists only with the prefill matmul
   [e setBuffer:oh.buf offset:oh.off atIndex:5];
-  [e dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   if (ho) {
     xh_buf_ = (__bridge const void*)out.buf;
     xh_off_ = out.off;
@@ -532,8 +533,11 @@ struct GdnChunkArgs {
 void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
   const int cw = int(L.qkv.N), vw = Hv_ * Dv_;
   gemv(L.qkv, xn_, qkv_, T, hidden_, cw, false);
+  q_->overlap();  // z, a and b read xn_ like qkv
   gemv(L.z, xn_, zb_, T, hidden_, vw, false, 0, true);
+  q_->overlap();
   gemv(L.a, xn_, ab_, T, hidden_, Hv_, false, 0, true);
+  q_->overlap();
   gemv(L.b, xn_, bb_, T, hidden_, Hv_, false, 0, true);
   if (dump) {
     q_->sync();
@@ -546,13 +550,14 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     bind(e, {qkv_, L.conv_state, L.conv_w});
     uint32_t ca[2] = {uint32_t(cw), uint32_t(T)};
     [e setBytes:ca length:8 atIndex:3];
-    [e dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
+  if (!chunked) q_->overlap();  // the gates do not touch the conv's buffers
   [e setComputePipelineState:q_->pipe("gdn_gates")];
   bind(e, {ab_, bb_, L.A_log, L.dt_bias});
   uint32_t ga[2] = {uint32_t(Hv_), uint32_t(T)};
   [e setBytes:ga length:8 atIndex:4];
-  [e dispatchThreads:MTLSizeMake(Hv_ * T, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(Hv_ * T, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
   if (dump) {
     q_->sync();
     if (!chunked) dump(tag + "conv", qkv_, {T, cw});
@@ -572,12 +577,12 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     [e setComputePipelineState:q_->pipe("gdn_conv_h")];
     bind(e, {qkv_, L.conv_state, L.conv_w, gq_, gk_, gv_});
     bind_args(e, 6, ga2);
-    [e dispatchThreads:MTLSizeMake(cw, nc, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(cw, nc, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (nc > 1) {
       [e setComputePipelineState:q_->pipe("gdn_conv_state")];
       bind(e, {qkv_, L.conv_state});
       bind_args(e, 2, ga2);
-      [e dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [q_->pre(e) dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     if (prof_ >= 3) {
       gtp_[0] += q_->sync();
@@ -586,7 +591,7 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     [e setComputePipelineState:q_->pipe("gdn_chunk_prep")];
     bind(e, {gq_, gk_, gv_, ab_, bb_, gW_, gU_, gA2_, glg_});
     bind_args(e, 9, ga2);
-    [e dispatchThreadgroups:MTLSizeMake(nc, Hv_, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(nc, Hv_, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     if (prof_ >= 3) {
       gtp_[1] += q_->sync();
       e = q_->encoder();
@@ -594,7 +599,7 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     [e setComputePipelineState:q_->pipe("gdn_chunk_seq")];
     bind(e, {gk_, gW_, gU_, gA2_, glg_, L.S, core_});
     bind_args(e, 7, ga2);
-    [e dispatchThreadgroups:MTLSizeMake(Dv_ / 32, Hv_, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Dv_ / 32, Hv_, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     if (prof_ >= 3) {
       gtp_[2] += q_->sync();
       if (++gtn_ % 48 == 0) std::fprintf(stderr, "gdn chunk s: conv %.3f prep %.3f seq %.3f\n", gtp_[0], gtp_[1], gtp_[2]);
@@ -605,7 +610,7 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     bind(e, {qkv_, ab_, bb_, L.S, core_});
     GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw)};
     bind_args(e, 5, g);
-    [e dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / (four ? 32 : 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / (four ? 32 : 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
   if (prof_) {
     const double tr = q_->sync();
@@ -633,33 +638,37 @@ struct AttnArgs {
 void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::string& tag) {
   const int qw = H_ * 2 * D_, kw = KV_ * D_;
   gemv(L.q, xn_, qg_, T, hidden_, qw, false);
+  q_->overlap();  // k and v read xn_ like q
   gemv(L.k, xn_, kb_, T, hidden_, kw, false, 0, true);
+  q_->overlap();
   gemv(L.v, xn_, vb_, T, hidden_, kw, false, 0, true);
   norm(qg_, L.q_norm, View{}, qg_, T * H_, D_, H_, qw, 2 * D_, qw, 2 * D_, 0);
+  q_->overlap();  // k's norm is independent of q's
   norm(kb_, L.k_norm, View{}, kb_, T * KV_, D_, KV_, kw, D_, kw, D_, 0);
   id<MTLComputeCommandEncoder> e = q_->encoder();
   [e setComputePipelineState:q_->pipe("rope_rows")];
   RopeArgs rq{uint32_t(H_), uint32_t(qw), uint32_t(2 * D_), uint32_t(rot_ / 2), uint32_t(pos0)};
   bind(e, {qg_, cos_, sin_});
   bind_args(e, 3, rq);
-  [e dispatchThreads:MTLSizeMake(rot_ / 2, T * H_, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(rot_ / 2, T * H_, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
   RopeArgs rk{uint32_t(KV_), uint32_t(kw), uint32_t(D_), uint32_t(rot_ / 2), uint32_t(pos0)};
+  q_->overlap();  // k's rope is independent of q's
   bind(e, {kb_, cos_, sin_});
   bind_args(e, 3, rk);
-  [e dispatchThreads:MTLSizeMake(rot_ / 2, T * KV_, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(rot_ / 2, T * KV_, 1) threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
   if (kv8_) {
     if (D_ != 256) fail("int8 KV needs head dim 256");
     [e setComputePipelineState:q_->pipe("kv_write8")];
     bind(e, {kb_, vb_, L.kc, L.vc, L.ks, L.vs});
     const uint32_t kva[4] = {uint32_t(KV_), uint32_t(D_), uint32_t(pos0), 0};
     [e setBytes:kva length:16 atIndex:6];
-    [e dispatchThreadgroups:MTLSizeMake(KV_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(KV_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   } else {
     [e setComputePipelineState:q_->pipe("kv_write")];
     bind(e, {kb_, vb_, L.kc, L.vc});
     uint32_t kva[2] = {uint32_t(kw), uint32_t(pos0)};
     [e setBytes:kva length:8 atIndex:4];
-    [e dispatchThreads:MTLSizeMake(kw, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(kw, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
   if (dump) {
     q_->sync();
@@ -697,11 +706,11 @@ void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::st
     [e setBuffer:ks.buf offset:ks.off atIndex:5];
     [e setBuffer:vs.buf offset:vs.off atIndex:6];
   }
-  [e dispatchThreadgroups:MTLSizeMake(nch, fused ? KV_ : H_, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(nch, fused ? KV_ : H_, T) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [e setComputePipelineState:q_->pipe("attn_combine")];
   bind(e, {part_, ob_});
   bind_args(e, 2, a);
-  [e dispatchThreadgroups:MTLSizeMake(H_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(H_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
   if (dump) {
     q_->sync();
@@ -712,7 +721,7 @@ void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::st
   uint32_t hd[4] = {uint32_t(H_), uint32_t(D_), 0, 0};
   bind(e, {ob_, qg_});
   [e setBytes:hd length:16 atIndex:2];
-  [e dispatchThreads:MTLSizeMake(H_ * D_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(H_ * D_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   gemv(L.o, ob_, h_, T, H_ * D_, hidden_, true);
 }
 
@@ -732,14 +741,14 @@ void Model::attention_mm(Layer& L, int T, int pos0) {
   bind(e, {qg_, qb_});
   bind_args(e, 2, a);
   if (flash) [e setBytes:&g length:4 atIndex:3];
-  [e dispatchThreads:MTLSizeMake(D, Tp, H) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(D, Tp, H) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   View kc = L.kc, vc = L.vc;
   if (kv8_) {  // expand this layer's int8 cache to bfloat once per chunk (rows past pos0 + T zero)
     [e setComputePipelineState:q_->pipe("kv_dq8")];
     bind(e, {L.kc, L.vc, L.ks, L.vs, kdq_, vdq_});
     const uint32_t da[4] = {uint32_t(KV_), D, uint32_t(pos0 + T), 0};
     [e setBytes:da length:16 atIndex:6];
-    [e dispatchThreads:MTLSizeMake(kw, kvp, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(kw, kvp, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     kc = kdq_;
     vc = vdq_;
   }
@@ -752,23 +761,23 @@ void Model::attention_mm(Layer& L, int T, int pos0) {
     bind(e, {qb_, kc, vc, ob_});
     bind_args(e, 4, a);
     [e setBytes:&flash_dbg_ length:4 atIndex:5];
-    [e dispatchThreadgroups:MTLSizeMake(Tp * g / br, KV_, 1) threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Tp * g / br, KV_, 1) threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
     return;
   }
   MmArgs s{Tp, kvp, D, D, kw, kvp, Tp * D, D, Tp * kvp, g};
   [e setComputePipelineState:q_->pipe("mm_nt_b")];
   bind(e, {qb_, kc, S_});
   bind_args(e, 3, s);
-  [e dispatchThreadgroups:MTLSizeMake(kvp / 64, Tp / 64, H) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(kvp / 64, Tp / 64, H) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   [e setComputePipelineState:q_->pipe("softmax_causal")];
   bind(e, {S_, P_});
   bind_args(e, 2, a);
-  [e dispatchThreadgroups:MTLSizeMake(Tp, H, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Tp, H, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   MmArgs o{Tp, D, kvp, kvp, kw, H * D, Tp * kvp, D, D, g};
   [e setComputePipelineState:q_->pipe("mm_nn_b")];
   bind(e, {P_, vc, ob_});
   bind_args(e, 3, o);
-  [e dispatchThreadgroups:MTLSizeMake(D / 64, Tp / 64, H) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(D / 64, Tp / 64, H) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 }
 
 void Model::layer(size_t i, int T, int pos0, const Dump& dump) {
@@ -796,13 +805,14 @@ void Model::layer(size_t i, int T, int pos0, const Dump& dump) {
   } else if (mm_fused(L.up, T)) {
     gemv(L.up, xn_, gb_, T, hidden_, ffn_, false, 2, true);  // gb = silu(gate) * up in the matmul's store
   } else {
+    q_->overlap();  // up reads xn_ like gate
     gemv(L.up, xn_, ub_, T, hidden_, ffn_, false, 0, true);
     e = q_->encoder();
     [e setComputePipelineState:q_->pipe("silu_mul")];
     bind(e, {gb_, ub_, gb_});
     const uint32_t n = uint32_t(T * ffn_);
     [e setBytes:&n length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     e = pm_sync(e, 4);
   }
   gemv(L.down, gb_, h_, T, ffn_, hidden_, true, 0, false, h3 ? xh2_ : View{});
@@ -817,12 +827,13 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
   if (T > C_) fail("forward: T exceeds the chunk");
   if (pos0 + T > max_ctx_) fail("forward: context exceeds max_ctx");
   if (ids) std::memcpy(ids_.host<uint32_t>(), ids, size_t(T) * 4);  // null: the ids are already on the device
+  q_->concurrent = conc_ && T < mm_min_ && !prof_ && !dump;  // decode: independent small dispatches overlap
   id<MTLComputeCommandEncoder> e = q_->encoder();
   [e setComputePipelineState:q_->pipe("embed_bf16")];
   bind(e, {ids_, embed_, h_});
   const uint32_t dim = uint32_t(hidden_);
   [e setBytes:&dim length:4 atIndex:3];
-  [e dispatchThreads:MTLSizeMake(hidden_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(hidden_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   if (dump) {
     q_->sync();
     dump("embed", h_, {T, hidden_});
@@ -840,6 +851,7 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     dump("final_norm", xn_, {rows, hidden_});
   }
   gemv(head_, xn_, logits_, rows, hidden_, V_, false);
+  q_->concurrent = false;  // the encoder in use keeps its kind
   if (greedy_) {
     struct {
       uint32_t n, nb, banned[8];
@@ -849,7 +861,7 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     [e2 setComputePipelineState:q_->pipe("top2_ban")];
     bind(e2, {logits_, ids_, gout_.at(size_t(gstep_) * 12)});
     bind_args(e2, 3, a);
-    [e2 dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    [q_->pre(e2) dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
     id<MTLCommandBuffer> cb = q_->cb;
     q_->flush();
     gcb_.push_back(cb);
@@ -909,7 +921,7 @@ void Model::prefill(const uint32_t* ids, int P) {
     bind(e, {ids_, embed_, hall_.at(size_t(c) * C_ * row)});
     const uint32_t dim = uint32_t(hidden_);
     [e setBytes:&dim length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake(hidden_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(hidden_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     q_->sync();
   }
   const View h0 = h_;
