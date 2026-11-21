@@ -455,18 +455,25 @@ __device__ __forceinline__ void attention_mma_body(const float* __restrict__ q, 
   auto tile_compute = [&](const __nv_bfloat16* ks, int k0, bool ca, bool cb) {
     const __nv_bfloat16* vs = ks + TK * KS;
     {
-      // S = Q K^T for 16 rows x 32 keys: 4 key tiles of 8.
+      // S = Q K^T for 16 rows x 32 keys: 4 key tiles of 8. K's B fragments of two dim steps (s, s + 1) of one key tile
+      // come in one ldmatrix.x4 (matrix i: keys n * 8 .. + 7, dims 16 s + 8 i .. + 7; lane l addresses key l & 7 of
+      // matrix l >> 3), a quarter of the shared-load instructions of two 32-bit loads per MMA. Each sc[n] still takes
+      // its MMAs in the order s = 0, 1, ...: the same values into the same accumulation, bit for bit.
       float sc[TK / 8][4];
 #pragma unroll
       for (int n = 0; n < TK / 8; ++n) sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0.f;
 #pragma unroll
-      for (int s = 0; s < D / 16; ++s) {
+      for (int s = 0; s < D / 16; s += 2) {
 #pragma unroll
         for (int n = 0; n < TK / 8; ++n) {
-          const __nv_bfloat16* kr = ks + (n * 8 + g) * KS + 16 * s;
-          mma_bf16_16816(sc[n], qf[s][0], qf[s][1], qf[s][2], qf[s][3],
-                         *reinterpret_cast<const uint32_t*>(kr + 2 * t),
-                         *reinterpret_cast<const uint32_t*>(kr + 8 + 2 * t));
+          const uint32_t addr = static_cast<uint32_t>(
+              __cvta_generic_to_shared(ks + (n * 8 + (lane & 7)) * KS + 16 * s + (lane >> 3) * 8));
+          uint32_t b0, b1, b2, b3;
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                       : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
+                       : "r"(addr));
+          mma_bf16_16816(sc[n], qf[s][0], qf[s][1], qf[s][2], qf[s][3], b0, b1);
+          mma_bf16_16816(sc[n], qf[s + 1][0], qf[s + 1][1], qf[s + 1][2], qf[s + 1][3], b2, b3);
         }
       }
       // Mask (causal, and the range end), then the online softmax for rows a and b.
