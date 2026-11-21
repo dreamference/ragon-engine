@@ -39,9 +39,11 @@ constexpr int kTileBytesFp4 = 16 * 64 + 16 * 8, kTileBytesFp8 = 16 * 128;
 constexpr int kValueBytesFp4 = 16 * 64;  // B26: a coded blob's value blocks (its codes follow them all, stream_gemm.cu)
 
 // A block computes kBM tokens x BN weight rows; 8 warps, 2 along M x 4 along N, each 64 x BN / 4.
-template <int BN, int STAGES>
+// FP8 stages carry no block scales (FP4 false), which leaves room for a fourth 128 x 256 stage.
+template <int BN, int STAGES, bool FP4 = true>
 struct Shape {
-  static constexpr int kStageA = kBM * kRowBytes, kStageB = BN * kRowBytes, kStageSA = kBM * 8, kStageSB = BN * 8;
+  static constexpr int kStageA = kBM * kRowBytes, kStageB = BN * kRowBytes, kStageSA = FP4 ? kBM * 8 : 0,
+                       kStageSB = FP4 ? BN * 8 : 0;
   static constexpr int kStageBytes = kStageA + kStageB + kStageSA + kStageSB;
   static constexpr int kSmemBytes = STAGES * kStageBytes;
   static constexpr int kNF = BN / 4 / 8;  // n8 fragments per warp
@@ -140,7 +142,7 @@ __device__ __forceinline__ const uint8_t* weight_row(const GemmArgs& p, int n0, 
 // threads 0-127) or of two rows (weights, threads 128-191).
 template <bool FP4, int BN, int STAGES, bool SWIGLU = false>
 struct Loader {
-  using S = Shape<BN, STAGES>;
+  using S = Shape<BN, STAGES, FP4>;
   static constexpr int kBPieces = BN * 4 / kThreads;
   const uint8_t* a[2];
   const uint8_t* b[kBPieces];
@@ -224,7 +226,7 @@ __device__ __forceinline__ uint32_t e2m1x2(float lo, float hi) {
 template <bool FP4, int BN, int STAGES>
 __device__ __forceinline__ void compute_stage(const uint8_t* st, float (&acc)[4][Shape<BN, STAGES>::kNF][4], int lane,
                                               int wm, int wn) {
-  using S = Shape<BN, STAGES>;
+  using S = Shape<BN, STAGES, FP4>;
   constexpr int NF = S::kNF, WN = BN / 4;
   const int lr = lane & 7, mat = lane >> 3;
   const uint32_t sA = smem_addr(st), sB = sA + S::kStageA;
@@ -405,7 +407,7 @@ __device__ __forceinline__ void epilogue_lora(const GemmArgs& p, const float (&a
 
 template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false, bool LORA = false>
 __global__ void __launch_bounds__(kThreads) prefill_gemm_kernel(GemmArgs p) {
-  using S = Shape<BN, STAGES>;
+  using S = Shape<BN, STAGES, FP4>;
   constexpr int NF = S::kNF;
   extern __shared__ __align__(128) uint8_t smem[];
   const int m0 = blockIdx.x * kBM, n0 = blockIdx.y * BN;
@@ -633,7 +635,7 @@ void check_launch(const char* what) {
 
 template <bool FP4, int BN, int STAGES, bool SWIGLU = false, bool OUT_BF16 = false, bool LORA = false>
 void launch_shape(const GemmArgs& p, cudaStream_t s) {
-  using S = Shape<BN, STAGES>;
+  using S = Shape<BN, STAGES, FP4>;
   static bool configured = false;
   if (!configured) {
     cudaFuncSetAttribute(prefill_gemm_kernel<FP4, BN, STAGES, SWIGLU, OUT_BF16, LORA>,
@@ -653,6 +655,17 @@ int gemm_shape() {
   return v;
 }
 
+// The FP8 GEMMs run deeper rings (128 x 256 x 4 stages, 128 x 128 x 6; RAGON_GEMM_FP8_DEEP=0: 3 and 4 as before):
+// a stage holds only 64 FP8 values of K, so 3 stages left too few loads in flight. Same MMAs in the same K order,
+// so the same bits. GB10, 2,048 rows: the model's FP8 projections 127-141 -> 143-145 TFLOPS.
+bool gemm_fp8_deep() {
+  static const bool v = [] {
+    const char* e = std::getenv("RAGON_GEMM_FP8_DEEP");
+    return !e || std::atoi(e) != 0;
+  }();
+  return v;
+}
+
 template <bool FP4, bool OUT_BF16 = false, bool LORA = false>
 void launch_gemm(const GemmArgs& p, cudaStream_t s) {
   if (p.N % 128 != 0 || p.K % 128 != 0) throw std::runtime_error("prefill_gemm: N % 128 and K % 128 must be 0");
@@ -660,6 +673,14 @@ void launch_gemm(const GemmArgs& p, cudaStream_t s) {
   int shape = gemm_shape();
   // 128 x 256 tiles (measured +12-25% on the NVFP4 matrices at 512-2,048 rows) when they still give two waves.
   if (shape == 0) shape = (p.M + kBM - 1) / kBM * (p.N / 256) >= 96 ? 2 : 1;
+  if constexpr (!FP4) {
+    if (gemm_fp8_deep()) {
+      if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 4, false, OUT_BF16, LORA>(p, s);
+      else launch_shape<FP4, 128, 6, false, OUT_BF16, LORA>(p, s);
+      check_launch("prefill_gemm_fp8");
+      return;
+    }
+  }
   if (shape == 2 && p.N % 256 == 0) launch_shape<FP4, 256, 3, false, OUT_BF16, LORA>(p, s);
   else launch_shape<FP4, 128, 4, false, OUT_BF16, LORA>(p, s);
   check_launch(FP4 ? "prefill_gemm_nvfp4" : "prefill_gemm_fp8");
