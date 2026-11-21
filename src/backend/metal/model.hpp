@@ -49,6 +49,9 @@ struct Lin {
   View w, sc;
   float scale = 1.0f;
   uint32_t N = 0, K = 0;
+  // layer-major prefill: the half weight already sits at wlay_ + dq_off (dequantized once for all chunks)
+  bool dq_ready = false;
+  size_t dq_off = 0;
 };
 
 struct Layer {
@@ -74,6 +77,10 @@ class Model {
   // Runs T <= chunk tokens at positions pos0.. and leaves logits for the last row (all rows if all_logits) in
   // logits(). With dump set, syncs at each check point and hands the buffer to it.
   void forward(const uint32_t* ids, int T, int pos0, bool all_logits, const Dump& dump = nullptr);
+  // A new sequence's whole prompt (P tokens from position 0) in chunk-sized pieces, layer by layer: each layer's
+  // weights are dequantized once for all chunks. Same kernels on the same inputs as forward() chunk by chunk, so
+  // the same results; RAGON_METAL_LAYER_MAJOR=0 runs the chunk loop instead. Leaves the last row's logits.
+  void prefill(const uint32_t* ids, int P);
   const float* logits() const { return logits_.host<float>(); }
   int vocab() const { return V_; }
   int chunk() const { return C_; }
@@ -83,7 +90,7 @@ class Model {
   double prof[5] = {0, 0, 0, 0, 0};
   // RAGON_METAL_PROF=2 also syncs after each prefill matmul pass: pm[0..4] = weight dequant, x to half, matmul,
   // store, silu_mul; pm[5] = the other work queued before each matmul (these seconds are then missing from
-  // prof[0..3]).
+  // prof[0..3]). RAGON_METAL_PROF=4 also syncs around each GEMV (decode): pm[2] = the GEMVs, pm[5] = the rest.
   double pm[6] = {0, 0, 0, 0, 0, 0};
 
  private:
@@ -103,6 +110,8 @@ class Model {
   void norm(View x, View w, View z, View out, int rows, int n, int rpt, int ldt, int ldh, int ldo_t, int ldo_h,
             int mode, float scale = 1.0f, const Lin* next = nullptr, int T = 0);
   void gdn(Layer& L, int T, const Dump& dump, const std::string& tag);
+  void layer(size_t i, int T, int pos0, const Dump& dump);  // one decoder layer over h_'s T rows
+  void dequant(id<MTLComputeCommandEncoder> e, const Lin& l, View out);
   void attention(Layer& L, int T, int pos0, const Dump& dump, const std::string& tag);
   Lin lin(const std::string& prefix);
 
@@ -135,6 +144,9 @@ class Model {
   View ids_, h_, xn_, qkv_, zb_, ab_, bb_, core_, gated_, qg_, kb_, vb_, ob_, part_, gb_, ub_, logits_, cos_, sin_;
   // prefill matmul scratch: half weights, half activations, f32 product; attention Q, scores, probabilities
   View wdq_, xh_, mmc_, qb_, S_, P_;
+  // layer-major prefill: the whole prompt's hidden rows and one layer's half weights
+  View hall_, wlay_;
+  bool layer_major_ = true;
   // chunked GDN prefill (RAGON_METAL_GDN_OLD=1 keeps the token loop): half q/k/v, per (sub-chunk, head) W, Uv, A2, lg
   View gq_, gk_, gv_, gW_, gU_, gA2_, glg_;
   double gtp_[3] = {0, 0, 0};  // RAGON_METAL_PROF=3: the chunked kernels apart (measurement only)
