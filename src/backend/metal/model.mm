@@ -475,12 +475,21 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     dump(tag + "beta", bb_, {T, Hv_});
     e = q_->encoder();
   }
+  if (prof_) {
+    prof[1] += q_->sync();
+    e = q_->encoder();
+  }
   const bool four = T >= 16;  // prefill: four state rows a simdgroup
   [e setComputePipelineState:q_->pipe(four ? "gdn_recurrent4" : "gdn_recurrent")];
   bind(e, {qkv_, ab_, bb_, L.S, core_});
   GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw)};
   bind_args(e, 5, g);
   [e dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / (four ? 32 : 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (prof_) {
+    const double tr = q_->sync();
+    prof[1] += tr;
+    prof[4] += tr;
+  }
   if (dump) {
     q_->sync();
     dump(tag + "core", core_, {T, vw});

@@ -209,8 +209,8 @@ int main(int argc, char** argv) {
       for (int s = 0; s < P; s += chunk) m.forward(pr.data() + s, std::min(chunk, P - s), s, false);
       const double prefill_s = now() - tp;
       if (std::getenv("RAGON_METAL_PROF"))
-        std::fprintf(stderr, "prefill GPU s: attention %.3f, GDN %.3f, MLP %.3f, head %.3f\n", m.prof[0], m.prof[1],
-                     m.prof[2], m.prof[3]);
+        std::fprintf(stderr, "prefill GPU s: attention %.3f, GDN %.3f (recurrence %.3f), MLP %.3f, head %.3f\n",
+                     m.prof[0], m.prof[1], m.prof[4], m.prof[2], m.prof[3]);
       std::vector<int> gen;
       float min_gap = INFINITY;
       int div = -1, div_ref = -1;

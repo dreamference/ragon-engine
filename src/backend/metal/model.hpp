@@ -78,8 +78,9 @@ class Model {
   int vocab() const { return V_; }
   int chunk() const { return C_; }
   std::vector<int> eos_ids;
-  // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head.
-  double prof[4] = {0, 0, 0, 0};
+  // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head;
+  // prof[4] = the GDN recurrence alone (part of prof[1]).
+  double prof[5] = {0, 0, 0, 0, 0};
 
  private:
   // y[T][N] (=|+=) x[T][K] W^T: GEMV kernels for decode and short chunks, tensor-op matmul for T >= mm_min_.
