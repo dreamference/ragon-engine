@@ -1194,3 +1194,269 @@ kernel void gdn_recurrent4(device const float* conv [[buffer(0)]], device const 
   }
   for (uint i = 0; i < 4; ++i) *(device float4*)(S + (ulong)(row0 + i) * a.Dk + lane * 4) = s[i];
 }
+
+// ---- chunked GDN recurrence for prefill (Dk = Dv = 128, sub-chunks of 64 tokens) -------------------------------------
+// Per sub-chunk c and v head h, with lg the cumulative log gate inside the sub-chunk (G_t = exp(lg_t)), q and k
+// normalized, A the strictly lower beta_t (G_t/G_j) k_t.k_j and X = (I + A)^-1 (f32 forward substitution):
+//   U = X diag(beta) V - X diag(beta G) K S^T = Uv - W S^T,  O = diag(G) Q S^T + (Q K^T * G_t/G_j, j <= t) U,
+//   S <- G_C S + (diag(G_C/G) U)^T K.
+// gdn_conv_h runs the conv in token blocks and writes raw q, k, v as half (pad rows zero); gdn_chunk_prep folds the
+// l2 norms (q times Dk^-0.5) into its scalars and builds Uv, W (X diag(..) as hi + lo halves, so the factor keeps ~f32
+// precision), A2 = [G Q | masked Q K^T] and the S-update scales for every (c, h) in parallel; gdn_chunk_seq walks
+// the sub-chunks of one head and a block of state rows with S in registers (f32).
+// Pad rows (t >= T) carry beta 0, gate 1 and zero q/k/v: an exact identity on S.
+struct GdnChunkArgs {
+  uint T, Hk, Hv, ldc;  // ldc: channels of the conv output (q | k | v)
+};
+
+// grid (ldc, token blocks of 64 over the padded chunk). The conv state moves in gdn_conv_state (several blocks) or
+// here (one block).
+kernel void gdn_conv_h(device const float* x [[buffer(0)]], device float* state [[buffer(1)]],
+                       device const float* w [[buffer(2)]], device half* qr [[buffer(3)]], device half* kr [[buffer(4)]],
+                       device half* vr [[buffer(5)]], constant GdnChunkArgs& a [[buffer(6)]],
+                       uint2 pos [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
+  const uint C = a.ldc, c = pos.x, t0 = pos.y * 64, qw = a.Hk * 128;
+  if (c >= C) return;
+  const float w0 = w[c * 4 + 0], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+  float s0, s1, s2;
+  if (t0 == 0) {
+    s0 = state[c], s1 = state[C + c], s2 = state[2 * C + c];
+  } else {
+    s0 = x[(ulong)(t0 - 3) * C + c], s1 = x[(ulong)(t0 - 2) * C + c], s2 = x[(ulong)(t0 - 1) * C + c];
+  }
+  device half* dst = c < qw ? qr + c : (c < 2 * qw ? kr + (c - qw) : vr + (c - 2 * qw));
+  const uint ld = c < 2 * qw ? qw : a.Hv * 128;
+  for (uint t = t0; t < t0 + 64; ++t) {
+    float o = 0.0f;
+    if (t < a.T) {
+      const float v = x[(ulong)t * C + c];
+      o = w0 * s0 + w1 * s1 + w2 * s2 + w3 * v;
+      o = o / (1.0f + exp(-o));
+      s0 = s1;
+      s1 = s2;
+      s2 = v;
+    }
+    dst[(ulong)t * ld] = half(o);
+  }
+  if (grid.y == 1) {
+    state[c] = s0;
+    state[C + c] = s1;
+    state[2 * C + c] = s2;
+  }
+}
+
+// After a multi-block gdn_conv_h (T >= 3): the state is the last three inputs.
+kernel void gdn_conv_state(device const float* x [[buffer(0)]], device float* state [[buffer(1)]],
+                           constant GdnChunkArgs& a [[buffer(2)]], uint c [[thread_position_in_grid]]) {
+  const uint C = a.ldc;
+  if (c >= C) return;
+  for (uint i = 0; i < 3; ++i) state[i * C + c] = x[(ulong)(a.T - 3 + i) * C + c];
+}
+
+// grid (sub-chunks, Hv), 256 threads. Outputs a block (c, h) = c * Hv + h: W [64][128], Uv [64][128], A2 [64][192] half,
+// sc [128] f32: [0, 64) the S-update scale G_C/G_t / |k_t|, [64] G_C.
+kernel void gdn_chunk_prep(device const half* qr [[buffer(0)]], device const half* kr [[buffer(1)]],
+                           device const half* vr [[buffer(2)]], device const float* g [[buffer(3)]],
+                           device const float* beta [[buffer(4)]], device half* W [[buffer(5)]],
+                           device half* Uv [[buffer(6)]], device half* A2 [[buffer(7)]], device float* sco [[buffer(8)]],
+                           constant GdnChunkArgs& a [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint C = 64, D = 128, NSG = 8;
+  threadgroup float sX[C * C];  // A; then two half matrices (hi | lo)
+  threadgroup float sLg[C], sBe[C], sRq[C], sRk[C];
+  const uint c = tg.x, h = tg.y, hk = h / (a.Hv / a.Hk), t0 = c * C;
+  const ulong blk = (ulong)c * a.Hv + h;
+  const uint ldk = a.Hk * D, ldv = a.Hv * D;
+  {  // inverse norms: q rows by threads 0..127, k rows by 128..255, two lanes a row
+    const uint isk = tid >> 7, r = (tid >> 1) & 63, p = tid & 1;
+    device const half* src = (isk ? kr : qr) + (ulong)(t0 + r) * ldk + hk * D + p * 64;
+    float n = 0.0f;
+    for (uint k = 0; k < 64; k += 4) {
+      const float4 v = float4(*(device const half4*)(src + k));
+      n += dot(v, v);
+    }
+    n += simd_shuffle_xor(n, 1);
+    if (p == 0) (isk ? sRk : sRq)[r] = rsqrt(n + 1e-6f) * (isk ? 1.0f : rsqrt(float(D)));
+  }
+  if (sg == 0) {
+    float x[2], b[2];
+    for (uint u = 0; u < 2; ++u) {
+      const uint t = t0 + lane + 32 * u;
+      x[u] = t < a.T ? max(log(g[(ulong)t * a.Hv + h]), -80.0f) : 0.0f;
+      b[u] = t < a.T ? beta[(ulong)t * a.Hv + h] : 0.0f;
+    }
+    const float p0 = simd_prefix_inclusive_sum(x[0]);
+    const float p1 = simd_prefix_inclusive_sum(x[1]) + simd_broadcast(p0, 31);
+    sLg[lane] = p0;
+    sLg[lane + 32] = p1;
+    sBe[lane] = b[0];
+    sBe[lane + 32] = b[1];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < C) {
+    const float lgC = sLg[C - 1];
+    sco[blk * 2 * C + tid] = exp(lgC - sLg[tid]) * sRk[tid];
+    if (tid == 0) sco[blk * 2 * C + C] = exp(lgC);
+  }
+  auto tK = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)kr + (ulong)t0 * ldk + hk * D,
+                                                                    dextents<int32_t, 2>(D, C), array<int32_t, 2>{1, int(ldk)});
+  auto tQ = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)qr + (ulong)t0 * ldk + hk * D,
+                                                                    dextents<int32_t, 2>(D, C), array<int32_t, 2>{1, int(ldk)});
+  auto tV = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)vr + (ulong)t0 * ldv + h * D,
+                                                                    dextents<int32_t, 2>(D, C), array<int32_t, 2>{1, int(ldv)});
+  auto mK = tK.slice(0, 0);
+  auto mQ = tQ.slice(0, 0);
+  auto mV = tV.slice(0, 0);
+  constexpr auto d1 = matmul2d_descriptor(C, C, D, false, true, false);
+  matmul2d<d1, execution_simdgroups<NSG>> op1;
+  device half* a2 = A2 + blk * C * 192;
+  {
+    auto cK = op1.template get_destination_cooperative_tensor<decltype(mK), decltype(mK), float>();
+    op1.run(mK, mK, cK);
+#pragma unroll
+    for (uint16_t i = 0; i < cK.get_capacity(); ++i)
+      if (cK.is_valid_element(i)) {
+        const auto ix = cK.get_multidimensional_index(i);
+        const uint j = uint(ix[0]), r = uint(ix[1]);
+        sX[r * C + j] = j < r ? sBe[r] * exp(sLg[r] - sLg[j]) * sRk[r] * sRk[j] * cK[i] : 0.0f;
+      }
+    auto cQ = op1.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
+    op1.run(mQ, mK, cQ);
+#pragma unroll
+    for (uint16_t i = 0; i < cQ.get_capacity(); ++i)
+      if (cQ.is_valid_element(i)) {
+        const auto ix = cQ.get_multidimensional_index(i);
+        const uint j = uint(ix[0]), r = uint(ix[1]);
+        a2[r * 192 + 128 + j] = half(j <= r ? exp(sLg[r] - sLg[j]) * sRq[r] * sRk[j] * cQ[i] : 0.0f);
+      }
+  }
+  for (uint e = tid; e < C * D / 4; e += 256) {
+    const uint r = e / (D / 4), k = (e % (D / 4)) * 4;
+    const float4 v = float4(*(device const half4*)(qr + (ulong)(t0 + r) * ldk + hk * D + k));
+    *(device half4*)(a2 + r * 192 + k) = half4(exp(sLg[r]) * sRq[r] * v);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // X = (I + A)^-1 by forward substitution, X_ic = d_ic - sum_{j < i} A_ij X_jc: simdgroup sg owns columns 8 sg..8 sg+7,
+  // lane l rows l and l + 32 (registers), one simd_sum a row and column, no barriers.
+  float x0[8], x1[8];
+#pragma unroll
+  for (uint m = 0; m < 8; ++m) x0[m] = x1[m] = 0.0f;
+  for (uint i = 0; i < C; ++i) {
+    const float a0 = sX[i * C + lane], a1 = sX[i * C + lane + 32];
+#pragma unroll
+    for (uint m = 0; m < 8; ++m) {
+      const float v = (i == sg * 8 + m ? 1.0f : 0.0f) - simd_sum(a0 * x0[m] + a1 * x1[m]);
+      if (i == lane) x0[m] = v;
+      if (i == lane + 32) x1[m] = v;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup half* sH = (threadgroup half*)sX;
+  auto tHi = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sH, dextents<int32_t, 2>(C, C), array<int32_t, 2>{1, int(C)});
+  auto tLo = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sH + C * C, dextents<int32_t, 2>(C, C), array<int32_t, 2>{1, int(C)});
+  constexpr auto d2 = matmul2d_descriptor(C, D, C, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<d2, execution_simdgroups<NSG>> op2;
+  for (uint pass = 0; pass < 2; ++pass) {  // 0: Uv = X diag(beta) V, 1: W = X diag(beta G / |k|) K
+#pragma unroll
+    for (uint m = 0; m < 8; ++m) {
+      const uint j = sg * 8 + m;
+      const float fj = sBe[j] * (pass ? exp(sLg[j]) * sRk[j] : 1.0f);
+      const float f0 = x0[m] * fj, f1 = x1[m] * fj;
+      const half h0 = half(f0), h1 = half(f1);
+      sH[lane * C + j] = h0;
+      sH[(lane + 32) * C + j] = h1;
+      sH[C * C + lane * C + j] = half(f0 - float(h0));
+      sH[C * C + (lane + 32) * C + j] = half(f1 - float(h1));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto cU = op2.template get_destination_cooperative_tensor<decltype(tHi), decltype(mV), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < cU.get_capacity(); ++i)
+      if (cU.is_valid_element(i)) cU[i] = 0.0f;
+    if (pass == 0) {
+      op2.run(tHi, mV, cU);
+      op2.run(tLo, mV, cU);
+    } else {
+      op2.run(tHi, mK, cU);
+      op2.run(tLo, mK, cU);
+    }
+    device half* dst = (pass ? W : Uv) + blk * C * D;
+#pragma unroll
+    for (uint16_t i = 0; i < cU.get_capacity(); ++i)
+      if (cU.is_valid_element(i)) {
+        const auto ix = cU.get_multidimensional_index(i);
+        dst[uint(ix[1]) * D + uint(ix[0])] = half(cU[i]);
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// grid (Dv / 32, Hv), 128 threads: one head's 32 state rows through every sub-chunk; y [T][Hv * Dv] f32.
+kernel void gdn_chunk_seq(device const half* kr [[buffer(0)]], device const half* W [[buffer(1)]],
+                          device const half* Uv [[buffer(2)]], device const half* A2 [[buffer(3)]],
+                          device const float* sc [[buffer(4)]], device float* S [[buffer(5)]], device float* y [[buffer(6)]],
+                          constant GdnChunkArgs& a [[buffer(7)]], uint2 tg [[threadgroup_position_in_grid]]) {
+  constexpr uint C = 64, D = 128, R = 32, NSG = 4, LB = D + C;
+  threadgroup half sB[R * LB];  // row r: [half S[r][0..127] | U[0..63][r]]
+  threadgroup half sUd[R * C];  // row r: U[t][r] G_C / G_t
+  const uint rb = tg.x, h = tg.y, hk = h / (a.Hv / a.Hk), ldk = a.Hk * D, ldy = a.Hv * D;
+  const uint nc = (a.T + C - 1) / C;
+  auto tS = tensor<device float, dextents<int32_t, 2>, tensor_inline>(S + ((ulong)h * D + rb * R) * D,
+                                                                     dextents<int32_t, 2>(D, R), array<int32_t, 2>{1, int(D)});
+  auto tSh = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sB, dextents<int32_t, 2>(D, R), array<int32_t, 2>{1, int(LB)});
+  auto tBa = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sB, dextents<int32_t, 2>(LB, R), array<int32_t, 2>{1, int(LB)});
+  auto tUd = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sUd, dextents<int32_t, 2>(C, R), array<int32_t, 2>{1, int(C)});
+  constexpr auto dA = matmul2d_descriptor(C, R, D, false, true, false);
+  constexpr auto dO = matmul2d_descriptor(C, R, LB, false, true, false);
+  constexpr auto dS = matmul2d_descriptor(R, D, C, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<dA, execution_simdgroups<NSG>> opA;
+  matmul2d<dO, execution_simdgroups<NSG>> opO;
+  matmul2d<dS, execution_simdgroups<NSG>> opS;
+  auto tK0 = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)kr + hk * D, dextents<int32_t, 2>(D, C),
+                                                                     array<int32_t, 2>{1, int(ldk)});
+  auto cS = opS.template get_destination_cooperative_tensor<decltype(tUd), decltype(tK0), float>();
+  cS.load(tS);
+  for (uint c = 0; c < nc; ++c) {
+    const ulong blk = (ulong)c * a.Hv + h;
+#pragma unroll
+    for (uint16_t i = 0; i < cS.get_capacity(); ++i)
+      if (cS.is_valid_element(i)) {
+        const auto ix = cS.get_multidimensional_index(i);
+        sB[uint(ix[1]) * LB + uint(ix[0])] = half(cS[i]);
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto mW = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)W + blk * C * D, dextents<int32_t, 2>(D, C),
+                                                                      array<int32_t, 2>{1, int(D)});
+    auto cP = opA.template get_destination_cooperative_tensor<decltype(mW), decltype(tSh), float>();
+    opA.run(mW, tSh, cP);
+    device const float* scb = sc + blk * 2 * C;
+#pragma unroll
+    for (uint16_t i = 0; i < cP.get_capacity(); ++i)
+      if (cP.is_valid_element(i)) {
+        const auto ix = cP.get_multidimensional_index(i);
+        const uint r = uint(ix[0]), t = uint(ix[1]);
+        const float u = float(Uv[(blk * C + t) * D + rb * R + r]) - cP[i];
+        sB[r * LB + D + t] = half(u);
+        sUd[r * C + t] = half(u * scb[t]);
+      }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto mA2 = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)A2 + blk * C * LB, dextents<int32_t, 2>(LB, C),
+                                                                       array<int32_t, 2>{1, int(LB)});
+    auto cO = opO.template get_destination_cooperative_tensor<decltype(mA2), decltype(tBa), float>();
+    opO.run(mA2, tBa, cO);
+    auto tY = tensor<device float, dextents<int32_t, 2>, tensor_inline>(y + (ulong)c * C * ldy + h * D + rb * R,
+                                                                       dextents<int32_t, 2>(R, int(min(C, a.T - c * C))),
+                                                                       array<int32_t, 2>{1, int(ldy)});
+    cO.store(tY);
+    const float gC = scb[C];
+#pragma unroll
+    for (uint16_t i = 0; i < cS.get_capacity(); ++i)
+      if (cS.is_valid_element(i)) cS[i] *= gC;
+    auto mK = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half*)kr + (ulong)c * C * ldk + hk * D,
+                                                                      dextents<int32_t, 2>(D, C), array<int32_t, 2>{1, int(ldk)});
+    opS.run(tUd, mK, cS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  cS.store(tS);
+}

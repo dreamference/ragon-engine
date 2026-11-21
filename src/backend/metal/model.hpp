@@ -127,6 +127,11 @@ class Model {
   View ids_, h_, xn_, qkv_, zb_, ab_, bb_, core_, gated_, qg_, kb_, vb_, ob_, part_, gb_, ub_, logits_, cos_, sin_;
   // prefill matmul scratch: half weights, half activations, f32 product; attention Q, scores, probabilities
   View wdq_, xh_, mmc_, qb_, S_, P_;
+  // chunked GDN prefill (RAGON_METAL_GDN_OLD=1 keeps the token loop): half q/k/v, per (sub-chunk, head) W, Uv, A2, lg
+  View gq_, gk_, gv_, gW_, gU_, gA2_, glg_;
+  double gtp_[3] = {0, 0, 0};  // RAGON_METAL_PROF=3: the chunked kernels apart (measurement only)
+  long gtn_ = 0;
+  int gdn_min_ = 64;  // chunk sizes from which the chunked recurrence runs; 0 = never
 };
 
 }  // namespace ragon::metal
