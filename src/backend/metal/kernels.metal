@@ -770,6 +770,54 @@ template [[host_name("mm_nt_b")]] kernel void mm_nt<bfloat>(device bfloat*, devi
 template [[host_name("mm_nn_b")]] kernel void mm_nn<bfloat>(device bfloat*, device bfloat*, device float*,
                                                             constant MmArgs&, uint3);
 
+// Prefill weight matmul with the store fused in: y[t][n] = scale * c (mode 0), y + scale * c (mode 1) or
+// silu(y) * scale * c (mode 2, the MLP up projection writing over the gate) for t < T; c = A[t][:] . W[n][:].
+// A is half [Mp][K] (Mp a multiple of BM), W half [N][K]. The y tensor's extents (N, T) clip the tail rows.
+struct EpArgs {
+  uint M, N, K, T, ldy, mode;
+  float scale;
+};
+template <uint BM, uint BN, uint NSG>
+kernel void mm_ep(device half* A [[buffer(0)]], device half* W [[buffer(1)]], device float* y [[buffer(2)]],
+                  constant EpArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]]) {
+  auto tA = tensor<device half, dextents<int32_t, 2>, tensor_inline>(A, dextents<int32_t, 2>(a.K, a.M));
+  auto tW = tensor<device half, dextents<int32_t, 2>, tensor_inline>(W, dextents<int32_t, 2>(a.K, a.N));
+  auto tY = tensor<device float, dextents<int32_t, 2>, tensor_inline>(y, dextents<int32_t, 2>(a.N, a.T),
+                                                                      array<int32_t, 2>{1, int(a.ldy)});
+  constexpr auto d = matmul2d_descriptor(BM, BN, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<d, execution_simdgroups<NSG>> op;
+  auto mA = tA.slice(0, tg.y * BM);
+  auto mW = tW.slice(0, tg.x * BN);
+  auto mY = tY.slice(tg.x * BN, tg.y * BM);
+  auto cT = op.template get_destination_cooperative_tensor<decltype(mA), decltype(mW), float>();
+  op.run(mA, mW, cT);
+  if (a.mode == 0) {
+#pragma unroll
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+      if (cT.is_valid_element(i)) cT[i] *= a.scale;
+  } else {
+    auto yT = op.template get_destination_cooperative_tensor<decltype(mA), decltype(mW), float>();
+    yT.load(mY);
+    if (a.mode == 1) {
+#pragma unroll
+      for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+        if (cT.is_valid_element(i)) cT[i] = a.scale * cT[i] + yT[i];
+    } else {
+#pragma unroll
+      for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+        if (cT.is_valid_element(i)) {
+          const float g = yT[i];
+          cT[i] = g / (1.0f + exp(-g)) * (a.scale * cT[i]);
+        }
+    }
+  }
+  cT.store(mY);
+}
+template [[host_name("mm_ep_64x128")]] kernel void mm_ep<64, 128, 4>(device half*, device half*, device float*,
+                                                                     constant EpArgs&, uint2);
+template [[host_name("mm_ep_64x64")]] kernel void mm_ep<64, 64, 4>(device half*, device half*, device float*,
+                                                                   constant EpArgs&, uint2);
+
 // NVFP4 [N][K] -> half [N][K] (without the global scale): one thread per 32 values.
 kernel void dq_nvfp4(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
                      device half* out [[buffer(2)]], constant uint& n32 [[buffer(3)]],

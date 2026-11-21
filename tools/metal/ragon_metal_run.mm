@@ -204,13 +204,17 @@ int main(int argc, char** argv) {
         return 2;
       }
       m.reset();
-      std::fill(m.prof, m.prof + 4, 0.0);
+      std::fill(m.prof, m.prof + 5, 0.0);
+      std::fill(m.pm, m.pm + 6, 0.0);
       const double tp = now();
       for (int s = 0; s < P; s += chunk) m.forward(pr.data() + s, std::min(chunk, P - s), s, false);
       const double prefill_s = now() - tp;
       if (std::getenv("RAGON_METAL_PROF"))
         std::fprintf(stderr, "prefill GPU s: attention %.3f, GDN %.3f (recurrence %.3f), MLP %.3f, head %.3f\n",
                      m.prof[0], m.prof[1], m.prof[4], m.prof[2], m.prof[3]);
+      if (std::getenv("RAGON_METAL_PROF") && std::atoi(std::getenv("RAGON_METAL_PROF")) >= 2)
+        std::fprintf(stderr, "prefill matmul passes s: dequant %.3f, x_half %.3f, matmul %.3f, store %.3f, silu_mul %.3f; other %.3f\n",
+                     m.pm[0], m.pm[1], m.pm[2], m.pm[3], m.pm[4], m.pm[5]);
       std::vector<int> gen;
       float min_gap = INFINITY;
       int div = -1, div_ref = -1;

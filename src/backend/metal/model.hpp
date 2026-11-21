@@ -81,12 +81,20 @@ class Model {
   // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head;
   // prof[4] = the GDN recurrence alone (part of prof[1]).
   double prof[5] = {0, 0, 0, 0, 0};
+  // RAGON_METAL_PROF=2 also syncs after each prefill matmul pass: pm[0..4] = weight dequant, x to half, matmul,
+  // store, silu_mul; pm[5] = the other work queued before each matmul (these seconds are then missing from
+  // prof[0..3]).
+  double pm[6] = {0, 0, 0, 0, 0, 0};
 
  private:
   // y[T][N] (=|+=) x[T][K] W^T: GEMV kernels for decode and short chunks, tensor-op matmul for T >= mm_min_.
-  void gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add);
+  // mode 2 (prefill matmul only, see mm_fused()): y = silu(y) * (x W^T), the MLP up projection over the gate.
+  // reuse_x: x is the input of the previous gemv call and unchanged since, so its half copy is kept.
+  void gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add, int mode = 0, bool reuse_x = false);
+  bool mm_fused(const Lin& l, int T) const { return !mm_old_ && use_mm(l, T); }
   bool use_mm(const Lin& l, int T) const;
   void attention_mm(Layer& L, int T, int pos0);
+  id<MTLComputeCommandEncoder> pm_sync(id<MTLComputeCommandEncoder> e, int k);
   void norm(View x, View w, View z, View out, int rows, int n, int rpt, int ldt, int ldh, int ldo_t, int ldo_h,
             int mode, float scale = 1.0f);
   void gdn(Layer& L, int T, const Dump& dump, const std::string& tag);
@@ -101,13 +109,17 @@ class Model {
   int H_ = 0, KV_ = 0, D_ = 0, Hk_ = 0, Hv_ = 0, Dk_ = 0, Dv_ = 0, hidden_ = 0, ffn_ = 0, V_ = 0, rot_ = 0;
   int max_ctx_ = 0, C_ = 0, nchunk_max_ = 32, mm_min_ = 64;
   bool attn_gqa_ = true;
+  bool mm_old_ = false;  // RAGON_METAL_MM_OLD=1: the lane 2 prefill matmul (64x64 tiles, separate store pass)
+  const void* xh_buf_ = nullptr;  // what xh_ holds: x's buffer, offset, K, T, ldx
+  size_t xh_off_ = 0;
+  uint32_t xh_k_ = 0, xh_t_ = 0, xh_ld_ = 0;
   bool kv8_ = false;  // int8 KV cache option (RAGON_METAL_KV=int8)
   uint32_t flash_dbg_ = 0;  // flash timing probes (RAGON_METAL_FLASH_DBG, wrong results): skip 1 rescale, 2 PV, 4 softmax, 16 QK; 8 QK via registers
   int attn_flash_ = 8;  // prefill attention (RAGON_METAL_ATTN_FLASH): 0 = S/P matmuls; 4, 8, 128, 192 = flash kernel
   View kdq_, vdq_;    // int8 KV: bfloat scratch of one layer's cache for the prefill matmuls
   void to_q4(Lin& l);  // the Mac-native 4-bit projection option (RAGON_METAL_PROJ=q4)
   int attn_nch_ = 16, attn_chunk_min_ = 64;  // fused decode attention: max key chunks, min keys a chunk
-  bool prof_ = false;
+  int prof_ = 0;
   size_t wdq_cap_ = 0;
   float eps_ = 1e-6f;
   // activations [C][...] f32

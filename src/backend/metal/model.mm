@@ -288,8 +288,9 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   gb_ = q.alloc(C * ffn_ * 4);
   ub_ = q.alloc(C * ffn_ * 4);
   logits_ = q.alloc(C * size_t(V_) * 4);
-  prof_ = std::getenv("RAGON_METAL_PROF") != nullptr;
+  if (const char* pr = std::getenv("RAGON_METAL_PROF")) prof_ = std::max(1, std::atoi(pr));
   if (const char* mm = std::getenv("RAGON_METAL_MM_MIN")) mm_min_ = std::max(1, std::atoi(mm));
+  mm_old_ = std::getenv("RAGON_METAL_MM_OLD") != nullptr;
   // Decode attention: the GQA-fused kernel by default; RAGON_METAL_ATTN_OLD=1 keeps the per-head kernel for A/B checks.
   attn_gqa_ = std::getenv("RAGON_METAL_ATTN_OLD") == nullptr;
   if (const char* v = std::getenv("RAGON_METAL_ATTN_NCH")) attn_nch_ = std::max(1, std::atoi(v));
@@ -372,10 +373,17 @@ bool Model::use_mm(const Lin& l, int T) const {
          size_t(l.N) * l.K <= wdq_cap_;
 }
 
-void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add) {
+id<MTLComputeCommandEncoder> Model::pm_sync(id<MTLComputeCommandEncoder> e, int k) {
+  if (prof_ < 2) return e;
+  pm[k] += q_->sync();
+  return q_->encoder();
+}
+
+void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add, int mode, bool reuse_x) {
   id<MTLComputeCommandEncoder> e = q_->encoder();
   if (use_mm(l, T)) {
     const uint32_t Mp = uint32_t(pad64(T));
+    e = pm_sync(e, 5);
     if (l.fmt == Lin::kNvfp4 || l.fmt == Lin::kQ4) {
       const uint32_t n32 = l.N * (l.K / 32);
       [e setComputePipelineState:q_->pipe(l.fmt == Lin::kQ4 ? "dq_q4" : "dq_nvfp4")];
@@ -389,16 +397,40 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
       [e setBytes:&n16 length:4 atIndex:2];
       [e dispatchThreads:MTLSizeMake(n16, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
-    const uint32_t xa[4] = {l.K, uint32_t(T), uint32_t(ldx), 0};
-    [e setComputePipelineState:q_->pipe("x_half")];
-    bind(e, {x, xh_});
-    [e setBytes:xa length:16 atIndex:2];
-    [e dispatchThreads:MTLSizeMake(l.K, Mp, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    e = pm_sync(e, 0);
+    const bool have_x = reuse_x && !mm_old_ && xh_buf_ == (__bridge const void*)x.buf && xh_off_ == x.off &&
+                        xh_k_ == l.K && xh_t_ == uint32_t(T) && xh_ld_ == uint32_t(ldx);
+    if (!have_x) {
+      const uint32_t xa[4] = {l.K, uint32_t(T), uint32_t(ldx), 0};
+      [e setComputePipelineState:q_->pipe("x_half")];
+      bind(e, {x, xh_});
+      [e setBytes:xa length:16 atIndex:2];
+      [e dispatchThreads:MTLSizeMake(l.K, Mp, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      xh_buf_ = (__bridge const void*)x.buf;
+      xh_off_ = x.off;
+      xh_k_ = l.K;
+      xh_t_ = uint32_t(T);
+      xh_ld_ = uint32_t(ldx);
+      e = pm_sync(e, 1);
+    }
+    if (!mm_old_) {
+      // one pass: 64x128 tiles (64x64 when N is not a multiple of 128) with the scale, add and row clip fused in
+      const bool wide = l.N % 128 == 0;
+      const uint32_t md = mode == 2 ? 2u : add ? 1u : 0u;
+      struct { uint32_t M, N, K, T, ldy, mode; float scale; } ea = {Mp, l.N, l.K, uint32_t(T), uint32_t(ldy), md, l.scale};
+      [e setComputePipelineState:q_->pipe(wide ? "mm_ep_64x128" : "mm_ep_64x64")];
+      bind(e, {xh_, wdq_, y});
+      [e setBytes:&ea length:sizeof(ea) atIndex:3];
+      [e dispatchThreadgroups:MTLSizeMake(l.N / (wide ? 128 : 64), Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      e = pm_sync(e, 2);
+      return;
+    }
     MmArgs m{Mp, l.N, l.K, l.K, l.K, l.N, 0, 0, 0, 1};
     [e setComputePipelineState:q_->pipe("mm_nt_h")];
     bind(e, {xh_, wdq_, mmc_});
     bind_args(e, 3, m);
     [e dispatchThreadgroups:MTLSizeMake(l.N / 64, Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    e = pm_sync(e, 2);
     const uint32_t sa[4] = {l.N, uint32_t(T), uint32_t(ldy), add ? 1u : 0u};
     const float f[2] = {l.scale, 0};
     [e setComputePipelineState:q_->pipe("mm_store")];
@@ -406,6 +438,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     [e setBytes:sa length:16 atIndex:2];
     [e setBytes:f length:8 atIndex:3];
     [e dispatchThreads:MTLSizeMake(l.N, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    e = pm_sync(e, 3);
     return;
   }
   const char* k = l.fmt == Lin::kNvfp4 ? "gemv_nvfp4"
@@ -450,9 +483,9 @@ struct GdnArgs {
 void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
   const int cw = int(L.qkv.N), vw = Hv_ * Dv_;
   gemv(L.qkv, xn_, qkv_, T, hidden_, cw, false);
-  gemv(L.z, xn_, zb_, T, hidden_, vw, false);
-  gemv(L.a, xn_, ab_, T, hidden_, Hv_, false);
-  gemv(L.b, xn_, bb_, T, hidden_, Hv_, false);
+  gemv(L.z, xn_, zb_, T, hidden_, vw, false, 0, true);
+  gemv(L.a, xn_, ab_, T, hidden_, Hv_, false, 0, true);
+  gemv(L.b, xn_, bb_, T, hidden_, Hv_, false, 0, true);
   if (dump) {
     q_->sync();
     dump(tag + "qkv", qkv_, {T, cw});
@@ -511,8 +544,8 @@ struct AttnArgs {
 void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::string& tag) {
   const int qw = H_ * 2 * D_, kw = KV_ * D_;
   gemv(L.q, xn_, qg_, T, hidden_, qw, false);
-  gemv(L.k, xn_, kb_, T, hidden_, kw, false);
-  gemv(L.v, xn_, vb_, T, hidden_, kw, false);
+  gemv(L.k, xn_, kb_, T, hidden_, kw, false, 0, true);
+  gemv(L.v, xn_, vb_, T, hidden_, kw, false, 0, true);
   norm(qg_, L.q_norm, View{}, qg_, T * H_, D_, H_, qw, 2 * D_, qw, 2 * D_, 0);
   norm(kb_, L.k_norm, View{}, kb_, T * KV_, D_, KV_, kw, D_, kw, D_, 0);
   id<MTLComputeCommandEncoder> e = q_->encoder();
@@ -681,13 +714,18 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
       dump(tag + "post_norm", xn_, {T, hidden_});
     }
     gemv(L.gate, xn_, gb_, T, hidden_, ffn_, false);
-    gemv(L.up, xn_, ub_, T, hidden_, ffn_, false);
-    e = q_->encoder();
-    [e setComputePipelineState:q_->pipe("silu_mul")];
-    bind(e, {gb_, ub_, gb_});
-    const uint32_t n = uint32_t(T * ffn_);
-    [e setBytes:&n length:4 atIndex:3];
-    [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (mm_fused(L.up, T)) {
+      gemv(L.up, xn_, gb_, T, hidden_, ffn_, false, 2, true);  // gb = silu(gate) * up in the matmul's store
+    } else {
+      gemv(L.up, xn_, ub_, T, hidden_, ffn_, false, 0, true);
+      e = q_->encoder();
+      [e setComputePipelineState:q_->pipe("silu_mul")];
+      bind(e, {gb_, ub_, gb_});
+      const uint32_t n = uint32_t(T * ffn_);
+      [e setBytes:&n length:4 atIndex:3];
+      [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      e = pm_sync(e, 4);
+    }
     gemv(L.down, gb_, h_, T, ffn_, hidden_, true);
     if (prof_) prof[2] += q_->sync();
     if (dump) {
