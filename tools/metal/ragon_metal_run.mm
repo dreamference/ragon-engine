@@ -3,6 +3,7 @@
 //                   [--ban-eos] [--ctx N] [--chunk C]
 //   ragon-metal-run --model DIR --prompts-ids FILE --teacher FILE    (argmax agreement on a reference continuation)
 //   ragon-metal-run --model DIR --prompt-ids 1,2,3 --dump DIR      (per-layer check dumps, .npy f32)
+//   ragon-metal-run --model DIR --stdio [--ctx N] [--chunk C]      (a serving loop over JSON lines, see serve_stdio)
 // A prompts-ids file holds one prompt a line as comma-separated token ids; a check file holds one JSON object a
 // line with an "ids" array (the reference continuation), compared token by token.
 #import <Foundation/Foundation.h>
@@ -99,12 +100,90 @@ static double now() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+static void reply(NSDictionary* d) {
+  NSData* j = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+  std::fwrite([j bytes], 1, [j length], stdout);
+  std::fputc('\n', stdout);
+  std::fflush(stdout);
+}
+
+// A serving loop for a front end that tokenizes (the Mac node has no HTTP surface yet): one JSON request a line on
+// stdin, {"ids":[...], "max_tokens":N, "stop":[ids]}, one reply a line on stdout, {"ids":[generated], "finish":
+// "stop"|"length", "reused":n, "prefill_tokens":n, "prefill_s":f, "decode_s":f, "decode_tok_s":f} or {"error":...}.
+// Greedy on the CPU pick. The sequence in the model stays between requests: a request that extends it (an agent's
+// next turn) feeds only the new tokens. The recurrent state cannot be rewound, so any other request starts over.
+// The last generated token (the stop token, or the one that hit max_tokens) is not fed; a next turn feeds it.
+static int serve_stdio(Model& m, int ctx, int chunk) {
+  reply(@{@"ready" : @YES, @"vocab" : @(m.vocab())});
+  std::vector<uint32_t> fed;
+  char* buf = nullptr;
+  size_t cap = 0;
+  ssize_t len;
+  while ((len = getline(&buf, &cap, stdin)) > 0) {
+    @autoreleasepool {
+      NSData* d = [NSData dataWithBytes:buf length:size_t(len)];
+      NSDictionary* j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+      if (![j isKindOfClass:[NSDictionary class]] || ![j[@"ids"] isKindOfClass:[NSArray class]]) {
+        reply(@{@"error" : @"bad request: want {\"ids\":[...]}"});
+        continue;
+      }
+      std::vector<uint32_t> ids;
+      for (NSNumber* n in j[@"ids"]) ids.push_back(uint32_t([n unsignedIntValue]));
+      std::vector<int> stop = m.eos_ids;
+      for (NSNumber* n in j[@"stop"]) stop.push_back([n intValue]);
+      int max_tokens = j[@"max_tokens"] ? [j[@"max_tokens"] intValue] : 256;
+      const int P = int(ids.size());
+      if (P == 0 || P >= ctx) {
+        reply(@{@"error" : [NSString stringWithFormat:@"prompt of %d tokens outside 1..%d", P, ctx - 1]});
+        continue;
+      }
+      max_tokens = std::max(1, std::min(max_tokens, ctx - P));
+      size_t reuse = 0;
+      if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin()))
+        reuse = fed.size();
+      const double tp = now();
+      if (reuse) {
+        for (int s = int(reuse); s < P; s += chunk) m.forward(ids.data() + s, std::min(chunk, P - s), s, false);
+      } else {
+        m.reset();
+        m.prefill(ids.data(), P);
+      }
+      const double prefill_s = now() - tp;
+      fed = ids;
+      std::vector<int> gen;
+      const char* finish = "length";
+      const double td = now();
+      for (int k = 0; k < max_tokens; ++k) {
+        const int id = top2(m.logits(), m.vocab(), {}).id;
+        gen.push_back(id);
+        if (std::find(stop.begin(), stop.end(), id) != stop.end()) {
+          finish = "stop";
+          break;
+        }
+        if (k + 1 == max_tokens) break;
+        const uint32_t u = uint32_t(id);
+        m.forward(&u, 1, int(fed.size()), false);
+        fed.push_back(u);
+      }
+      const double decode_s = now() - td;
+      NSMutableArray* g = [NSMutableArray arrayWithCapacity:gen.size()];
+      for (int id : gen) [g addObject:@(id)];
+      const int steps = int(gen.size()) - 1;
+      reply(@{@"ids" : g, @"finish" : @(finish), @"reused" : @(reuse), @"prefill_tokens" : @(P - int(reuse)),
+              @"prefill_s" : @(prefill_s), @"decode_s" : @(decode_s),
+              @"decode_tok_s" : @(steps > 0 ? steps / decode_s : 0.0)});
+    }
+  }
+  std::free(buf);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   @autoreleasepool {
     std::string model, prompts_file, check_file, greedy_out, dump_dir, teacher_file;
     std::vector<std::vector<uint32_t>> prompts;
     int max_tokens = 256, ctx = 40960, chunk = 128;
-    bool ban_eos = false;
+    bool ban_eos = false, stdio = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       auto next = [&]() -> std::string {
@@ -125,6 +204,7 @@ int main(int argc, char** argv) {
       else if (a == "--ctx") ctx = std::stoi(next());
       else if (a == "--chunk") chunk = std::stoi(next());
       else if (a == "--ban-eos") ban_eos = true;
+      else if (a == "--stdio") stdio = true;
       else {
         std::fprintf(stderr, "unknown argument %s\n", a.c_str());
         return 2;
@@ -136,7 +216,7 @@ int main(int argc, char** argv) {
       while (std::getline(f, line))
         if (!line.empty()) prompts.push_back(parse_ids(line));
     }
-    if (model.empty() || prompts.empty()) {
+    if (model.empty() || (prompts.empty() && !stdio)) {
       std::fprintf(stderr, "usage: ragon-metal-run --model DIR (--prompts-ids FILE | --prompt-ids IDS) ...\n");
       return 2;
     }
@@ -147,6 +227,7 @@ int main(int argc, char** argv) {
     const double t0 = now();
     m.load(q, model, ctx, chunk);
     std::fprintf(stderr, "loaded in %.1f s\n", now() - t0);
+    if (stdio) return serve_stdio(m, ctx, chunk);
 
     if (!dump_dir.empty()) {
       [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:dump_dir.c_str()]
