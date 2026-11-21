@@ -295,6 +295,7 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   // Prefill: the norms and the MLP up matmul write the next matmul's half A themselves; =1 keeps the x_half passes.
   xh_fuse_ = std::getenv("RAGON_METAL_XH_OLD") == nullptr;
   if (const char* v = std::getenv("RAGON_METAL_LAYER_MAJOR")) layer_major_ = std::atoi(v) != 0;
+  if (const char* v = std::getenv("RAGON_METAL_FLUSH")) flush_ = std::max(0, std::atoi(v));
   // Decode attention: the GQA-fused kernel by default; RAGON_METAL_ATTN_OLD=1 keeps the per-head kernel for A/B checks.
   attn_gqa_ = std::getenv("RAGON_METAL_ATTN_OLD") == nullptr;
   if (const char* v = std::getenv("RAGON_METAL_ATTN_NCH")) attn_nch_ = std::max(1, std::atoi(v));
@@ -815,7 +816,7 @@ void Model::layer(size_t i, int T, int pos0, const Dump& dump) {
 void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const Dump& dump) {
   if (T > C_) fail("forward: T exceeds the chunk");
   if (pos0 + T > max_ctx_) fail("forward: context exceeds max_ctx");
-  std::memcpy(ids_.host<uint32_t>(), ids, size_t(T) * 4);
+  if (ids) std::memcpy(ids_.host<uint32_t>(), ids, size_t(T) * 4);  // null: the ids are already on the device
   id<MTLComputeCommandEncoder> e = q_->encoder();
   [e setComputePipelineState:q_->pipe("embed_bf16")];
   bind(e, {ids_, embed_, h_});
@@ -826,7 +827,11 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     q_->sync();
     dump("embed", h_, {T, hidden_});
   }
-  for (size_t i = 0; i < layers_.size(); ++i) layer(i, T, pos0, dump);
+  const bool flush = flush_ > 0 && T < mm_min_ && !prof_ && !dump;
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    layer(i, T, pos0, dump);
+    if (flush && (i + 1) % size_t(flush_) == 0) q_->flush();
+  }
   const int r0 = all_logits ? 0 : T - 1, rows = all_logits ? T : 1;
   View hr = h_.at(size_t(r0) * hidden_ * 4);
   norm(hr, final_norm_, View{}, xn_, rows, hidden_, 1, hidden_, 0, hidden_, 0, 0);
@@ -835,8 +840,45 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     dump("final_norm", xn_, {rows, hidden_});
   }
   gemv(head_, xn_, logits_, rows, hidden_, V_, false);
+  if (greedy_) {
+    struct {
+      uint32_t n, nb, banned[8];
+    } a{uint32_t(V_), uint32_t(gban_.size()), {}};
+    std::copy(gban_.begin(), gban_.end(), a.banned);
+    id<MTLComputeCommandEncoder> e2 = q_->encoder();
+    [e2 setComputePipelineState:q_->pipe("top2_ban")];
+    bind(e2, {logits_, ids_, gout_.at(size_t(gstep_) * 12)});
+    bind_args(e2, 3, a);
+    [e2 dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    id<MTLCommandBuffer> cb = q_->cb;
+    q_->flush();
+    gcb_.push_back(cb);
+    return;
+  }
   const double th = q_->sync();
+  gpu_s += th;
   if (prof_) prof[3] += th;
+}
+
+void Model::greedy_begin(uint32_t id0, const std::vector<int>& banned, int steps) {
+  if (banned.size() > 8) fail("greedy: more than 8 banned ids");
+  gban_.assign(banned.begin(), banned.end());
+  if (gout_.empty() || [gout_.buf length] < size_t(steps) * 12) gout_ = q_->alloc(size_t(steps) * 12);
+  gcb_.clear();
+  gstep_ = 0;
+  ids_.host<uint32_t>()[0] = id0;
+}
+
+void Model::greedy_step(int pos) {
+  if (size_t(gstep_ + 1) * 12 > [gout_.buf length]) fail("greedy: more steps than greedy_begin allowed");
+  greedy_ = true;
+  forward(nullptr, 1, pos, false);
+  greedy_ = false;
+  ++gstep_;
+}
+
+void Model::greedy_wait(int k) {
+  q_->wait_for(gcb_.at(size_t(k)));
 }
 
 void Model::prefill(const uint32_t* ids, int P) {
