@@ -707,6 +707,67 @@ bool test_bf16_rows() {
   return ok;
 }
 
+// Launches of more than 32 rows (prefill slices, the wide 128-row kernel from 64 rows on) against a host reference, with
+// rows on both sides of a key-range boundary (4096, and 2048 / 1024 under a smaller RAGON_ATTN_CHUNK). The 32-row test
+// above never has a launch's rows straddle a range.
+bool test_attention_rows_wide() {
+  std::mt19937 rng(29);
+  std::normal_distribution<float> normal(0.f, 1.f);
+  const int Hq = 24, Hkv = 4, D = 256, MMAX = 256, ctx = 6400;
+  std::vector<__nv_bfloat16> kc(size_t(ctx) * Hkv * D), vc(kc.size());
+  for (auto& v : kc) v = __float2bfloat16(normal(rng));
+  for (auto& v : vc) v = __float2bfloat16(normal(rng));
+  std::vector<float> q(size_t(MMAX) * Hq * D);
+  for (auto& v : q) v = normal(rng) * 2.f;
+  __nv_bfloat16 *dk = upload(kc), *dv = upload(vc);
+  float* dq = upload(q);
+  float *scratch, *out;
+  cudaMalloc(&scratch, ragon::kernels::attention_rows_scratch_floats(MMAX, Hq, D, ctx) * sizeof(float));
+  cudaMalloc(&out, size_t(MMAX) * Hq * D * sizeof(float));
+  auto ref = [&](int m, int h, int pos, std::vector<double>& o) {
+    const int kvh = h / 6;
+    std::vector<double> sc(pos + 1);
+    double mx = -1e300;
+    for (int j = 0; j <= pos; ++j) {
+      double a = 0;
+      for (int d = 0; d < D; ++d)
+        a += double(__bfloat162float(__float2bfloat16(q[(size_t(m) * Hq + h) * D + d] * 0.0625f))) *
+             __bfloat162float(kc[(size_t(j) * Hkv + kvh) * D + d]);
+      sc[j] = a;
+      mx = std::max(mx, a);
+    }
+    double l = 0;
+    for (double& v : sc) l += v = std::exp(v - mx);
+    o.assign(D, 0.0);
+    for (int j = 0; j <= pos; ++j)
+      for (int d = 0; d < D; ++d) o[d] += sc[j] * __bfloat162float(vc[(size_t(j) * Hkv + kvh) * D + d]);
+    for (double& v : o) v /= l;
+  };
+  bool ok = true;
+  struct Case { int P, M; };
+  for (const Case c : {Case{1000, 33}, Case{2000, 64}, Case{1990, 128}, Case{4000, 256}, Case{6100, 256}}) {
+    ragon::kernels::attention_rows(dq, dk, dv, c.P, c.M, Hq, Hkv, D, scratch, out, nullptr);
+    const std::vector<float> got = download(out, size_t(c.M) * Hq * D);
+    std::vector<int> ms = {0, 1, c.M / 2, c.M - 1};
+    for (int b : {1024, 2048, 4096})
+      for (int m = b - 1 - c.P; m <= b - c.P; ++m)
+        if (m >= 0 && m < c.M) ms.push_back(m);
+    double worst = 0;
+    std::vector<double> o;
+    for (int m : ms)
+      for (int h : {0, 5, 11, 23}) {
+        ref(m, h, c.P + m, o);
+        for (int d = 0; d < D; ++d) worst = std::max(worst, std::abs(got[(size_t(m) * Hq + h) * D + d] - o[d]));
+      }
+    const bool good = worst < 2e-2;
+    ok &= good;
+    std::printf("attention_rows wide P=%d M=%d (chunk %d) vs host: max abs err %.2e %s\n", c.P, c.M,
+                ragon::kernels::attention_chunk(), worst, good ? "ok" : "FAIL");
+  }
+  cudaFree(dk), cudaFree(dv), cudaFree(dq), cudaFree(scratch), cudaFree(out);
+  return ok;
+}
+
 // The rows path's attention: against a host reference, and each row of a 32-row call bit for bit equal
 // to a one-row call at that row's position (what decode and verify see).
 bool test_attention_rows() {
@@ -1784,6 +1845,7 @@ int main(int argc, char** argv) {
     bench_draft();
     return cudaDeviceSynchronize() == cudaSuccess ? 0 : 1;
   }
+  if (argc > 1 && std::string(argv[1]) == "--attention-wide") return test_attention_rows_wide() ? 0 : 1;
   bool ok = test_to_half_rows();
   ok &= test_gemm();
   ok &= test_gemm_wide();
@@ -1792,6 +1854,7 @@ int main(int argc, char** argv) {
   ok &= test_sparse_select();
   ok &= test_draft_head_batch();
   ok &= test_attention_rows();
+  ok &= test_attention_rows_wide();
   ok &= test_topk();
   ok &= test_topk_masked();
   ok &= test_batched_state_kernels();
