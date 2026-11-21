@@ -275,7 +275,9 @@ int main(int argc, char** argv) {
       }
       const double decode_s = now() - td;
       const double dec_tps = max_tokens > 1 ? (max_tokens - 1) / decode_s : 0;
-      if (max_tokens > 1)
+      if (pipe)  // two steps in flight: no per-step GPU time (RAGON_METAL_PIPE=0 for the wall/GPU split)
+        std::fprintf(stderr, "decode ms a step: wall %.3f (pipelined)\n", decode_s * 1e3 / (max_tokens - 1));
+      else if (max_tokens > 1)
         std::fprintf(stderr, "decode ms a step: wall %.3f, GPU (step command buffers) %.3f, top-2 %.3f\n",
                      decode_s * 1e3 / (max_tokens - 1), m.gpu_s * 1e3 / max_tokens, top_s * 1e3 / (max_tokens - 1));
       if (std::getenv("RAGON_METAL_PROF") && max_tokens > 1) {
