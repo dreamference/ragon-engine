@@ -11,6 +11,14 @@
 using namespace metal;
 
 constant uint kRows [[function_constant(0)]];  // activation rows per GEMV pass (1 for decode, up to 8 for prefill)
+// Decode (kRows 1): the residual-stream rmsnorm folded into the GEMVs around it. The GEMV that adds into the
+// residual (kFoldOut) also writes the next norm's input times its weight, xw = h * (1 + w), and per threadgroup
+// the sum of h*h over its 8 rows; the GEMVs that read the normed row (kFoldIn) dot with xw and scale by
+// rsqrt(mean(h*h) + eps) from those partial sums. No norm pass and no barrier for it between the big GEMVs.
+constant bool kFoldIn [[function_constant(1)]];
+constant bool kFold = is_function_constant_defined(kFoldIn) && kFoldIn;
+constant bool kFoldOutIn [[function_constant(2)]];
+constant bool kFoldOut = is_function_constant_defined(kFoldOutIn) && kFoldOutIn;
 
 constant float kFp8Unscale = 256.0f;
 constant float kFp4Unscale = 16384.0f;
@@ -37,16 +45,52 @@ struct GemvArgs {
   uint rows;       // activation rows in total; threadgroup row y takes rows 8y .. 8y+7 (kRows of them)
   float scale;     // global scale (NVFP4 scale_2, the FP8 per-tensor scale, 1 for BF16)
   uint add;        // 1: y += result (the residual adds)
+  float eps;       // kFold: the rmsnorm epsilon
+  uint npart;      // kFold: partial sums to add (K / 8)
 };
 
+// Fold buffers: kFoldIn reads the partial sums at 6; kFoldOut reads the next norm's weight at 7 and writes xw at 8
+// and the partial sums at 9.
+#define FOLD_ARGS                                                                                          \
+  device const float *fpart [[buffer(6)]], device const float *fnw [[buffer(7)]],                          \
+      device float *fxw [[buffer(8)]], device float *fpo [[buffer(9)]]
+
+// The 8 simdgroups of the threadgroup share the partial sums' read (N is a multiple of 8 when kFold is on).
+inline void fold_scale(thread float* acc, device const float* part, constant GemvArgs& a, uint lane, uint sg,
+                       threadgroup float* tp) {
+  if (!kFold) return;
+  float ss = 0;
+  for (uint i = sg * 32 + lane; i < a.npart; i += 256) ss += part[i];
+  ss = simd_sum(ss);
+  if (lane == 0) tp[sg] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float t = 0;
+  for (uint i = 0; i < 8; ++i) t += tp[i];
+  acc[0] *= rsqrt(t / float(a.K) + a.eps);
+}
+
 inline void gemv_store(device float* y, constant GemvArgs& a, uint rows, uint n, thread float* acc, float unscale,
-                       uint lane) {
+                       uint lane, threadgroup float* tp = nullptr, device const float* nw = nullptr,
+                       device float* xw = nullptr, device float* po = nullptr, uint sg = 0, uint tgx = 0) {
   for (uint m = 0; m < kRows; ++m) {
     if (m >= rows) break;
     const float r = simd_sum(acc[m]) * a.scale * unscale;
     if (lane == 0) {
       device float* p = y + (ulong)m * a.ldy + n;
-      *p = a.add ? *p + r : r;
+      const float v = a.add ? *p + r : r;
+      *p = v;
+      if (kFoldOut) {
+        xw[n] = v * (1.0f + nw[n]);
+        tp[sg] = v * v;
+      }
+    }
+  }
+  if (kFoldOut) {  // N is a multiple of 8 here: every simdgroup of the threadgroup has a row
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+      float t = 0;
+      for (uint i = 0; i < 8; ++i) t += tp[i];
+      po[tgx] = t;
     }
   }
 }
@@ -55,7 +99,8 @@ inline void gemv_store(device float* y, constant GemvArgs& a, uint rows, uint n,
 kernel void gemv_nvfp4(device const float* x [[buffer(0)]], device const uchar* w [[buffer(1)]],
                        device const uchar* sc [[buffer(2)]], device float* y [[buffer(3)]],
                        constant GemvArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
-                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], FOLD_ARGS) {
+  threadgroup float ftp[8];
   const uint n = tg.x * 8 + sg;
   if (n >= a.N) return;
   const uint rows = min(kRows, a.rows - tg.y * 8);
@@ -85,14 +130,16 @@ kernel void gemv_nvfp4(device const float* x [[buffer(0)]], device const uchar* 
       acc[m] += s0 * b0 + s1 * b1;
     }
   }
-  gemv_store(y, a, rows, n, acc, kFp4Unscale, lane);
+  fold_scale(acc, fpart, a, lane, sg, ftp);
+  gemv_store(y, a, rows, n, acc, kFp4Unscale, lane, ftp, fnw, fxw, fpo, sg, tg.x);
 }
 
 // FP8 rows: each lane takes 16 weight bytes (16 values) a step.
 kernel void gemv_fp8(device const float* x [[buffer(0)]], device const uchar* w [[buffer(1)]],
                      device float* y [[buffer(2)]], constant GemvArgs& a [[buffer(3)]],
                      uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                     uint lane [[thread_index_in_simdgroup]]) {
+                     uint lane [[thread_index_in_simdgroup]], FOLD_ARGS) {
+  threadgroup float ftp[8];
   const uint n = tg.x * 8 + sg;
   if (n >= a.N) return;
   const uint rows = min(kRows, a.rows - tg.y * 8);
@@ -119,7 +166,8 @@ kernel void gemv_fp8(device const float* x [[buffer(0)]], device const uchar* w 
       acc[m] += b;
     }
   }
-  gemv_store(y, a, rows, n, acc, kFp8Unscale, lane);
+  fold_scale(acc, fpart, a, lane, sg, ftp);
+  gemv_store(y, a, rows, n, acc, kFp8Unscale, lane, ftp, fnw, fxw, fpo, sg, tg.x);
 }
 
 // ---- Q4: the Mac-native 4-bit projection option (affine, groups of 64) -------------------------------
@@ -136,7 +184,8 @@ inline half2 q4x2(uint w, uint j) { return as_type<half2>(0x64006400u | ((w >> (
 kernel void gemv_q4(device const float* x [[buffer(0)]], device const uchar* w [[buffer(1)]],
                     device const uchar* sb [[buffer(2)]], device float* y [[buffer(3)]],
                     constant GemvArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
-                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], FOLD_ARGS) {
+  threadgroup float ftp[8];
   const uint n = tg.x * 8 + sg;
   if (n >= a.N) return;
   const uint rows = min(kRows, a.rows - tg.y * 8);
@@ -164,7 +213,8 @@ kernel void gemv_q4(device const float* x [[buffer(0)]], device const uchar* w [
       acc[m] += cb.x * b + cb.y * sx;
     }
   }
-  gemv_store(y, a, rows, n, acc, 1.0f, lane);
+  fold_scale(acc, fpart, a, lane, sg, ftp);
+  gemv_store(y, a, rows, n, acc, 1.0f, lane, ftp, fnw, fxw, fpo, sg, tg.x);
 }
 
 // Q4 [N][K] -> half [N][K] (raw units, without the per-tensor scale): one thread per 32 values.
@@ -264,7 +314,8 @@ kernel void q4_quant(device const uchar* src [[buffer(0)]], device uchar* w [[bu
 kernel void gemv_bf16(device const float* x [[buffer(0)]], device const uchar* w [[buffer(1)]],
                       device float* y [[buffer(2)]], constant GemvArgs& a [[buffer(3)]],
                       uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
+                      uint lane [[thread_index_in_simdgroup]], FOLD_ARGS) {
+  threadgroup float ftp[8];
   const uint n = tg.x * 8 + sg;
   if (n >= a.N) return;
   const uint rows = min(kRows, a.rows - tg.y * 8);
@@ -283,7 +334,8 @@ kernel void gemv_bf16(device const float* x [[buffer(0)]], device const uchar* w
                 dot(bf16x2(q[3]), xb.zw);
     }
   }
-  gemv_store(y, a, rows, n, acc, 1.0f, lane);
+  fold_scale(acc, fpart, a, lane, sg, ftp);
+  gemv_store(y, a, rows, n, acc, 1.0f, lane, ftp, fnw, fxw, fpo, sg, tg.x);
 }
 
 // ---- embedding, norms, elementwise ----------------------------------------------------------------

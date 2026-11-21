@@ -44,7 +44,7 @@ struct Queue {
   // Opens the default device and compiles the kernels with safe math (no fast-math: correctness first).
   void open();
   // The pipeline of a kernel; GEMV kernels are specialized by the function constant kRows.
-  id<MTLComputePipelineState> pipe(const char* name, uint32_t rows = 0);
+  id<MTLComputePipelineState> pipe(const char* name, uint32_t rows = 0, uint32_t fold = 0);  // fold bit 1: kFoldIn, bit 2: kFoldOut
   View alloc(size_t bytes);  // shared storage, zeroed
   id<MTLComputeCommandEncoder> encoder();
   id<MTLComputeCommandEncoder> pre(id<MTLComputeCommandEncoder> e) {

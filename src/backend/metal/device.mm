@@ -25,8 +25,8 @@ void Queue::open() {
   if (!lib) die("kernel compile", err);
 }
 
-id<MTLComputePipelineState> Queue::pipe(const char* name, uint32_t rows) {
-  std::string key = std::string(name) + "/" + std::to_string(rows);
+id<MTLComputePipelineState> Queue::pipe(const char* name, uint32_t rows, uint32_t fold) {
+  std::string key = std::string(name) + "/" + std::to_string(rows) + (fold ? "/f" + std::to_string(fold) : "");
   auto it = pipes.find(key);
   if (it != pipes.end()) return it->second;
   NSError* err = nil;
@@ -35,6 +35,9 @@ id<MTLComputePipelineState> Queue::pipe(const char* name, uint32_t rows) {
   if (rows) {
     MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
     [cv setConstantValue:&rows type:MTLDataTypeUInt atIndex:0];
+    const bool fin = fold & 1, fout = fold & 2;
+    if (fin) [cv setConstantValue:&fin type:MTLDataTypeBool atIndex:1];
+    if (fout) [cv setConstantValue:&fout type:MTLDataTypeBool atIndex:2];
     fn = [lib newFunctionWithName:n constantValues:cv error:&err];
   } else {
     fn = [lib newFunctionWithName:n];

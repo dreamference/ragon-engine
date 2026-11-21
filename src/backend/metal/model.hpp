@@ -138,6 +138,12 @@ class Model {
   uint32_t xh_k_ = 0, xh_t_ = 0, xh_ld_ = 0;
   bool xh_fresh_ = false;  // a norm just wrote xh_ for the next gemv (as reuse_x for that one call)
   bool xh_fuse_ = true;    // RAGON_METAL_XH_OLD=1: the separate x_half passes (lane 3)
+  // Decode (one row): the residual-stream rmsnorms after layer 0 fold into the GEMVs around them. The GEMV that adds
+  // into h_ while fold_out_ is set writes fxw_ = h * (1 + fold_out_) and fpart_ (sums of h*h, 8 rows each); a GEMV
+  // of xn_ while fold_in_ is set reads fxw_ and scales by the rms from fpart_. Not bit-exact with the norm pass (the
+  // scale goes after the dot). RAGON_METAL_NORM_FOLD=0 runs the norm passes.
+  bool fold_ = true, fold_in_ = false;
+  View fold_out_, fxw_, fpart_;
   View xh2_;               // half silu(gate)*up, the MLP down projection's A (mode 3)
   bool kv8_ = false;  // int8 KV cache option (RAGON_METAL_KV=int8)
   uint32_t flash_dbg_ = 0;  // flash timing probes (RAGON_METAL_FLASH_DBG, wrong results): skip 1 rescale, 2 PV, 4 softmax, 16 QK; 8 QK via registers

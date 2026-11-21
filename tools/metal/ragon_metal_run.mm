@@ -2,6 +2,7 @@
 //   ragon-metal-run --model DIR --prompts-ids FILE [--check FILE] [--max-tokens N] [--greedy-out FILE]
 //                   [--ban-eos] [--ctx N] [--chunk C]
 //   ragon-metal-run --model DIR --prompts-ids FILE --teacher FILE    (argmax agreement on a reference continuation)
+//     [--teacher-chunk N]  feed the continuation N tokens a step (default --chunk; 1 scores the decode path)
 //   ragon-metal-run --model DIR --prompt-ids 1,2,3 --dump DIR      (per-layer check dumps, .npy f32)
 //   ragon-metal-run --model DIR --stdio [--ctx N] [--chunk C]      (a serving loop over JSON lines, see serve_stdio)
 // A prompts-ids file holds one prompt a line as comma-separated token ids; a check file holds one JSON object a
@@ -182,7 +183,7 @@ int main(int argc, char** argv) {
   @autoreleasepool {
     std::string model, prompts_file, check_file, greedy_out, dump_dir, teacher_file;
     std::vector<std::vector<uint32_t>> prompts;
-    int max_tokens = 256, ctx = 40960, chunk = 128;
+    int max_tokens = 256, ctx = 40960, chunk = 128, teacher_chunk = 0;
     bool ban_eos = false, stdio = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -198,6 +199,7 @@ int main(int argc, char** argv) {
       else if (a == "--prompt-ids") prompts.push_back(parse_ids(next()));
       else if (a == "--check") check_file = next();
       else if (a == "--teacher") teacher_file = next();
+      else if (a == "--teacher-chunk") teacher_chunk = std::stoi(next());
       else if (a == "--greedy-out") greedy_out = next();
       else if (a == "--dump") dump_dir = next();
       else if (a == "--max-tokens") max_tokens = std::stoi(next());
@@ -261,8 +263,9 @@ int main(int argc, char** argv) {
           margin_sum += t.v - lg[want];
         };
         score(m.logits(), int(cont[0]));
-        for (int s = 0; s + 1 < R; s += chunk) {
-          const int n = std::min(chunk, R - 1 - s);
+        const int tc = teacher_chunk > 0 ? std::min(teacher_chunk, chunk) : chunk;
+        for (int s = 0; s + 1 < R; s += tc) {
+          const int n = std::min(tc, R - 1 - s);
           m.forward(cont.data() + s, n, P + s, true);
           for (int r = 0; r < n; ++r) score(m.logits() + size_t(r) * m.vocab(), int(cont[s + r + 1]));
         }

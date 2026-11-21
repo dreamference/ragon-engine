@@ -275,6 +275,8 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   ids_ = q.alloc(C * 4);
   h_ = q.alloc(C * hidden_ * 4);
   xn_ = q.alloc(C * hidden_ * 4);
+  fxw_ = q.alloc(hidden_ * 4);
+  fpart_ = q.alloc(hidden_ / 8 * 4);
   qkv_ = q.alloc(C * std::max(conv_w, size_t(H_) * 2 * D_) * 4);
   zb_ = q.alloc(C * Hv_ * Dv_ * 4);
   ab_ = q.alloc(C * Hv_ * 4);
@@ -295,6 +297,7 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   mm_old_ = std::getenv("RAGON_METAL_MM_OLD") != nullptr;
   // Prefill: the norms and the MLP up matmul write the next matmul's half A themselves; =1 keeps the x_half passes.
   xh_fuse_ = std::getenv("RAGON_METAL_XH_OLD") == nullptr;
+  if (const char* v = std::getenv("RAGON_METAL_NORM_FOLD")) fold_ = std::atoi(v) != 0;
   if (const char* v = std::getenv("RAGON_METAL_LAYER_MAJOR")) layer_major_ = std::atoi(v) != 0;
   if (const char* v = std::getenv("RAGON_METAL_FLUSH")) flush_ = std::max(0, std::atoi(v));
   // Decode attention: the GQA-fused kernel by default; RAGON_METAL_ATTN_OLD=1 keeps the per-head kernel for A/B checks.
@@ -383,6 +386,8 @@ struct GemvArgs {
   uint32_t N, K, ldx, ldy, rows;
   float scale;
   uint32_t add;
+  float eps;
+  uint32_t npart;
 };
 
 struct MmArgs {
@@ -477,8 +482,19 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
                   : l.fmt == Lin::kFp8 ? "gemv_fp8"
                                        : "gemv_bf16";
   if (prof_ == 4) e = pm_sync(e, 5);  // decode split: the GEMV passes apart from the rest
-  [e setComputePipelineState:q_->pipe(k, T == 1 ? 1 : 8)];
-  GemvArgs a{l.N, l.K, uint32_t(ldx), uint32_t(ldy), uint32_t(T), l.scale, add ? 1u : 0u};
+  // decode: a GEMV of the normed row reads fxw_ and folds the norm in; a residual add writes the next fxw_ (see fold_in_)
+  const bool fin = fold_in_ && T == 1 && x.buf == xn_.buf && x.off == xn_.off;
+  if (fin && l.N % 8) fail("gemv: the norm fold needs N a multiple of 8 (RAGON_METAL_NORM_FOLD=0)");
+  const bool fout = !fold_out_.empty() && T == 1 && add && y.buf == h_.buf && y.off == h_.off && l.N % 8 == 0;
+  if (fin) x = fxw_;
+  [e setComputePipelineState:q_->pipe(k, T == 1 ? 1 : 8, (fin ? 1u : 0u) | (fout ? 2u : 0u))];
+  if (fin) [e setBuffer:fpart_.buf offset:fpart_.off atIndex:6];
+  if (fout) {
+    [e setBuffer:fold_out_.buf offset:fold_out_.off atIndex:7];
+    [e setBuffer:fxw_.buf offset:fxw_.off atIndex:8];
+    [e setBuffer:fpart_.buf offset:fpart_.off atIndex:9];
+  }
+  GemvArgs a{l.N, l.K, uint32_t(ldx), uint32_t(ldy), uint32_t(T), l.scale, add ? 1u : 0u, eps_, uint32_t(l.K / 8)};
   if (l.fmt == Lin::kNvfp4 || l.fmt == Lin::kQ4) {
     bind(e, {x, l.w, l.sc, y});
     bind_args(e, 4, a);
@@ -785,15 +801,20 @@ void Model::layer(size_t i, int T, int pos0, const Dump& dump) {
   Layer& L = layers_[i];
   const bool inner = dump && (i == 0 || i == 3);
   const std::string tag = "l" + std::to_string(i) + ".";
-  norm(h_, L.in_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0, 1.0f, L.attn ? &L.q : &L.qkv, T);
+  const bool fold = fold_ && T == 1 && !dump;  // decode: the GEMVs that read xn_ norm the residual row themselves
+  fold_in_ = fold && i > 0;  // the previous layer's down GEMV wrote fxw_ and fpart_
+  if (!fold_in_) norm(h_, L.in_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0, 1.0f, L.attn ? &L.q : &L.qkv, T);
   if (inner) {
     q_->sync();
     dump(tag + "in_norm", xn_, {T, hidden_});
   }
+  if (fold) fold_out_ = L.post_norm;  // the output projection's residual add
   if (L.attn) attention(L, T, pos0, inner ? dump : nullptr, tag);
   else gdn(L, T, inner ? dump : nullptr, tag);
+  fold_out_ = View{};
+  fold_in_ = fold;
   if (prof_) prof[L.attn ? 0 : 1] += q_->sync();
-  norm(h_, L.post_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0, 1.0f, &L.gate, T);
+  if (!fold) norm(h_, L.post_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0, 1.0f, &L.gate, T);
   if (inner) {
     q_->sync();
     dump(tag + "post_norm", xn_, {T, hidden_});
@@ -815,7 +836,10 @@ void Model::layer(size_t i, int T, int pos0, const Dump& dump) {
     [q_->pre(e) dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     e = pm_sync(e, 4);
   }
+  fold_in_ = false;
+  if (fold) fold_out_ = i + 1 < layers_.size() ? layers_[i + 1].in_norm : final_norm_;
   gemv(L.down, gb_, h_, T, ffn_, hidden_, true, 0, false, h3 ? xh2_ : View{});
+  fold_out_ = View{};
   if (prof_) prof[2] += q_->sync();
   if (dump) {
     q_->sync();
@@ -845,12 +869,14 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
   }
   const int r0 = all_logits ? 0 : T - 1, rows = all_logits ? T : 1;
   View hr = h_.at(size_t(r0) * hidden_ * 4);
-  norm(hr, final_norm_, View{}, xn_, rows, hidden_, 1, hidden_, 0, hidden_, 0, 0);
+  fold_in_ = fold_ && T == 1 && !dump;  // the last down GEMV wrote fxw_ and fpart_ with the final norm's weight
+  if (!fold_in_) norm(hr, final_norm_, View{}, xn_, rows, hidden_, 1, hidden_, 0, hidden_, 0, 0);
   if (dump) {
     q_->sync();
     dump("final_norm", xn_, {rows, hidden_});
   }
   gemv(head_, xn_, logits_, rows, hidden_, V_, false);
+  fold_in_ = false;
   q_->concurrent = false;  // the encoder in use keeps its kind
   if (greedy_) {
     struct {
