@@ -1371,7 +1371,7 @@ int attn_prefetch(const KvQ8& q8, bool wide) {
 
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx,
-                    const TreeDesc* td, const uint64_t* pages, KvQ8 q8) {
+                    const TreeDesc* td, const uint64_t* pages, KvQ8 q8, bool live) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   check_q8(q8, attention_chunk());
   if (pos0.dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
@@ -1383,7 +1383,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   const bool wide = attention_wide(R, q8.on(), td != nullptr);
   const int rows = wide ? kAttnPrefillRows : kAttnRows;
   const int splits = attention_rows_grid_splits(fixed_ctx > 0 ? fixed_ctx : pos0.host + M, M, Hkv, q8.on());
-  const AttnLive lv{attention_live_target(q8.on()), attention_live_min()};
+  const AttnLive lv{live ? attention_live_target(q8.on()) : 0, attention_live_min()};
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
                     wide          ? attention_mma_kernel<kAttnPrefillRows, tk, ns, false>
                     : q8.on()     ? attention_mma_kernel<kAttnRows, tk, ns, false, true>
@@ -1398,7 +1398,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
 
 void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                          const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
-                         int fixed_ctx, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
+                         int fixed_ctx, SeqPtrs<const uint64_t> pages, KvQ8 q8, bool live) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   check_q8(q8, attention_chunk());
   if (b.pos_dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
@@ -1421,7 +1421,7 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   for (int i = 0; i < b.n; ++i) blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
   // The live chunk's room whenever any sequence is decode-sized (its chunk then never depends on its batch-mates).
   const int splits = attention_rows_grid_splits(ctx, least, Hkv, q8.on());
-  const AttnLive lv{attention_live_target(q8.on()), attention_live_min()};
+  const AttnLive lv{live ? attention_live_target(q8.on()) : 0, attention_live_min()};
   prepare_kernels();
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
                     wide          ? attention_mma_seqs_kernel<kAttnPrefillRows, tk, ns, false>
@@ -1436,7 +1436,7 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
 
 void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                             const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out,
-                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8) {
+                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8, bool live) {
   if (D != 256 || Hq != 6 * Hkv) throw std::runtime_error("attention_rows: built for head_dim 256, 6 query heads per KV head");
   check_q8(q8, attention_chunk());
   if (b.pos_dev) throw std::runtime_error("attention_rows_cascade: positions on the host only (no captured graph)");
@@ -1444,7 +1444,7 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
   if (groups.n < 1 || groups.n > kMaxSeqGroups) throw std::runtime_error("attention_rows_cascade: no groups");
   // The live chunk is a sequence's own (its position's): a group's shared ranges have no one chunk, so with the
   // switch on each sequence takes its own launch's ranges (the result per sequence is the cascade's contract).
-  if (attention_live_target()) return attention_rows_seqs(q, kc, vc, b, Hq, Hkv, D, scratch, out, s, 0, pages, q8);
+  if (attention_live_target()) return attention_rows_seqs(q, kc, vc, b, Hq, Hkv, D, scratch, out, s, 0, pages, q8, live);
   constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
   const int chunk = attention_chunk();
   int ctx = 0;

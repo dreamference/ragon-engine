@@ -1637,6 +1637,9 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
   // A prompt's tokens take the prefill path whatever the chunk's size, so the state a prompt leaves does
   // not depend on how its prefill was split or where it resumed (the prefix checkpoints rely on it).
   quantized_ = pass == Pass::Prefill;
+  // RAGON_ATTN_LIVE_CHUNK applies to decode and verify passes only: a prefill's launches keep the fixed chunk even
+  // when a slice or a short chunk has as few rows as a verify (the 32-row tail of a 544-row chunk).
+  const bool live = pass != Pass::Prefill;
   // LORA §3: the rows of the sequences on an adapter. With any, the fused paths that keep a projection's input or
   // output inside one kernel step aside (megakernels, tails, the fork, the BF16 prefill), so every site's input is in
   // FP32 for its shrink; without, nothing below changes.
@@ -1786,10 +1789,10 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
                                    c.rope_theta, c.eps, q_, gate_, kc, vc, stream_, pg, kv_sealed_, kv_page_unit_);
         if (groups.n > 0)
           kernels::attention_rows_cascade(q_, kcr, vcr, sb, groups, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_,
-                                          stream_, pg, kv_q8_of(slot));
+                                          stream_, pg, kv_q8_of(slot), live);
         else
           kernels::attention_rows_seqs(q_, kcr, vcr, sb, c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_, stream_,
-                                       use_dev_pos_ ? opts_.max_context : 0, pg, kv_q8_of(slot));
+                                       use_dev_pos_ ? opts_.max_context : 0, pg, kv_q8_of(slot), live);
       }
       // RAGON_KV_CALIB: the K and V the eager passes cached, by layer (tree rows and captured passes skipped).
       auto calib = [&](const Seg& g) {
@@ -1815,7 +1818,7 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
           const int n = std::min(kAttnSlice, g.rows - q0);
           kernels::attention_rows(q_ + (r0 + q0) * qsize, g.s->kcache[slot], g.s->vcache[slot], seg_pos(g, q0), n,
                                   c.heads, c.kv_heads, c.head_dim, attn_scratch_, attn_ + (r0 + q0) * qsize, stream_,
-                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages, kv_q8_of(slot));
+                                  use_dev_pos_ ? opts_.max_context : 0, seg_tree(g), g.s->pages, kv_q8_of(slot), live);
         }
       }
       if (quantized_ && !L.o.fp4) {

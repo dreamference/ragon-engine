@@ -299,14 +299,14 @@ void attn_prepare_seqs(const float* q_gate, const float* k, const float* v, cons
 // attention_rows over every row of b (q and out [rows][Hq][D]), each sequence over its own caches.
 void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                          const SeqBatch& b, int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s,
-                         int fixed_ctx = 0, SeqPtrs<const uint64_t> pages = {}, KvQ8 q8 = {});
+                         int fixed_ctx = 0, SeqPtrs<const uint64_t> pages = {}, KvQ8 q8 = {}, bool live = true);
 // The cascade (BATCHING §5.3): attention_rows_seqs with the keys below a group's cut computed once for every row of the
 // group, whose sequences (a run of the batch) hold those keys on the same pages; cut on the tile grid, at or below each
 // sequence's position. Every sequence's own keys follow from its group's cut, so each row's result is bit for bit its own
 // launch's. Eager only: a captured graph's launches cannot follow which pages are shared.
 void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtrs<const __nv_bfloat16> vc,
                             const SeqBatch& b, const SeqGroups& groups, int Hq, int Hkv, int D, float* scratch, float* out,
-                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8 = {});
+                            cudaStream_t s, SeqPtrs<const uint64_t> pages, KvQ8 q8 = {}, bool live = true);
 // The verify's conv: each sequence's rows of mixed from its own window (read, not written).
 void gdn_conv_seqs(float* mixed, SeqPtrs<const float> state, const __nv_bfloat16* w, const SeqBatch& b, int C,
                    cudaStream_t s);
@@ -572,7 +572,8 @@ void attn_prepare(const float* q_gate, const float* k, const float* v, const __n
 size_t attention_rows_scratch_floats(int M, int Hq, int D, int ctx);
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx = 0,
-                    const TreeDesc* td = nullptr, const uint64_t* pages = nullptr, KvQ8 q8 = {});
+                    const TreeDesc* td = nullptr, const uint64_t* pages = nullptr, KvQ8 q8 = {}, bool live = true);
+// `live` false: a prefill pass's launch, which keeps the fixed chunk under RAGON_ATTN_LIVE_CHUNK whatever its rows.
 // P4: kcache/vcache are a layer's K and V bases in the pool and `pages` the session's page table (null: flat).
 // Sets the kernels' shared-memory attributes once, outside any graph capture.
 void prepare_kernels();
