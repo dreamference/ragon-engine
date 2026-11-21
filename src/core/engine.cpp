@@ -379,6 +379,10 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   if (const char* e = std::getenv("RAGON_MK_FFN")) mk_ffn_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_GDN")) mk_gdn_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_ATTN")) mk_attn_ = std::atoi(e);
+  if (mk_attn_ && kernels::attention_live_target()) {  // its ranges are the fixed chunk's: one chunk per launch
+    mk_attn_ = 0;
+    std::fprintf(stderr, "RAGON_MK_ATTN off: the live attention chunk (RAGON_ATTN_LIVE_CHUNK) is on\n");
+  }
   if (const char* e = std::getenv("RAGON_MK_LAYERS")) mk_layers_ = std::atoi(e);
   if (const char* e = std::getenv("RAGON_MK_SPAN")) mk_span_ = std::atoi(e);
   if (mk_span_ > 0) {  // the spanning kernel's own FP16 copies (see kernels::gdn_ffn_persistent)

@@ -1518,6 +1518,32 @@ bool test_batched_state_kernels() {
                     (void*)scratch, (void*)o1, (void*)o2})
       cudaFree(p);
   }
+  // ---- a prefill-sized sequence beside a decode-sized one: each bit for bit its own launch (with
+  // RAGON_ATTN_LIVE_CHUNK the decode-sized one's key ranges must not depend on its batch-mate) ----
+  {
+    const int Hq = 24, Hkv = 4, D = 256, ctx = 8192, mr[2] = {40, 5}, mp[2] = {2900, 3100}, MM = mr[0] + mr[1];
+    const size_t cache = size_t(ctx) * Hkv * D, qbytes = size_t(MM) * Hq * D * 4;
+    __nv_bfloat16 *ka = upload(randb(cache)), *va = upload(randb(cache)), *kb = upload(randb(cache)),
+                  *vb = upload(randb(cache));
+    float* q = upload(randv(size_t(MM) * Hq * D, 0.05f));
+    k::SeqBatch mb;
+    mb.n = 2, mb.row0[1] = mr[0], mb.row0[2] = MM, mb.pos[0] = mp[0], mb.pos[1] = mp[1];
+    float *scratch, *o1, *o2;
+    cudaMalloc(&scratch, k::attention_rows_scratch_floats(64, Hq, D, ctx) * sizeof(float));
+    cudaMalloc(&o1, qbytes), cudaMalloc(&o2, qbytes);
+    for (int s = 0; s < 2; ++s)
+      k::attention_rows(q + size_t(mb.row0[s]) * Hq * D, s ? kb : ka, s ? vb : va, mp[s], mr[s], Hq, Hkv, D, scratch,
+                        o1 + size_t(mb.row0[s]) * Hq * D, nullptr);
+    k::SeqPtrs<const __nv_bfloat16> kr, vr;
+    kr.p[0] = ka, kr.p[1] = kb, vr.p[0] = va, vr.p[1] = vb;
+    k::attention_rows_seqs(q, kr, vr, mb, Hq, Hkv, D, scratch, o2, nullptr);
+    const bool mixed = same(download(o1, qbytes / 4).data(), download(o2, qbytes / 4).data(), qbytes) &&
+                       cudaDeviceSynchronize() == cudaSuccess;
+    ok &= mixed;
+    std::printf("attention_rows over a 40-row and a 5-row sequence in one launch identical to per sequence: %s\n",
+                mixed ? "yes ok" : "NO FAIL");
+    for (void* p : {(void*)ka, (void*)va, (void*)kb, (void*)vb, (void*)q, (void*)scratch, (void*)o1, (void*)o2}) cudaFree(p);
+  }
   // ---- the cascade: keys on shared pages computed once for every row that shares them ----
   {
     const int Hq = 24, Hkv = 4, D = 256, page = k::kKvPageTokens, shared = 150, own = 10;
