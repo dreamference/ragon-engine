@@ -997,6 +997,140 @@ template [[host_name("attn_flash6_8")]] kernel void attn_flash<6, 8, 64, 64>(dev
 template [[host_name("attn_flash6_128")]] kernel void attn_flash<6, 8, 128, 32>(device bfloat*, device bfloat*, device bfloat*, device float*, constant PrefAttnArgs&, constant uint&, uint2, uint, uint, uint);
 template [[host_name("attn_flash6_192")]] kernel void attn_flash<6, 12, 192, 16>(device bfloat*, device bfloat*, device bfloat*, device float*, constant PrefAttnArgs&, constant uint&, uint2, uint, uint, uint);
 
+// attn_flash2: as attn_flash, with the online softmax on the QK^T cooperative tile in registers (no S round trip
+// through threadgroup memory), one cross-simdgroup row-max exchange per key block, per-thread partial row sums (combined
+// once at the end), and a lazy rescale: a row's reference max moves only when the block max exceeds it by more than
+// 2^8 (log2 domain), so O is rescaled only in the blocks where some row's max moved that far. Exact math: the final
+// division uses the same reference max as the numerator. Layout of the MPP destination (measured for 64x64 and 64x128
+// over 8 simdgroups; 128-key blocks were slower, register pressure): elements 4g..4g+3 of a thread are 4 consecutive columns of one row, and lanes l, l^1, l^8, l^9
+// hold the same row's 16 consecutive columns starting at a multiple of 16 (a column chunk).
+template <uint G, uint BC>
+kernel void attn_flash2(device bfloat* qg [[buffer(0)]], device bfloat* kc [[buffer(1)]],
+                        device bfloat* vc [[buffer(2)]], device float* o [[buffer(3)]],
+                        constant PrefAttnArgs& a [[buffer(4)]], constant uint& dbg [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint D = 256, BR = 64, NSG = 8, NG = BR * BC / (32 * NSG * 4), NCH = BC / 16;
+  constexpr float TAU = 8.0f;
+  threadgroup bfloat sP[BR * BC];
+  threadgroup float smx[NCH * BR];  // per column chunk row maxima, then the final per chunk row sums
+  threadgroup float sa[BR];
+  threadgroup uint sflag;
+  const uint kvh = tg.y, r0 = tg.x * BR, rows = a.Tp * G, kw = (a.H / G) * D;
+  auto tQ = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+      qg + (ulong)kvh * rows * D, dextents<int32_t, 2>(D, rows), array<int32_t, 2>{1, int(D)});
+  auto tK = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(kc + kvh * D, dextents<int32_t, 2>(D, a.kvp),
+                                                                       array<int32_t, 2>{1, int(kw)});
+  auto tV = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(vc + kvh * D, dextents<int32_t, 2>(D, a.kvp),
+                                                                       array<int32_t, 2>{1, int(kw)});
+  auto tP = tensor<threadgroup bfloat, dextents<int32_t, 2>, tensor_inline>(sP, dextents<int32_t, 2>(BC, BR),
+                                                                            array<int32_t, 2>{1, int(BC)});
+  constexpr auto d1 = matmul2d_descriptor(BR, BC, D, false, true, false);
+  constexpr auto d2 = matmul2d_descriptor(BR, D, BC, false, false, false,
+                                          matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<d1, execution_simdgroups<NSG>> op1;
+  matmul2d<d2, execution_simdgroups<NSG>> op2;
+  auto mQ = tQ.slice(0, r0);
+  auto mK0 = tK.slice(0, 0);
+  auto mV0 = tV.slice(0, 0);
+  auto cO = op2.template get_destination_cooperative_tensor<decltype(tP), decltype(mV0), float>();
+#pragma unroll
+  for (uint16_t i = 0; i < cO.get_capacity(); ++i)
+    if (cO.is_valid_element(i)) cO[i] = 0.0f;
+  auto cS = op1.template get_destination_cooperative_tensor<decltype(mQ), decltype(mK0), float>();
+  // this thread's element groups: row, first column, valid key count (fixed for every block); per group row state
+  uint rr[NG], cc[NG], nn[NG];
+  float m[NG], l[NG];
+#pragma unroll
+  for (uint k = 0; k < NG; ++k) {
+    const auto ix = cS.get_multidimensional_index(uint16_t(4 * k));
+    rr[k] = uint(ix[1]);
+    cc[k] = uint(ix[0]);
+    const uint t = (r0 + rr[k]) / G;
+    nn[k] = t < a.T ? a.pos0 + t + 1 : 0;  // valid keys j < nn
+    m[k] = -INFINITY;
+    l[k] = 0.0f;
+  }
+  const bool wr = (lane & 9) == 0;
+  if (tid == 0) sflag = ~0u;
+  const uint tfirst = r0 / G;
+  const uint kend = tfirst < a.T ? a.pos0 + min((r0 + BR - 1) / G, a.T - 1) + 1 : 0;  // keys [0, kend)
+  const uint nmin = tfirst < a.T ? a.pos0 + tfirst + 1 : 0;  // blocks ending at or below nmin need no mask
+  for (uint j0 = 0, it = 0; j0 < kend; j0 += BC, ++it) {
+    auto mK = tK.slice(0, j0);
+    op1.run(mQ, mK, cS);
+    const bool full = j0 + BC <= nmin;
+#pragma unroll
+    for (uint k = 0; k < NG; ++k) {
+      float x = -INFINITY;
+#pragma unroll
+      for (uint e = 0; e < 4; ++e) {
+        const uint i = 4 * k + e;
+        const float s = (full || j0 + cc[k] + e < nn[k]) ? cS[i] * M_LOG2E_F : -INFINITY;
+        cS[i] = s;
+        x = max(x, s);
+      }
+      x = max(x, simd_shuffle_xor(x, 1));
+      x = max(x, simd_shuffle_xor(x, 8));
+      if (wr) smx[(cc[k] / 16) * BR + rr[k]] = x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool resc = false;
+#pragma unroll
+    for (uint k = 0; k < NG; ++k) {
+      const uint r = rr[k];
+      float mx = smx[r];
+#pragma unroll
+      for (uint c = 1; c < NCH; ++c) mx = max(mx, smx[c * BR + r]);
+      float al = 1.0f;
+      if (mx > m[k] + TAU) {  // also the first finite block (m = -inf); O and l are still 0 then
+        if (m[k] != -INFINITY) {
+          al = exp2(m[k] - mx);
+          resc = true;
+        }
+        m[k] = mx;
+      }
+      float4 p4;
+#pragma unroll
+      for (uint e = 0; e < 4; ++e) p4[e] = m[k] == -INFINITY ? 0.0f : exp2(cS[4 * k + e] - m[k]);
+      *(threadgroup bfloat4*)(sP + r * BC + cc[k]) = bfloat4(p4);
+      l[k] = l[k] * al + (p4[0] + p4[1] + p4[2] + p4[3]);
+      if (wr && cc[k] < 16) sa[r] = al;
+    }
+    if (resc) sflag = it;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sflag == it) {
+#pragma unroll
+      for (uint16_t i = 0; i < cO.get_capacity(); ++i)
+        if (cO.is_valid_element(i)) cO[i] *= sa[cO.get_multidimensional_index(i)[1]];
+    }
+    auto mV = tV.slice(0, j0);
+    op2.run(tP, mV, cO);
+  }
+  // row sums: lanes, then column chunks
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+  for (uint k = 0; k < NG; ++k) {
+    float x = l[k];
+    x += simd_shuffle_xor(x, 1);
+    x += simd_shuffle_xor(x, 8);
+    if (wr) smx[(cc[k] / 16) * BR + rr[k]] = x;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint H = a.H;
+#pragma unroll
+  for (uint16_t i = 0; i < cO.get_capacity(); ++i)
+    if (cO.is_valid_element(i)) {
+      const auto ix = cO.get_multidimensional_index(i);
+      const uint rl = uint(ix[1]), r = r0 + rl, t = r / G, c = uint(ix[0]);
+      float s = 0.0f;
+#pragma unroll
+      for (uint q = 0; q < NCH; ++q) s += smx[q * BR + rl];
+      o[(ulong)t * H * D + (kvh * G + r % G) * D + c] = t < a.T && s > 0.0f ? cO[i] / s : 0.0f;
+    }
+}
+template [[host_name("attn_flash2_6")]] kernel void attn_flash2<6, 64>(device bfloat*, device bfloat*, device bfloat*, device float*, constant PrefAttnArgs&, constant uint&, uint2, uint, uint, uint);
+
 // Causal softmax over S [H][Tp][kvp] f32 -> P bfloat (masked and padded entries 0). Grid (Tp, H), 256 threads.
 kernel void softmax_causal(device const float* S [[buffer(0)]], device bfloat* P [[buffer(1)]],
                            constant PrefAttnArgs& a [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],

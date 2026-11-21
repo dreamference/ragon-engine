@@ -295,10 +295,10 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   attn_gqa_ = std::getenv("RAGON_METAL_ATTN_OLD") == nullptr;
   if (const char* v = std::getenv("RAGON_METAL_ATTN_NCH")) attn_nch_ = std::max(1, std::atoi(v));
   if (const char* v = std::getenv("RAGON_METAL_ATTN_CHUNK_MIN")) attn_chunk_min_ = std::max(4, std::atoi(v));
-  // Prefill attention: the flash kernel (4 simdgroups) by default; RAGON_METAL_ATTN_FLASH=0 keeps the S/P matmuls.
+  // Prefill attention: flash2 by default; RAGON_METAL_ATTN_FLASH=0 keeps the S/P matmuls, 8 the first flash kernel.
   if (const char* v = std::getenv("RAGON_METAL_ATTN_FLASH")) attn_flash_ = std::atoi(v);
-  if (attn_flash_ != 0 && attn_flash_ != 4 && attn_flash_ != 8 && attn_flash_ != 128 && attn_flash_ != 192)
-    fail("RAGON_METAL_ATTN_FLASH must be 0, 4, 8, 128 or 192");
+  if (attn_flash_ != 0 && attn_flash_ != 2 && attn_flash_ != 4 && attn_flash_ != 8 && attn_flash_ != 128 && attn_flash_ != 192)
+    fail("RAGON_METAL_ATTN_FLASH must be 0, 2, 4, 8, 128 or 192");
   if (D_ != 256 || H_ != 6 * KV_) attn_flash_ = 0;
   if (const char* v = std::getenv("RAGON_METAL_FLASH_DBG")) flash_dbg_ = uint32_t(std::atoi(v));
   if (C_ >= mm_min_) {
@@ -655,8 +655,8 @@ void Model::attention_mm(Layer& L, int T, int pos0) {
     vc = vdq_;
   }
   if (flash) {
-    // 4, 8: 64 query rows a threadgroup (4 or 8 simdgroups); 128, 192: taller tiles that read K/V fewer times
-    const char* fn = attn_flash_ == 8 ? "attn_flash6_8" : attn_flash_ == 128 ? "attn_flash6_128"
+    // 2: flash2 (64 rows, 8 simdgroups); 4, 8: 64 query rows a threadgroup (4 or 8 simdgroups); 128, 192: taller tiles
+    const char* fn = attn_flash_ == 2 ? "attn_flash2_6" : attn_flash_ == 8 ? "attn_flash6_8" : attn_flash_ == 128 ? "attn_flash6_128"
                      : attn_flash_ == 192 ? "attn_flash6_192" : "attn_flash6";
     const uint32_t br = attn_flash_ >= 128 ? uint32_t(attn_flash_) : 64, nsg = attn_flash_ == 192 ? 12 : attn_flash_ == 4 ? 4 : 8;
     [e setComputePipelineState:q_->pipe(fn)];

@@ -115,7 +115,8 @@ class Model {
   uint32_t xh_k_ = 0, xh_t_ = 0, xh_ld_ = 0;
   bool kv8_ = false;  // int8 KV cache option (RAGON_METAL_KV=int8)
   uint32_t flash_dbg_ = 0;  // flash timing probes (RAGON_METAL_FLASH_DBG, wrong results): skip 1 rescale, 2 PV, 4 softmax, 16 QK; 8 QK via registers
-  int attn_flash_ = 8;  // prefill attention (RAGON_METAL_ATTN_FLASH): 0 = S/P matmuls; 4, 8, 128, 192 = flash kernel
+  int attn_flash_ = 2;  // prefill attention (RAGON_METAL_ATTN_FLASH): 0 = S/P matmuls; 2 = flash2 (softmax in registers);
+                        // 4, 8, 128, 192 = the first flash kernel
   View kdq_, vdq_;    // int8 KV: bfloat scratch of one layer's cache for the prefill matmuls
   void to_q4(Lin& l);  // the Mac-native 4-bit projection option (RAGON_METAL_PROJ=q4)
   int attn_nch_ = 16, attn_chunk_min_ = 64;  // fused decode attention: max key chunks, min keys a chunk
