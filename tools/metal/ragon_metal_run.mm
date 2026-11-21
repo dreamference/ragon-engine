@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
         std::vector<uint32_t> cont(ref[p].begin(), ref[p].end());
         const int R = std::min(int(cont.size()), ctx - P);
         m.reset();
-        for (int s = 0; s < P; s += chunk) m.forward(pr.data() + s, std::min(chunk, P - s), s, false);
+        m.prefill(pr.data(), P);
         int agree = 0;
         double margin_sum = 0;
         auto score = [&](const float* lg, int want) {
@@ -207,8 +207,14 @@ int main(int argc, char** argv) {
       std::fill(m.prof, m.prof + 5, 0.0);
       std::fill(m.pm, m.pm + 6, 0.0);
       const double tp = now();
-      for (int s = 0; s < P; s += chunk) m.forward(pr.data() + s, std::min(chunk, P - s), s, false);
+      m.prefill(pr.data(), P);
       const double prefill_s = now() - tp;
+      if (std::getenv("RAGON_METAL_LOGITS_HASH")) {  // exactness checks between prefill paths
+        uint64_t hsh = 1469598103934665603ull;
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(m.logits());
+        for (size_t k = 0; k < size_t(m.vocab()) * 4; ++k) hsh = (hsh ^ b[k]) * 1099511628211ull;
+        std::fprintf(stderr, "prompt %zu: prefill logits hash %016llx\n", p, (unsigned long long)hsh);
+      }
       if (std::getenv("RAGON_METAL_PROF"))
         std::fprintf(stderr, "prefill GPU s: attention %.3f, GDN %.3f (recurrence %.3f), MLP %.3f, head %.3f\n",
                      m.prof[0], m.prof[1], m.prof[4], m.prof[2], m.prof[3]);
@@ -221,6 +227,8 @@ int main(int argc, char** argv) {
       float div_margin = 0, div_gap = 0;
       const std::vector<int>* ref = p < check.size() ? &check[p] : nullptr;
       double td = 0;
+      std::fill(m.prof, m.prof + 5, 0.0);
+      std::fill(m.pm, m.pm + 6, 0.0);
       for (int k = 0; k < max_tokens; ++k) {
         const float* lg = m.logits();
         Top t = top2(lg, m.vocab(), banned);
@@ -239,6 +247,14 @@ int main(int argc, char** argv) {
       }
       const double decode_s = now() - td;
       const double dec_tps = max_tokens > 1 ? (max_tokens - 1) / decode_s : 0;
+      if (std::getenv("RAGON_METAL_PROF") && max_tokens > 1) {
+        const double st = 1e3 / (max_tokens - 1);
+        std::fprintf(stderr, "decode GPU ms a step: attention %.3f, GDN %.3f, MLP %.3f, head %.3f (wall %.3f)\n",
+                     m.prof[0] * st, m.prof[1] * st, m.prof[2] * st, m.prof[3] * st, decode_s * st);
+        if (std::atoi(std::getenv("RAGON_METAL_PROF")) == 4)
+          std::fprintf(stderr, "decode GPU ms a step: GEMV %.3f, other %.3f, GDN recurrence %.3f\n", m.pm[2] * st,
+                       m.pm[5] * st, m.prof[4] * st);
+      }
       std::printf("prompt %zu: %d prompt tokens, prefill %.3f s (%.1f tok/s), decode %d tokens %.2f tok/s, "
                   "min top1-top2 gap %.3f",
                   p, P, prefill_s, P / prefill_s, int(gen.size()), dec_tps, min_gap);
