@@ -1100,6 +1100,27 @@ bool attention_shared_retile() {
   return on;
 }
 
+// RAGON_ATTN_PREFILL_ROWS (default 128, 0 or 96 off): attention_rows and attention_rows_seqs with 128 query rows per
+// block, 8 warps, for launches of at least kAttnPrefillMinRows rows (the prefill's slices), not 96 and 6. With 255
+// registers a thread the 96-row block leaves a quarter of the register file idle and one block fits an SM; 8 warps of
+// 32 x 256 registers fill it, hide more of each tile's load and share each staged tile among a third more rows. Each warp
+// keeps its 16 rows, the tile grid and the key order (as attention_shared_kernel's retile): the same floats, bit for
+// bit. Not with --kv-fp8 (its domains span the block's positions) nor --attn-bulk nor a tree. Wide launches skip the
+// L2 prefetch (data movement only): at 256 query rows it was 2-3% slower than none (GB10, 8K-30K context).
+constexpr int kAttnPrefillRows = 128, kAttnPrefillMinRows = 384;
+int attention_prefill_rows() {
+  static const int r = [] {
+    const char* e = std::getenv("RAGON_ATTN_PREFILL_ROWS");
+    const int v = e && std::atoi(e) != kAttnPrefillRows ? kAttnRows : kAttnPrefillRows;
+    if (v != kAttnRows) std::fprintf(stderr, "attention prefill rows: %d query rows per block\n", v);
+    return v;
+  }();
+  return r;
+}
+bool attention_wide(int rows, bool q8, bool tree) {
+  return rows >= kAttnPrefillMinRows && !q8 && !tree && !g_attn_bulk && attention_prefill_rows() == kAttnPrefillRows;
+}
+
 void prepare_kernels() {
   static bool configured = false;
   if (configured) return;
@@ -1107,6 +1128,12 @@ void prepare_kernels() {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
   check(cudaFuncSetAttribute(attention_mma_kernel<kAttnRows, kAttnTk, kAttnNs, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_kernel<kAttnPrefillRows, kAttnTk, kAttnNs, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
+        "attention_rows smem");
+  check(cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnPrefillRows, kAttnTk, kAttnNs, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mma_smem(kAttnTk, kAttnNs))),
         "attention_rows smem");
   check(cudaFuncSetAttribute(attention_mma_seqs_kernel<kAttnRows, kAttnTk, kAttnNs, false>,
@@ -1260,15 +1287,18 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
   if (td && g_attn_bulk) throw std::runtime_error("attention_rows: a tree verify needs the cp.async tiles (no --attn-bulk)");
   // The grid: the ranges covering the rows' keys, or (in a graph) every range up to fixed_ctx.
   const int splits = attention_rows_splits(fixed_ctx > 0 ? fixed_ctx : pos0.host + M);
-  constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
+  constexpr int tk = kAttnTk, ns = kAttnNs;
   prepare_kernels();
   const int R = M * 6;
+  const bool wide = attention_wide(R, q8.on(), td != nullptr);
+  const int rows = wide ? kAttnPrefillRows : kAttnRows;
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows",
-                    q8.on()       ? attention_mma_kernel<rows, tk, ns, false, true>
-                    : g_attn_bulk ? attention_mma_kernel<rows, tk, ns, true>
-                                  : attention_mma_kernel<rows, tk, ns, false>,
+                    wide          ? attention_mma_kernel<kAttnPrefillRows, tk, ns, false>
+                    : q8.on()     ? attention_mma_kernel<kAttnRows, tk, ns, false, true>
+                    : g_attn_bulk ? attention_mma_kernel<kAttnRows, tk, ns, true>
+                                  : attention_mma_kernel<kAttnRows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kcache, vcache,
-                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, td, pages,
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), wide ? 0 : g_attn_prefetch, td, pages,
                     q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
@@ -1281,7 +1311,11 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   check_q8(q8, attention_chunk());
   if (b.pos_dev && fixed_ctx <= 0) throw std::runtime_error("attention_rows: a device position needs a fixed context");
   if (b.n < 1 || b.n > kMaxSeqs) throw std::runtime_error("attention_rows_seqs: 1 to kMaxSeqs sequences");
-  constexpr int rows = kAttnRows, tk = kAttnTk, ns = kAttnNs;
+  constexpr int tk = kAttnTk, ns = kAttnNs;
+  int most = 0;
+  for (int i = 0; i < b.n; ++i) most = std::max(most, (b.row0[i + 1] - b.row0[i]) * 6);
+  const bool wide = attention_wide(most, q8.on(), false);
+  const int rows = wide ? kAttnPrefillRows : kAttnRows;
   // One set of ranges for every sequence: those covering the furthest sequence's keys (or, in a graph, every range
   // up to fixed_ctx). A range past a sequence's last key writes an empty partial that the combine skips, so each
   // sequence's result is bit for bit its own launch's (the argument a captured graph already relies on).
@@ -1293,11 +1327,12 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
   for (int i = 0; i < b.n; ++i) blocks.blk0[i + 1] = blocks.blk0[i] + ((b.row0[i + 1] - b.row0[i]) * 6 + rows - 1) / rows;
   prepare_kernels();
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_seqs",
-                    q8.on()       ? attention_mma_seqs_kernel<rows, tk, ns, false, true>
-                    : g_attn_bulk ? attention_mma_seqs_kernel<rows, tk, ns, true>
-                                  : attention_mma_seqs_kernel<rows, tk, ns, false>,
+                    wide          ? attention_mma_seqs_kernel<kAttnPrefillRows, tk, ns, false>
+                    : q8.on()     ? attention_mma_seqs_kernel<kAttnRows, tk, ns, false, true>
+                    : g_attn_bulk ? attention_mma_seqs_kernel<kAttnRows, tk, ns, true>
+                                  : attention_mma_seqs_kernel<kAttnRows, tk, ns, false>,
                     dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
-                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
+                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), wide ? 0 : g_attn_prefetch, pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
