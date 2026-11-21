@@ -1278,6 +1278,20 @@ void check_q8(const KvQ8& q8, int chunk) {
   if (chunk % kAttnTk) throw std::runtime_error("attention_rows: --kv-fp8 needs RAGON_ATTN_CHUNK on the 32-key grid");
 }
 
+// The prefetch distance a launch passes: none on the wide path; with --kv-fp8 RAGON_ATTN_Q8_PREFETCH (default 0 tiles), as
+// the codes are half the bytes and the decode into the stage hides the load. Measured on GB10, 1 sequence x 16 rows:
+// 0.401 ms per layer at 8K and 0.417 at 32K, against 0.425 and 0.441 with the engine's 2; agentlong prefill 2% faster.
+// Data movement only: the same floats.
+int attn_prefetch(const KvQ8& q8, bool wide) {
+  static const int q8pf = [] {
+    const char* e = std::getenv("RAGON_ATTN_Q8_PREFETCH");
+    const int v = e ? std::atoi(e) : 0;
+    return v < 0 ? 0 : v;
+  }();
+  if (wide) return 0;
+  return q8.on() ? q8pf : g_attn_prefetch;
+}
+
 void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bfloat16* vcache, DevPos pos0, int M,
                     int Hq, int Hkv, int D, float* scratch, float* out, cudaStream_t s, int fixed_ctx,
                     const TreeDesc* td, const uint64_t* pages, KvQ8 q8) {
@@ -1298,7 +1312,7 @@ void attention_rows(const float* q, const __nv_bfloat16* kcache, const __nv_bflo
                     : g_attn_bulk ? attention_mma_kernel<kAttnRows, tk, ns, true>
                                   : attention_mma_kernel<kAttnRows, tk, ns, false>,
                     dim3((R + rows - 1) / rows, Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kcache, vcache,
-                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), wide ? 0 : g_attn_prefetch, td, pages,
+                    pos0, M, Hq, Hkv, splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, wide), td, pages,
                     q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel, dim3(M * Hq), dim3(D),
                     0, s, scratch, splits, D, out);
@@ -1332,7 +1346,7 @@ void attention_rows_seqs(const float* q, SeqPtrs<const __nv_bfloat16> kc, SeqPtr
                     : g_attn_bulk ? attention_mma_seqs_kernel<kAttnRows, tk, ns, true>
                                   : attention_mma_seqs_kernel<kAttnRows, tk, ns, false>,
                     dim3(blocks.blk0[b.n], Hkv, splits), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks, Hq, Hkv,
-                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), wide ? 0 : g_attn_prefetch, pages, q8);
+                    splits, attention_chunk(), scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, wide), pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }
@@ -1385,13 +1399,13 @@ void attention_rows_cascade(const float* q, SeqPtrs<const __nv_bfloat16> kc, Seq
                     : g_attn_bulk ? attention_shared_kernel<rows, tk, ns, true>
                                   : attention_shared_kernel<rows, tk, ns, false>,
                     dim3(gr.blk0[groups.n], Hkv, zshared), dim3(srows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, gr, Hq, Hkv,
-                    splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
+                    splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, false), pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_suffix",
                     q8.on()       ? attention_suffix_kernel<rows, tk, ns, false, true>
                     : g_attn_bulk ? attention_suffix_kernel<rows, tk, ns, true>
                                   : attention_suffix_kernel<rows, tk, ns, false>,
                     dim3(blocks.blk0[b.n], Hkv, splits - cuts.zbase), dim3(rows * 2), q8.on() ? mma_smem_q8(tk, ns) : mma_smem(tk, ns), s, q, kc, vc, b, blocks,
-                    cuts, Hq, Hkv, splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), g_attn_prefetch, pages, q8);
+                    cuts, Hq, Hkv, splits, chunk, scratch, kv_hs(D), kv_ps(Hkv, D), attn_prefetch(q8, false), pages, q8);
   launch_kernel_pdl(pdl_attention_enabled(), "attention_rows_combine", attention_combine_kernel,
                     dim3(b.row0[b.n] * Hq), dim3(D), 0, s, scratch, splits, D, out);
 }

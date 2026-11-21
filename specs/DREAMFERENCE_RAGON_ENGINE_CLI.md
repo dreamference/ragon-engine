@@ -130,6 +130,7 @@ Read by the engine at start (`src/core/engine.cpp`) and by two kernels, and the 
 | `RAGON_PDL=0\|1` | Overrides `--pdl`. |
 | `RAGON_ATTN_BULK=0\|1` | Overrides `--attn-bulk`. |
 | `RAGON_ATTN_PREFETCH=N` | Overrides `--attn-prefetch`. |
+| `RAGON_ATTN_Q8_PREFETCH=N` | The prefetch distance of the `--kv-fp8` attention reads (default 0: the codes are half the bytes; 0 tiles measured 5% faster than 2 on GB10). `--attn-prefetch` does not apply to them. |
 | `RAGON_PREFILL_BF16=0\|1` | Overrides `--prefill-bf16` (also the way to switch it on in a program without the flag, such as `bench/agreement/ragon_force.cpp`). |
 | `RAGON_PROFILE` | Set to anything: per-phase timing with a synchronization after each phase. Switches step graphs off (nothing may synchronize inside a captured step). |
 | `RAGON_KSPLIT=N` | Split-K for the streaming GEMM; set and non-zero it allocates a buffer per step, which also switches step graphs off. |
