@@ -55,7 +55,12 @@ View Queue::alloc(size_t bytes) {
 
 id<MTLComputeCommandEncoder> Queue::encoder() {
   if (!cb) cb = [q commandBuffer];
-  if (!enc) enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+  if (!enc) {
+    enc = [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+    conc_enc_ = concurrent;
+    first_ = true;
+    overlap_ = false;
+  }
   return enc;
 }
 

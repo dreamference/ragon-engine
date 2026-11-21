@@ -36,6 +36,10 @@ struct Queue {
   id<MTLComputeCommandEncoder> enc = nil;
   std::vector<id<MTLCommandBuffer>> flushed;
   std::map<std::string, id<MTLComputePipelineState>> pipes;
+  // concurrent: encoders opened from now on run their dispatches concurrently, with a buffer barrier before each
+  // dispatch (pre()) unless overlap() marked it independent of the dispatches since the last barrier.
+  bool concurrent = false;
+  bool conc_enc_ = false, first_ = true, overlap_ = false;  // conc_enc_: the open encoder is concurrent
 
   // Opens the default device and compiles the kernels with safe math (no fast-math: correctness first).
   void open();
@@ -43,6 +47,12 @@ struct Queue {
   id<MTLComputePipelineState> pipe(const char* name, uint32_t rows = 0);
   View alloc(size_t bytes);  // shared storage, zeroed
   id<MTLComputeCommandEncoder> encoder();
+  id<MTLComputeCommandEncoder> pre(id<MTLComputeCommandEncoder> e) {
+    if (conc_enc_ && !first_ && !overlap_) [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    first_ = overlap_ = false;
+    return e;
+  }
+  void overlap() { overlap_ = true; }  // the next dispatch needs no barrier (concurrent encoders only)
   // Ends the encoder and commits without waiting, so the GPU starts while the caller encodes the rest.
   void flush();
   // Waits for the flushed buffer b and retires it with every buffer committed before it (one queue: they complete

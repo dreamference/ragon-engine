@@ -161,6 +161,7 @@ class Model {
   // layer-major prefill: the whole prompt's hidden rows and one layer's half weights
   View hall_, wlay_;
   bool layer_major_ = true;
+  bool conc_ = true;  // decode: a concurrent encoder, barriers only between dependent dispatches (RAGON_METAL_CONC)
   int flush_ = 4;  // decode: commit the command buffer every flush_ layers so the GPU starts while the CPU encodes
   // chunked GDN prefill (RAGON_METAL_GDN_OLD=1 keeps the token loop): half q/k/v, per (sub-chunk, head) W, Uv, A2, lg
   View gq_, gk_, gv_, gW_, gU_, gA2_, glg_;
