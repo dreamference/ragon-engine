@@ -291,6 +291,8 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   if (const char* pr = std::getenv("RAGON_METAL_PROF")) prof_ = std::max(1, std::atoi(pr));
   if (const char* mm = std::getenv("RAGON_METAL_MM_MIN")) mm_min_ = std::max(1, std::atoi(mm));
   mm_old_ = std::getenv("RAGON_METAL_MM_OLD") != nullptr;
+  // Prefill: the norms and the MLP up matmul write the next matmul's half A themselves; =1 keeps the x_half passes.
+  xh_fuse_ = std::getenv("RAGON_METAL_XH_OLD") == nullptr;
   // Decode attention: the GQA-fused kernel by default; RAGON_METAL_ATTN_OLD=1 keeps the per-head kernel for A/B checks.
   attn_gqa_ = std::getenv("RAGON_METAL_ATTN_OLD") == nullptr;
   if (const char* v = std::getenv("RAGON_METAL_ATTN_NCH")) attn_nch_ = std::max(1, std::atoi(v));
@@ -327,6 +329,7 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
     const size_t kvp = size_t(pad64(max_ctx));
     wdq_ = q.alloc(wdq_cap_ * 2);
     xh_ = q.alloc(C * maxk * 2);
+    if (xh_fuse_) xh2_ = q.alloc(C * size_t(ffn_) * 2);
     mmc_ = q.alloc(C * maxn * 4);
     qb_ = q.alloc(size_t(H_) * C * D_ * 2);
     if (!attn_flash_) S_ = q.alloc(size_t(H_) * C * kvp * 4);
@@ -393,8 +396,11 @@ id<MTLComputeCommandEncoder> Model::pm_sync(id<MTLComputeCommandEncoder> e, int 
   return q_->encoder();
 }
 
-void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add, int mode, bool reuse_x) {
+void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add, int mode, bool reuse_x,
+                 View xa) {
   id<MTLComputeCommandEncoder> e = q_->encoder();
+  const bool fresh = xh_fresh_;
+  xh_fresh_ = false;
   if (use_mm(l, T)) {
     const uint32_t Mp = uint32_t(pad64(T));
     e = pm_sync(e, 5);
@@ -412,8 +418,9 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
       [e dispatchThreads:MTLSizeMake(n16, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     e = pm_sync(e, 0);
-    const bool have_x = reuse_x && !mm_old_ && xh_buf_ == (__bridge const void*)x.buf && xh_off_ == x.off &&
-                        xh_k_ == l.K && xh_t_ == uint32_t(T) && xh_ld_ == uint32_t(ldx);
+    const bool have_x = !xa.empty() || ((reuse_x || fresh) && !mm_old_ && xh_buf_ == (__bridge const void*)x.buf &&
+                                         xh_off_ == x.off && xh_k_ == l.K && xh_t_ == uint32_t(T) &&
+                                         xh_ld_ == uint32_t(ldx));
     if (!have_x) {
       const uint32_t xa[4] = {l.K, uint32_t(T), uint32_t(ldx), 0};
       [e setComputePipelineState:q_->pipe("x_half")];
@@ -430,11 +437,12 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     if (!mm_old_) {
       // one pass: 64x128 tiles (64x64 when N is not a multiple of 128) with the scale, add and row clip fused in
       const bool wide = l.N % 128 == 0;
-      const uint32_t md = mode == 2 ? 2u : add ? 1u : 0u;
+      const uint32_t md = mode >= 2 ? uint32_t(mode) : add ? 1u : 0u;
       struct { uint32_t M, N, K, T, ldy, mode; float scale; } ea = {Mp, l.N, l.K, uint32_t(T), uint32_t(ldy), md, l.scale};
       [e setComputePipelineState:q_->pipe(wide ? "mm_ep_64x128" : "mm_ep_64x64")];
-      bind(e, {xh_, wdq_, y});
+      bind(e, {xa.empty() ? xh_ : xa, wdq_, y});
       [e setBytes:&ea length:sizeof(ea) atIndex:3];
+      [e setBuffer:(mode == 3 ? xh2_ : y).buf offset:(mode == 3 ? xh2_ : y).off atIndex:4];
       [e dispatchThreadgroups:MTLSizeMake(l.N / (wide ? 128 : 64), Mp / 64, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       e = pm_sync(e, 2);
       return;
@@ -477,17 +485,31 @@ struct NormArgs {
   float eps;
   uint32_t mode;
   float scale;
+  uint32_t half_out, tvalid;
 };
 
 void Model::norm(View x, View w, View z, View out, int rows, int n, int rpt, int ldt, int ldh, int ldo_t,
-                 int ldo_h, int mode, float scale) {
+                 int ldo_h, int mode, float scale, const Lin* next, int T) {
+  const bool ho = xh_fuse_ && next && T > 0 && mm_fused(*next, T) && int(next->K) == ldo_t && rows == T * rpt &&
+                  ldo_t == n * rpt && (rpt == 1 || ldo_h == n);
+  if (ho) rows = pad64(T) * rpt;  // the pad rows zero xh_ as x_half does
   id<MTLComputeCommandEncoder> e = q_->encoder();
   [e setComputePipelineState:q_->pipe("rmsnorm_rows")];
-  NormArgs a{uint32_t(n), uint32_t(rpt), uint32_t(ldt), uint32_t(ldh), uint32_t(ldo_t), uint32_t(ldo_h), eps_,
-             uint32_t(mode), scale};
+  NormArgs a{uint32_t(n),  uint32_t(rpt), uint32_t(ldt), uint32_t(ldh), uint32_t(ldo_t), uint32_t(ldo_h), eps_,
+             uint32_t(mode), scale, ho ? 1u : 0u, uint32_t(T)};
   bind(e, {x, w.empty() ? x : w, z.empty() ? x : z, out});
   bind_args(e, 4, a);
+  const View oh = xh_.empty() ? out : xh_;  // xh_ exists only with the prefill matmul
+  [e setBuffer:oh.buf offset:oh.off atIndex:5];
   [e dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (ho) {
+    xh_buf_ = (__bridge const void*)out.buf;
+    xh_off_ = out.off;
+    xh_k_ = next->K;
+    xh_t_ = uint32_t(T);
+    xh_ld_ = uint32_t(ldo_t);
+    xh_fresh_ = true;
+  }
 }
 
 struct GdnArgs {
@@ -586,7 +608,7 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     dump(tag + "state", L.S, {Hv_, Dv_, Dk_});
   }
   // gated norm: rms over Dv with weight, times silu(z)
-  norm(core_, L.gnorm, zb_, gated_, T * Hv_, Dv_, Hv_, vw, Dv_, vw, Dv_, 1);
+  norm(core_, L.gnorm, zb_, gated_, T * Hv_, Dv_, Hv_, vw, Dv_, vw, Dv_, 1, 1.0f, &L.out, T);
   gemv(L.out, gated_, h_, T, vw, hidden_, true);
 }
 
@@ -757,7 +779,7 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     Layer& L = layers_[i];
     const bool inner = dump && (i == 0 || i == 3);
     const std::string tag = "l" + std::to_string(i) + ".";
-    norm(h_, L.in_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0);
+    norm(h_, L.in_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0, 1.0f, L.attn ? &L.q : &L.qkv, T);
     if (inner) {
       q_->sync();
       dump(tag + "in_norm", xn_, {T, hidden_});
@@ -765,13 +787,16 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     if (L.attn) attention(L, T, pos0, inner ? dump : nullptr, tag);
     else gdn(L, T, inner ? dump : nullptr, tag);
     if (prof_) prof[L.attn ? 0 : 1] += q_->sync();
-    norm(h_, L.post_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0);
+    norm(h_, L.post_norm, View{}, xn_, T, hidden_, 1, hidden_, 0, hidden_, 0, 0, 1.0f, &L.gate, T);
     if (inner) {
       q_->sync();
       dump(tag + "post_norm", xn_, {T, hidden_});
     }
     gemv(L.gate, xn_, gb_, T, hidden_, ffn_, false);
-    if (mm_fused(L.up, T)) {
+    const bool h3 = xh_fuse_ && mm_fused(L.up, T) && mm_fused(L.down, T);
+    if (h3) {
+      gemv(L.up, xn_, gb_, T, hidden_, ffn_, false, 3, true);  // xh2 = half(silu(gate) * up), down's A
+    } else if (mm_fused(L.up, T)) {
       gemv(L.up, xn_, gb_, T, hidden_, ffn_, false, 2, true);  // gb = silu(gate) * up in the matmul's store
     } else {
       gemv(L.up, xn_, ub_, T, hidden_, ffn_, false, 0, true);
@@ -783,7 +808,7 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
       [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       e = pm_sync(e, 4);
     }
-    gemv(L.down, gb_, h_, T, ffn_, hidden_, true);
+    gemv(L.down, gb_, h_, T, ffn_, hidden_, true, 0, false, h3 ? xh2_ : View{});
     if (prof_) prof[2] += q_->sync();
     if (dump) {
       q_->sync();
