@@ -90,13 +90,18 @@ class Model {
   // y[T][N] (=|+=) x[T][K] W^T: GEMV kernels for decode and short chunks, tensor-op matmul for T >= mm_min_.
   // mode 2 (prefill matmul only, see mm_fused()): y = silu(y) * (x W^T), the MLP up projection over the gate.
   // reuse_x: x is the input of the previous gemv call and unchanged since, so its half copy is kept.
-  void gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add, int mode = 0, bool reuse_x = false);
+  // mode 3 (prefill matmul only): as mode 2, but the result goes only to xh2_ as half, the A of the next gemv;
+  // xa: the half A that a mode-3 gemv wrote (skips the x_half pass; x is then unused).
+  void gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add, int mode = 0, bool reuse_x = false,
+            View xa = View{});
   bool mm_fused(const Lin& l, int T) const { return !mm_old_ && use_mm(l, T); }
   bool use_mm(const Lin& l, int T) const;
   void attention_mm(Layer& L, int T, int pos0);
   id<MTLComputeCommandEncoder> pm_sync(id<MTLComputeCommandEncoder> e, int k);
+  // next/T: when next takes the matmul path over these T tokens, the norm also writes out's half copy into xh_
+  // (no x_half pass for it); out must be [T][ldo_t] with next.K == ldo_t.
   void norm(View x, View w, View z, View out, int rows, int n, int rpt, int ldt, int ldh, int ldo_t, int ldo_h,
-            int mode, float scale = 1.0f);
+            int mode, float scale = 1.0f, const Lin* next = nullptr, int T = 0);
   void gdn(Layer& L, int T, const Dump& dump, const std::string& tag);
   void attention(Layer& L, int T, int pos0, const Dump& dump, const std::string& tag);
   Lin lin(const std::string& prefix);
@@ -113,6 +118,9 @@ class Model {
   const void* xh_buf_ = nullptr;  // what xh_ holds: x's buffer, offset, K, T, ldx
   size_t xh_off_ = 0;
   uint32_t xh_k_ = 0, xh_t_ = 0, xh_ld_ = 0;
+  bool xh_fresh_ = false;  // a norm just wrote xh_ for the next gemv (as reuse_x for that one call)
+  bool xh_fuse_ = true;    // RAGON_METAL_XH_OLD=1: the separate x_half passes (lane 3)
+  View xh2_;               // half silu(gate)*up, the MLP down projection's A (mode 3)
   bool kv8_ = false;  // int8 KV cache option (RAGON_METAL_KV=int8)
   uint32_t flash_dbg_ = 0;  // flash timing probes (RAGON_METAL_FLASH_DBG, wrong results): skip 1 rescale, 2 PV, 4 softmax, 16 QK; 8 QK via registers
   int attn_flash_ = 2;  // prefill attention (RAGON_METAL_ATTN_FLASH): 0 = S/P matmuls; 2 = flash2 (softmax in registers);

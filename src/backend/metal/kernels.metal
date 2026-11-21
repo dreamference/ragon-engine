@@ -304,17 +304,24 @@ struct NormArgs {
   float eps;
   uint mode;       // 0: x*rms*(1+w); 1: x*rms*w*silu(z); 2: x/|x| * scale (no weight); 3: x*rms*w
   float scale;
+  uint half_out;   // 1: also write half(out) to oh at the same offset (the next matmul's A, see x_half)
+  uint tvalid;     // with half_out: rows of tokens >= tvalid (the pad to 64) only zero oh
 };
 
 // One threadgroup (256 threads) a row; x and out may alias (in place).
 kernel void rmsnorm_rows(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                          device const float* z [[buffer(2)]], device float* out [[buffer(3)]],
-                         constant NormArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                         constant NormArgs& a [[buffer(4)]], device half* oh [[buffer(5)]],
+                         uint row [[threadgroup_position_in_grid]],
                          uint tid [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float part[8];
   const ulong xo = (ulong)(row / a.rpt) * a.ldt + (ulong)(row % a.rpt) * a.ldh;
   const ulong oo = (ulong)(row / a.rpt) * a.ldo_t + (ulong)(row % a.rpt) * a.ldo_h;
+  if (a.half_out && row / a.rpt >= a.tvalid) {
+    for (uint i = tid; i < a.n; i += 256) oh[oo + i] = half(0);
+    return;
+  }
   float ss = 0;
   for (uint i = tid; i < a.n; i += 256) {
     const float v = x[xo + i];
@@ -340,6 +347,7 @@ kernel void rmsnorm_rows(device const float* x [[buffer(0)]], device const float
       }
     }
     out[oo + i] = v;
+    if (a.half_out) oh[oo + i] = half(clamp(v, -65504.0f, 65504.0f));
   }
 }
 
@@ -779,7 +787,8 @@ struct EpArgs {
 };
 template <uint BM, uint BN, uint NSG>
 kernel void mm_ep(device half* A [[buffer(0)]], device half* W [[buffer(1)]], device float* y [[buffer(2)]],
-                  constant EpArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]]) {
+                  constant EpArgs& a [[buffer(3)]], device half* yh [[buffer(4)]],
+                  uint2 tg [[threadgroup_position_in_grid]]) {
   auto tA = tensor<device half, dextents<int32_t, 2>, tensor_inline>(A, dextents<int32_t, 2>(a.K, a.M));
   auto tW = tensor<device half, dextents<int32_t, 2>, tensor_inline>(W, dextents<int32_t, 2>(a.K, a.N));
   auto tY = tensor<device float, dextents<int32_t, 2>, tensor_inline>(y, dextents<int32_t, 2>(a.N, a.T),
@@ -809,14 +818,25 @@ kernel void mm_ep(device half* A [[buffer(0)]], device half* W [[buffer(1)]], de
           const float g = yT[i];
           cT[i] = g / (1.0f + exp(-g)) * (a.scale * cT[i]);
         }
+      if (a.mode == 3) {
+        // the half copy only, [M][N] with zero rows from T: the next matmul's A (the MLP down projection)
+#pragma unroll
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+          if (cT.is_valid_element(i)) {
+            const auto ix = cT.get_multidimensional_index(i);
+            const uint r = tg.y * BM + uint(ix[1]);
+            yh[(ulong)r * a.N + tg.x * BN + uint(ix[0])] = r < a.T ? half(clamp(cT[i], -65504.0f, 65504.0f)) : half(0);
+          }
+        return;
+      }
     }
   }
   cT.store(mY);
 }
 template [[host_name("mm_ep_64x128")]] kernel void mm_ep<64, 128, 4>(device half*, device half*, device float*,
-                                                                     constant EpArgs&, uint2);
+                                                                     constant EpArgs&, device half*, uint2);
 template [[host_name("mm_ep_64x64")]] kernel void mm_ep<64, 64, 4>(device half*, device half*, device float*,
-                                                                   constant EpArgs&, uint2);
+                                                                   constant EpArgs&, device half*, uint2);
 
 // NVFP4 [N][K] -> half [N][K] (without the global scale): one thread per 32 values.
 kernel void dq_nvfp4(device const uchar* w [[buffer(0)]], device const uchar* sc [[buffer(1)]],
