@@ -301,6 +301,20 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
     fail("RAGON_METAL_ATTN_FLASH must be 0, 2, 4, 8, 128 or 192");
   if (D_ != 256 || H_ != 6 * KV_) attn_flash_ = 0;
   if (const char* v = std::getenv("RAGON_METAL_FLASH_DBG")) flash_dbg_ = uint32_t(std::atoi(v));
+  if (std::getenv("RAGON_METAL_GDN_OLD")) gdn_min_ = 0;
+  if (const char* v = std::getenv("RAGON_METAL_GDN_MIN")) gdn_min_ = std::max(0, std::atoi(v));
+  if (gdn_min_ && Dk_ == 128 && Dv_ == 128 && Hv_ % Hk_ == 0) {
+    gq_ = q.alloc(C * Hk_ * Dk_ * 2);
+    gk_ = q.alloc(C * Hk_ * Dk_ * 2);
+    gv_ = q.alloc(C * Hv_ * Dv_ * 2);
+    gW_ = q.alloc(C * Hv_ * Dk_ * 2);
+    gU_ = q.alloc(C * Hv_ * Dv_ * 2);
+    gA2_ = q.alloc(C * Hv_ * (Dk_ + 64) * 2);
+    glg_ = q.alloc(C * Hv_ * 2 * 4);
+  } else {
+    gdn_min_ = 0;
+  }
+  std::fprintf(stderr, "metal model: GDN prefill %s\n", gdn_min_ ? ("chunked from " + std::to_string(gdn_min_) + " tokens").c_str() : "token loop");
   if (C_ >= mm_min_) {
     size_t maxk = 0, maxn = 0;
     for (const Layer& Ly : layers_)
@@ -479,6 +493,9 @@ void Model::norm(View x, View w, View z, View out, int rows, int n, int rpt, int
 struct GdnArgs {
   uint32_t T, Hk, Hv, Dk, Dv, ldc;
 };
+struct GdnChunkArgs {
+  uint32_t T, Hk, Hv, ldc;
+};
 
 void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
   const int cw = int(L.qkv.N), vw = Hv_ * Dv_;
@@ -491,11 +508,14 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     dump(tag + "qkv", qkv_, {T, cw});
   }
   id<MTLComputeCommandEncoder> e = q_->encoder();
-  [e setComputePipelineState:q_->pipe("gdn_conv")];
-  bind(e, {qkv_, L.conv_state, L.conv_w});
-  uint32_t ca[2] = {uint32_t(cw), uint32_t(T)};
-  [e setBytes:ca length:8 atIndex:3];
-  [e dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  const bool chunked = gdn_min_ && T >= gdn_min_;  // the chunked path runs its own conv (half output)
+  if (!chunked) {
+    [e setComputePipelineState:q_->pipe("gdn_conv")];
+    bind(e, {qkv_, L.conv_state, L.conv_w});
+    uint32_t ca[2] = {uint32_t(cw), uint32_t(T)};
+    [e setBytes:ca length:8 atIndex:3];
+    [e dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
   [e setComputePipelineState:q_->pipe("gdn_gates")];
   bind(e, {ab_, bb_, L.A_log, L.dt_bias});
   uint32_t ga[2] = {uint32_t(Hv_), uint32_t(T)};
@@ -503,7 +523,7 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
   [e dispatchThreads:MTLSizeMake(Hv_ * T, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
   if (dump) {
     q_->sync();
-    dump(tag + "conv", qkv_, {T, cw});
+    if (!chunked) dump(tag + "conv", qkv_, {T, cw});
     dump(tag + "g", ab_, {T, Hv_});
     dump(tag + "beta", bb_, {T, Hv_});
     e = q_->encoder();
@@ -512,12 +532,49 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     prof[1] += q_->sync();
     e = q_->encoder();
   }
-  const bool four = T >= 16;  // prefill: four state rows a simdgroup
-  [e setComputePipelineState:q_->pipe(four ? "gdn_recurrent4" : "gdn_recurrent")];
-  bind(e, {qkv_, ab_, bb_, L.S, core_});
-  GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw)};
-  bind_args(e, 5, g);
-  [e dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / (four ? 32 : 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  if (chunked) {
+    // chunked recurrence: the conv in token blocks to raw half q/k/v, every (sub-chunk, head) in parallel, then the
+    // sub-chunks in order per head
+    const uint32_t nc = uint32_t((T + 63) / 64);
+    GdnChunkArgs ga2{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(cw)};
+    [e setComputePipelineState:q_->pipe("gdn_conv_h")];
+    bind(e, {qkv_, L.conv_state, L.conv_w, gq_, gk_, gv_});
+    bind_args(e, 6, ga2);
+    [e dispatchThreads:MTLSizeMake(cw, nc, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (nc > 1) {
+      [e setComputePipelineState:q_->pipe("gdn_conv_state")];
+      bind(e, {qkv_, L.conv_state});
+      bind_args(e, 2, ga2);
+      [e dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    if (prof_ >= 3) {
+      gtp_[0] += q_->sync();
+      e = q_->encoder();
+    }
+    [e setComputePipelineState:q_->pipe("gdn_chunk_prep")];
+    bind(e, {gq_, gk_, gv_, ab_, bb_, gW_, gU_, gA2_, glg_});
+    bind_args(e, 9, ga2);
+    [e dispatchThreadgroups:MTLSizeMake(nc, Hv_, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (prof_ >= 3) {
+      gtp_[1] += q_->sync();
+      e = q_->encoder();
+    }
+    [e setComputePipelineState:q_->pipe("gdn_chunk_seq")];
+    bind(e, {gk_, gW_, gU_, gA2_, glg_, L.S, core_});
+    bind_args(e, 7, ga2);
+    [e dispatchThreadgroups:MTLSizeMake(Dv_ / 32, Hv_, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (prof_ >= 3) {
+      gtp_[2] += q_->sync();
+      if (++gtn_ % 48 == 0) std::fprintf(stderr, "gdn chunk s: conv %.3f prep %.3f seq %.3f\n", gtp_[0], gtp_[1], gtp_[2]);
+    }
+  } else {
+    const bool four = T >= 16;  // prefill: four state rows a simdgroup
+    [e setComputePipelineState:q_->pipe(four ? "gdn_recurrent4" : "gdn_recurrent")];
+    bind(e, {qkv_, ab_, bb_, L.S, core_});
+    GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw)};
+    bind_args(e, 5, g);
+    [e dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / (four ? 32 : 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
   if (prof_) {
     const double tr = q_->sync();
     prof[1] += tr;
