@@ -5,7 +5,8 @@ percent or the rep ranges overlap).
 
 Memory per fork, in MB of KV the fork made the server hold beyond what it held before the fork:
   ragon paged   (kv_pages_free before - its minimum during the fork) x --page-tokens x --kv-bytes-per-token / k
-  sglang        (num_used_tokens peak - before) x --kv-bytes-per-token / k  (its recurrent state slots apart)
+  sglang        ((num_used_tokens peak - before) x its KV bytes per token (kv_cache_memory_usage_gb / max_total_num_tokens)
+                 + (mamba_usage peak - before) x --sglang-mamba-slots x --sglang-mamba-slot-mb) / k
   ragon flat    (sessions_resident peak - before) x --flat-session-mb / k   (whole preallocated slots)
 """
 import argparse
@@ -29,8 +30,12 @@ def mem_per_fork(row, a):
     if "ragon:kv_pages_free" in g0 and g0.get("ragon:kv_pages_total"):
         used = g0["ragon:kv_pages_free"] - gp.get("ragon:kv_pages_free_min", g0["ragon:kv_pages_free"])
         return used * a.page_tokens * a.kv_bytes_per_token / 2**20 / k
-    if "sglang:num_used_tokens" in g0:
-        return (gp.get("sglang:num_used_tokens", 0) - g0["sglang:num_used_tokens"]) * a.kv_bytes_per_token / 2**20 / k
+    if "sglang:num_used_tokens" in g0:  # its own KV bytes per token (FP8 KV in the production launch)
+        per_tok = (g0["sglang:kv_cache_memory_usage_gb"] * 2**30 / g0["sglang:max_total_num_tokens"]
+                   if g0.get("sglang:max_total_num_tokens") and g0.get("sglang:kv_cache_memory_usage_gb") else a.kv_bytes_per_token)
+        kv = (gp.get("sglang:num_used_tokens", 0) - g0["sglang:num_used_tokens"]) * per_tok / 2**20
+        slots = (gp.get("sglang:mamba_usage", 0) - g0.get("sglang:mamba_usage", 0)) * a.sglang_mamba_slots
+        return (kv + slots * a.sglang_mamba_slot_mb) / k
     if "ragon:sessions_resident" in g0:
         return (gp.get("ragon:sessions_resident", 0) - g0["ragon:sessions_resident"]) * a.flat_session_mb / k
     return None
@@ -42,10 +47,14 @@ def figures(row, a):
     ttft = sorted(x["ttft"] for x in ok if x.get("ttft") is not None)
     prompt = sum(x.get("prompt_tokens") or 0 for x in ok)
     cached = sum(x.get("cached_tokens") or 0 for x in ok)
+    if ok and all(x.get("cached_tokens") is None for x in ok):  # no usage report: the server's counters instead
+        c = row["agg"]["counters"]
+        prompt, cached = c.get("sglang:prompt_tokens_total"), c.get("sglang:cached_tokens_total")
+    have = bool(ok) and prompt is not None and cached is not None
     return {
         "ttft_med": med(ttft), "ttft_max": ttft[-1] if ttft else None,
-        "reread": (prompt - cached) / len(ok) if ok and any(x.get("cached_tokens") is not None for x in ok) else None,
-        "cached_pct": 100.0 * cached / prompt if prompt else None,
+        "reread": (prompt - cached) / len(ok) if have else None,
+        "cached_pct": 100.0 * cached / prompt if have and prompt else None,
         "mem_mb": mem_per_fork(row, a),
         "dec_tps": med([x.get("decode_tps") for x in ok]),
         "tps_all": row["agg"].get("tps_all_running"), "wall": row["agg"]["wall_s"],
@@ -76,6 +85,8 @@ def main():
     p.add_argument("--same", type=float, default=5.0)
     p.add_argument("--kv-bytes-per-token", type=int, default=65536, help="Qwen3.8-27B BF16: 16 layers x 2 x 4 x 256 x 2")
     p.add_argument("--page-tokens", type=int, default=64)
+    p.add_argument("--sglang-mamba-slots", type=int, default=96, help="--max-mamba-cache-size of the launch")
+    p.add_argument("--sglang-mamba-slot-mb", type=float, default=76.0, help="BF16 DeltaNet state: 48 x 48 x 128 x 128 x 2 B")
     p.add_argument("--flat-session-mb", type=float, default=196608 * 65536 / 2**20 + 151)
     a = p.parse_args()
 
