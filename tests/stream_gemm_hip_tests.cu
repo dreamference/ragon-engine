@@ -10,9 +10,11 @@
 #include "gpu_test.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <cstring>
 #include <random>
 #include <string>
@@ -497,6 +499,11 @@ void bench(const std::string& only) {
   for (const Group& g : groups) {
     if (!only.empty() && ("," + only + ",").find("," + std::string(g.name) + ",") == std::string::npos) continue;
     const int Kd = g.K, nt = static_cast<int>(g.Ns.size());
+    size_t free_b = 0, total_b = 0;
+    (void)hipMemGetInfo(&free_b, &total_b);
+    const char* se = ragon::test::sync_error();
+    std::fprintf(stderr, "bench group %s: device memory free %.2f of %.2f GB, %s\n", g.name, free_b / 1e9,
+                 total_b / 1e9, se ? se : "ok");
     long long bytes = 0;
     std::vector<size_t> tb;
     for (int N : g.Ns) tb.push_back(g.fp4 ? K::tiled_bytes_nvfp4(N, Kd) : K::tiled_bytes_fp8(N, Kd)), bytes += tb.back();
@@ -513,7 +520,21 @@ void bench(const std::string& only) {
         } else {
           fill(p, tb[i], 17u * c + i, 2);
         }
-        if (g.split) K::stream_gemm_split_k(p, N, Kd);
+        if (c == 0 && i == 0) {  // a sticky error from before this group shows here (lane 8: d_kproj after FP8 groups)
+          const char* e = ragon::test::sync_error();
+          std::fprintf(stderr, "bench group %s: first copy filled: %s\n", g.name, e ? e : "ok");
+        }
+        if (g.split) {
+          const char* pe = ragon::test::sync_error();
+          if (pe) std::fprintf(stderr, "bench group %s: copy %d of %d filled: %s\n", g.name, c, L, pe);
+          try {
+            K::stream_gemm_split_k(p, N, Kd);
+          } catch (const std::exception&) {
+            std::fprintf(stderr, "bench group %s: split-K mark failed at copy %d of %d (%zu bytes each)\n", g.name, c,
+                         L, tb[i]);
+            throw;
+          }
+        }
         bufs.push_back(p);
       }
     float* dx = ragon::test::alloc<float>(size_t(16) * Kd);
@@ -567,6 +588,8 @@ void bench(const std::string& only) {
     for (uint8_t* p : bufs) ragon::test::free_bytes(p);
     for (float* y : ys) ragon::test::free_bytes(y);
     ragon::test::free_bytes(dx), ragon::test::free_bytes(xh), ragon::test::free_bytes(xinv);
+    const char* fe = ragon::test::sync_error();
+    std::fprintf(stderr, "bench group %s: freed: %s\n", g.name, fe ? fe : "ok");
   }
   (void)hipEventDestroy(e0), (void)hipEventDestroy(e1);
 }
@@ -622,9 +645,65 @@ bool test_gather() {
   return ok;
 }
 
+// `--launch-floor` (lane 8): the per-launch cost of a small kernel on this box, apart from its work. host = the host's
+// time to issue one launch; queued = the GPU's time per launch when all are queued behind a spinning kernel (the
+// dispatch floor); live = the GPU's time per launch issued back to back from the host (the larger of the two).
+__global__ void floor_spin(unsigned long long ticks, int* out) {
+  const unsigned long long t0 = wall_clock64();
+  while (wall_clock64() - t0 < ticks) {
+  }
+  if (threadIdx.x == 0 && blockIdx.x == 0) out[0] = 1;
+}
+__global__ void floor_tiny(int* out) {
+  if (threadIdx.x == 0) out[blockIdx.x] += 1;
+}
+void launch_floor() {
+  int* d = ragon::test::alloc<int>(4096);
+  (void)hipMemset(d, 0, 4096 * sizeof(int));
+  int khz = 0;
+  (void)hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, 0);
+  hipEvent_t e0, e1;
+  (void)hipEventCreate(&e0), (void)hipEventCreate(&e1);
+  const int n = 2000;
+  std::printf("LF,grid,host_us,queued_us,live_us (wall clock %d kHz)\n", khz);
+  for (int g : {1, 12, 40, 272, 642}) {
+    for (int rep = 0; rep < 3; ++rep) {
+      floor_spin<<<1, 64>>>(static_cast<unsigned long long>(khz) * 300, d + 4000);  // 300 ms
+      (void)hipEventRecord(e0, nullptr);
+      const auto h0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < n; ++i) floor_tiny<<<g, 256>>>(d);
+      const double host = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h0).count();
+      (void)hipEventRecord(e1, nullptr);
+      (void)hipEventSynchronize(e1);
+      float qms = 0.f;
+      (void)hipEventElapsedTime(&qms, e0, e1);
+      (void)hipEventRecord(e0, nullptr);
+      for (int i = 0; i < n; ++i) floor_tiny<<<g, 256>>>(d);
+      (void)hipEventRecord(e1, nullptr);
+      (void)hipEventSynchronize(e1);
+      float lms = 0.f;
+      (void)hipEventElapsedTime(&lms, e0, e1);
+      std::printf("LF,%d,%.2f,%.2f,%.2f%s\n", g, host / n, 1000.0 * qms / n, 1000.0 * lms / n,
+                  host > 250000 ? " (host outran the spinner)" : "");
+    }
+  }
+  const char* err = ragon::test::sync_error();
+  std::printf("LF done: %s\n", err ? err : "ok");
+  std::fflush(stdout);
+}
+
 int main(int argc, char** argv) {
+  if (argc > 1 && std::string(argv[1]) == "--launch-floor") {
+    launch_floor();
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "--bench") {
-    bench(argc > 2 ? argv[2] : "");
+    try {  // an uncaught throw ends a Windows process with 0xC0000409 and no message
+      bench(argc > 2 ? argv[2] : "");
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "bench: exception: %s\n", e.what());
+      return 2;
+    }
     return 0;
   }
   std::vector<int> all;

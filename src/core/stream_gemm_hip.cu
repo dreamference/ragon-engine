@@ -677,12 +677,15 @@ void stream_gemm_split_k(const uint8_t* w, int N, int K) {
   free_scratch(e);
   const size_t tiles = N / 16;
   Scratch n{N, K, S};
-  if (gpu::device_alloc(&n.part, kStreamSlots * tiles * S * 256 * sizeof(float)) != gpu::kSuccess ||
-      gpu::device_alloc(&n.cnt, kStreamSlots * tiles * sizeof(u32)) != gpu::kSuccess ||
-      gpu::memset_sync(n.cnt, 0, kStreamSlots * tiles * sizeof(u32)) != gpu::kSuccess) {
+  const char* step = "partials";
+  gpu::Error err = gpu::device_alloc(&n.part, kStreamSlots * tiles * S * 256 * sizeof(float));
+  if (err == gpu::kSuccess) step = "counters", err = gpu::device_alloc(&n.cnt, kStreamSlots * tiles * sizeof(u32));
+  if (err == gpu::kSuccess) step = "counter reset", err = gpu::memset_sync(n.cnt, 0, kStreamSlots * tiles * sizeof(u32));
+  if (err != gpu::kSuccess) {
     free_scratch(n);
     scratch_map().erase(w);
-    throw std::runtime_error("stream_gemm: split-K scratch allocation failed");
+    throw std::runtime_error(std::string("stream_gemm: split-K scratch allocation failed (") + step + ": " +
+                             gpu::error_string(err) + ")");
   }
   e = n;
 }

@@ -100,14 +100,31 @@ void launch_kernel(const char* what, void (*kernel)(Params...), dim3 grid, dim3 
 bool launch_log_enabled();
 void* launch_log_begin(gpu::Stream s);           // nullptr when the launch is not timed
 void launch_log_end(void* h, const char* what, gpu::Stream s);
+bool launch_log_wants(const char* what);  // RAGON_LAUNCH_LOG_ONLY (launch_log_hip.cu)
+// RAGON_LAUNCH_DUP=a,b (a measurement, never for serving; launch_log_hip.cu): launches named exactly a or b run twice
+// back to back, so a step's time grows by their true in-situ cost with no event in the stream. Only for kernels whose
+// second run writes what the first wrote (stream_gemm, stream_gemm_gather, to_half_rows); a run's ids show it.
+bool launch_dup_wants(const char* what);
+// RAGON_LAUNCH_SKIP=a,b (a measurement that breaks the results; never for serving): launches named exactly a or b do
+// not run, so a step's time shrinks by their in-situ cost (for in-place kernels, which RAGON_LAUNCH_DUP cannot time).
+bool launch_skip_wants(const char* what);
+// RAGON_LAUNCH_LOG=2: not waited for, keyed by grid size too (launch_log_hip.cu); otherwise launch_log_end.
+void launch_log_end_grid(void* h, const char* what, gpu::Stream s, unsigned gx, unsigned gy);
+// RAGON_HIP_KICK_EVERY=N (an A/B switch, 0 = off; launch_log_hip.cu): every N-th launch outside a capture queries
+// its stream, so the runtime sends the batch it holds to the GPU at once (TheRock #8786: work reaches the GPU only
+// at a sync or a query).
+void launch_kick(gpu::Stream s);
 template <typename... Params, typename... Args>
 void launch_kernel_pdl(bool /*pdl*/, const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
                        gpu::Stream s, Args&&... args) {
-  void* h = launch_log_enabled() ? launch_log_begin(s) : nullptr;
+  if (launch_skip_wants(what)) return;
+  void* h = launch_log_enabled() && launch_log_wants(what) ? launch_log_begin(s) : nullptr;
   kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-  if (h) launch_log_end(h, what, s);
+  if (h) launch_log_end_grid(h, what, s, grid.x, grid.y);
+  if (launch_dup_wants(what)) kernel<<<grid, block, smem, s>>>(args...);
+  launch_kick(s);
 }
 
 template <typename... Params, typename... Args>
