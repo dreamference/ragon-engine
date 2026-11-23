@@ -77,6 +77,66 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
+// RAGON_STEP_SPLIT (a measurement, off by default): the one-stream step's draft and commit phases by host clock (each
+// mark adds the time since the previous mark to its slot; the first mark counts from the phase's own timer), printed at
+// exit as ms per step (the slot's total over the steps), so a phase's slots sum to its line. =1 host marks only;
+// =2 also the GPU span of the draft's and the commit's queued work from one event pair each (an event record forces
+// a submission on some runtimes, which moves time between the marks: read the spans from =2, the marks from =1).
+struct StepSplit {
+  static constexpr int kSlots = 20;
+  const char* name[kSlots] = {};
+  double ms[kSlots] = {};
+  long n[kSlots] = {};
+  std::chrono::steady_clock::time_point last;
+  gpu::Event ev[4] = {};
+  bool on = false, events = false;
+  long steps = 0;
+  StepSplit() {
+    const char* e = std::getenv("RAGON_STEP_SPLIT");
+    on = e && std::atoi(e) != 0;
+    events = on && std::atoi(e) >= 2;
+    for (gpu::Event& x : ev)
+      if (events && gpu::event_create(&x) != gpu::kSuccess) events = false;
+  }
+  ~StepSplit() {
+    if (!on) return;
+    for (int i = 0; i < kSlots; ++i)
+      if (name[i])
+        std::fprintf(stderr, "step split: %-28s %8.3f ms/step  n %ld of %ld steps\n", name[i],
+                     steps ? ms[i] / steps : 0., n[i], steps);
+  }
+  void add(int slot, const char* nm, double v) {
+    name[slot] = nm;
+    ms[slot] += v;
+    ++n[slot];
+  }
+  void start(std::chrono::steady_clock::time_point t, bool step) {  // a phase's own timer start
+    last = t;
+    if (step) ++steps;
+  }
+  void mark(int slot, const char* nm) {
+    if (!on) return;
+    const auto t = std::chrono::steady_clock::now();
+    add(slot, nm, std::chrono::duration<double, std::milli>(t - last).count());
+    last = t;
+  }
+  void total(int slot, const char* nm, std::chrono::steady_clock::time_point a,
+             std::chrono::steady_clock::time_point b) {  // a phase's own timer, beside its marks
+    if (on) add(slot, nm, std::chrono::duration<double, std::milli>(b - a).count());
+  }
+  void record(int i, gpu::Stream s) {
+    if (events) (void)gpu::event_record(ev[i], s);
+  }
+  void span(int slot, const char* nm, int a, int b) {  // after a sync that covers ev[b]
+    float f = 0;
+    if (events && gpu::event_elapsed(&f, ev[a], ev[b]) == gpu::kSuccess) add(slot, nm, f);
+  }
+};
+StepSplit& step_split() {
+  static StepSplit s;
+  return s;
+}
+
 // The target's sampling distribution for one row from its top-K logits (sorted, descending): the chain
 // of Engine::sample (temperature, top-k, top-p, min-p), as (token, probability) pairs.
 Dist target_dist(const float* vals, const int* ids, int K, const SamplingParams& p) {
@@ -959,12 +1019,20 @@ void Engine::draft_batch_launch(std::span<StepPlan> plans, int B, unsigned spars
 void Engine::draft_propose(int anchor, int B, bool graph) {
   pin_->draft_ids[0] = anchor;
   for (int i = 1; i < B; ++i) pin_->draft_ids[i] = draft_->config().mask_token;
+  StepSplit& ss = step_split();
+  ss.mark(2, "draft: plan_fixed, pos");
+  ss.record(0, stream_);
   const bool sparse = sparse_head_sync(*s_);  // BACKLOG 19: the head for this draft
+  ss.mark(3, "draft: sparse_head_sync");
   if (graph) run_graph(sparse ? s_->draft_graph_sparse : s_->draft_graph, "draft", [&] { draft_launch(B, sparse); });
   else draft_launch(B, sparse);
+  ss.record(1, stream_);
+  ss.mark(4, "draft: launch issue");
   s_->sh_last_sparse = sparse;
   if (sparse) ++s_->spec.sparse_steps;
   check(gpu::stream_sync(stream_), "draft");
+  ss.mark(5, "draft: sync wait");
+  ss.span(6, "draft: GPU span (events)", 0, 1);
   // BACKLOG 19's offline input (bench/sparse_head): RAGON_DUMP_DRAFT_H=FILE appends each one-stream draft's rows' final
   // hidden states (E x hidden floats, the LM head's input) and their top-16 candidates (E x 16 ints).
   static FILE* dump = [] { const char* f = std::getenv("RAGON_DUMP_DRAFT_H"); return f ? std::fopen(f, "ab") : nullptr; }();
@@ -1346,11 +1414,14 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   // same kernels run, so the result is the same.
   const bool graph = graphs_ && B == opts_.draft_block;
   auto t0 = std::chrono::steady_clock::now();
+  StepSplit& ss = step_split();
+  ss.start(t0, true);
   StepPlan sp;
   sp.s = s_;
   sp.p = &p;
   sp.anchor = anchor;
   plan_begin(sp, B);
+  ss.mark(1, "draft: plan_begin (lookup)");
   if (graph && sp.use_lookup && sp.E < B - 1) {
     // Pad the chain to the block's rows with its last token: a pad row is verified like any proposal (accepted only
     // if it is what the model would write), so the output is unchanged and the graphs' shape holds.
@@ -1370,11 +1441,16 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
     }
   }
   if (!sp.use_lookup) plan_draft(sp, B, graph);
+  ss.mark(7, "draft: after sync (dumps)");
   plan_tree(sp, B, tree_nodes_for(1, B), pin_->scores, row_logits != nullptr, pin_->tree[0]);
+  ss.mark(8, "draft: plan_tree");
   const int V = sp.V, K = sp.K;  // rows verified, top K per row
   kv_ensure(*s_, s_->pos, s_->pos + V, stream_);  // P4b: mapped above (kv_step_rows bounds V); a no-op check
+  ss.mark(9, "draft: kv_ensure");
   auto t1 = std::chrono::steady_clock::now();
   s_->spec.draft_seconds += std::chrono::duration<double>(t1 - t0).count();
+  ss.total(0, "draft: total (t0..t1)", t0, t1);
+  ss.mark(15, "draft: mark to t1 (residual)");
 
   // 2. Verify, with each row's top K (the argmax when greedy) on the GPU.
   std::copy(sp.rows.begin(), sp.rows.end(), pin_->rows);
@@ -1421,17 +1497,26 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
           "row logits");
     check(gpu::stream_sync(stream_), "row logits");
   }
+  ss.start(t2, false);
+  ss.mark(14, "commit: row logits");
+  ss.record(2, stream_);
   if (commit_overlap_) commit_state_async(0, n, graph);
+  ss.mark(10, "commit: state issue");
   if (graph) {
     if (s_->commit_graphs.size() < size_t(V) + 1) s_->commit_graphs.resize(size_t(V) + 1, nullptr);
     run_graph(s_->commit_graphs[n], "commit", [&] { commit_launch(0, n); });
   } else {
     commit_launch(0, n);
   }
+  ss.record(3, stream_);
+  ss.mark(11, "commit: launch issue");
   s_->history.insert(s_->history.end(), sp.rows.begin(), sp.rows.begin() + n);
   s_->pos += n;
   check(gpu::stream_sync(stream_), "commit");
+  ss.mark(12, "commit: sync wait");
+  ss.span(16, "commit: GPU span (events)", 2, 3);
   s_->spec.commit_seconds += seconds_since(t2);
+  ss.total(13, "commit: total (t2..)", t2, std::chrono::steady_clock::now());
   plan_count(sp);
 
   std::vector<int> out(sp.rows.begin() + 1, sp.rows.begin() + n);
