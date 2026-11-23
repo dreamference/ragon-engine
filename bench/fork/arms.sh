@@ -18,7 +18,7 @@
 # env: SGLANG_IMAGE RAGON_IMAGE (pinned digests), HF_CACHE DF_CACHE (host dirs mounted at /root/.cache/huggingface
 #      and /root/.cache/dreamference), MODEL DRAFT SPARSE CHAT_TEMPLATE (paths inside the container),
 #      SGLANG_MOUNTS (extra -v args of the production launch), PORT (18100), RAGON_BIN (host path of a ragon-serve
-#      binary run in the image instead of its own; the ckl arm needs it)
+#      binary run in the image instead of its own; the ckl arm needs it), EXACT_ONLY=1 (no bench, the exact probe only)
 set -u
 ARM=$1; OUT=$2; shift 2
 PORT=${PORT:-18100}; FLAT_SESSIONS=${FLAT_SESSIONS:-4}; FANOUT_SESSIONS=${FANOUT_SESSIONS:-10}; FANOUT_BATCH=${FANOUT_BATCH:-8}
@@ -76,6 +76,7 @@ until curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null; do
   sleep 5
 done
 echo "$(date -u +%T) $ARM up after $(( $(date +%s) - T0 )) s; $(docker logs "$NAME" 2>&1 | grep -m4 -oE 'drafter head: [a-z]+|prefix checkpoints: .*|branch checkpoints: .*|kv pages[^,;]*' | tr '\n' ' ')"
+[ "${EXACT_ONLY:-0}" = 1 ] && BENCH=0  # re-run of an arm whose window ended before its exact probe
 if [ $BENCH = 1 ]; then
   python3 "$HERE/run.py" "${RUNARGS[@]}" "$@" > "$OUT/$ARM.run.log" 2>&1
   echo "$(date -u +%T) $ARM bench exit $?; $(grep -c . "$OUT/fork.jsonl" 2>/dev/null) rows"
