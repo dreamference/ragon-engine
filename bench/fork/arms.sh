@@ -10,6 +10,9 @@
 #      ckl         fix arm: paged, sessions/batch $FIX_SESSIONS, --checkpoint-limit $CKPT_LIMIT (prefix checkpoints and the
 #                  branch point kept past 32768); needs $RAGON_BIN, a ragon-serve with that flag, mounted over the image's
 #                  (exact probe at 8000 and 100000)
+#      ckb         ckl plus --branch-checkpoint-min $BRANCH_MIN (a fork's resumed snap joins the store for its
+#                  siblings when it is that far past the furthest checkpoint, not 2048), 8k and 32k only; $RAGON_BIN
+#                  must have that flag (eng/checkpoint-limit b706d0c)
 #      ck24        fix arm: paged, sessions/batch $FIX_SESSIONS, --prefix-checkpoints 24 (the image's binary), 8k and 32k only
 #      paged-x100  no bench: the paged arm's exact probe at 100000, the baseline for ckl's
 # env: SGLANG_IMAGE RAGON_IMAGE (pinned digests), HF_CACHE DF_CACHE (host dirs mounted at /root/.cache/huggingface
@@ -19,7 +22,7 @@
 set -u
 ARM=$1; OUT=$2; shift 2
 PORT=${PORT:-18100}; FLAT_SESSIONS=${FLAT_SESSIONS:-4}; FANOUT_SESSIONS=${FANOUT_SESSIONS:-10}; FANOUT_BATCH=${FANOUT_BATCH:-8}
-FIX_SESSIONS=${FIX_SESSIONS:-8}; CKPT_LIMIT=${CKPT_LIMIT:-196608}; EXACT_SIZES=8000; BENCH=1
+FIX_SESSIONS=${FIX_SESSIONS:-8}; CKPT_LIMIT=${CKPT_LIMIT:-196608}; BRANCH_MIN=${BRANCH_MIN:-64}; EXACT_SIZES=8000; BENCH=1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 NAME=forkbench-${ARM%-n}
@@ -28,12 +31,14 @@ case $ARM in *-n) RUNARGS+=(--arm n --idle 0) ;; esac
 case $ARM in
   ckl) EXACT_SIZES=8000,100000
        [ -x "${RAGON_BIN:-}" ] || { echo "$(date -u +%T) $ARM: RAGON_BIN is not an executable"; exit 2; } ;;
+  ckb) RUNARGS+=(--sizes 8000,32000)
+       [ -x "${RAGON_BIN:-}" ] || { echo "$(date -u +%T) $ARM: RAGON_BIN is not an executable"; exit 2; } ;;
   ck24) RUNARGS+=(--sizes 8000,32000) ;;
   paged-x100) EXACT_SIZES=100000; BENCH=0 ;;
 esac
 DOCKER=(docker run -d --name "$NAME" --gpus all --network host --shm-size 64m
         -v "$HF_CACHE:/root/.cache/huggingface" -v "$DF_CACHE:/root/.cache/dreamference" -e HF_HUB_OFFLINE=1)
-[ -n "${RAGON_BIN:-}" ] && [ "$ARM" = ckl ] && DOCKER+=(-v "$RAGON_BIN:/usr/local/bin/ragon-serve:ro")
+[ -n "${RAGON_BIN:-}" ] && { [ "$ARM" = ckl ] || [ "$ARM" = ckb ]; } && DOCKER+=(-v "$RAGON_BIN:/usr/local/bin/ragon-serve:ro")
 RAGON=(ragon-serve --model "$MODEL" --served-model-name RadixArk/Qwen3.8-27B-NVFP4 --host 127.0.0.1 --port "$PORT"
        --max-context 196608 --draft "$DRAFT" --draft-block 12 --fair-pairing 0 --vision on --sparse-head-dir "$SPARSE"
        --graphs --pdl)
@@ -55,6 +60,8 @@ case ${ARM%-n} in
   fanout) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FANOUT_SESSIONS" --batch "$FANOUT_BATCH" --kv-pages > /dev/null ;;
   ckl)    "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
             --checkpoint-limit "$CKPT_LIMIT" > /dev/null ;;
+  ckb)    "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
+            --checkpoint-limit "$CKPT_LIMIT" --branch-checkpoint-min "$BRANCH_MIN" > /dev/null ;;
   ck24)   "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
             --prefix-checkpoints 24 > /dev/null ;;
   paged-x100) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FLAT_SESSIONS" --batch "$FLAT_SESSIONS" --kv-pages > /dev/null ;;
@@ -68,7 +75,7 @@ until curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null; do
   [ $(( $(date +%s) - T0 )) -gt 1500 ] && { echo "$(date -u +%T) $ARM: not up after 1500 s"; exit 1; }
   sleep 5
 done
-echo "$(date -u +%T) $ARM up after $(( $(date +%s) - T0 )) s; $(docker logs "$NAME" 2>&1 | grep -m2 -oE 'drafter head: [a-z]+|prefix checkpoints: .*|kv pages[^,;]*' | tr '\n' ' ')"
+echo "$(date -u +%T) $ARM up after $(( $(date +%s) - T0 )) s; $(docker logs "$NAME" 2>&1 | grep -m4 -oE 'drafter head: [a-z]+|prefix checkpoints: .*|branch checkpoints: .*|kv pages[^,;]*' | tr '\n' ' ')"
 if [ $BENCH = 1 ]; then
   python3 "$HERE/run.py" "${RUNARGS[@]}" "$@" > "$OUT/$ARM.run.log" 2>&1
   echo "$(date -u +%T) $ARM bench exit $?; $(grep -c . "$OUT/fork.jsonl" 2>/dev/null) rows"
