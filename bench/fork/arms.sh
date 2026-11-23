@@ -7,19 +7,33 @@
 #      paged       the same with paged KV
 #      fanout      paged KV with room for every fork: --sessions $FANOUT_SESSIONS --batch $FANOUT_BATCH
 #      sglang-n, fanout-n   the same servers driven with one request of n=k (run.py --arm n), no retention step
+#      ckl         fix arm: paged, sessions/batch $FIX_SESSIONS, --checkpoint-limit $CKPT_LIMIT (prefix checkpoints and the
+#                  branch point kept past 32768); needs $RAGON_BIN, a ragon-serve with that flag, mounted over the image's
+#                  (exact probe at 8000 and 100000)
+#      ck24        fix arm: paged, sessions/batch $FIX_SESSIONS, --prefix-checkpoints 24 (the image's binary), 8k and 32k only
+#      paged-x100  no bench: the paged arm's exact probe at 100000, the baseline for ckl's
 # env: SGLANG_IMAGE RAGON_IMAGE (pinned digests), HF_CACHE DF_CACHE (host dirs mounted at /root/.cache/huggingface
 #      and /root/.cache/dreamference), MODEL DRAFT SPARSE CHAT_TEMPLATE (paths inside the container),
-#      SGLANG_MOUNTS (extra -v args of the production launch), PORT (18100)
+#      SGLANG_MOUNTS (extra -v args of the production launch), PORT (18100), RAGON_BIN (host path of a ragon-serve
+#      binary run in the image instead of its own; the ckl arm needs it)
 set -u
 ARM=$1; OUT=$2; shift 2
 PORT=${PORT:-18100}; FLAT_SESSIONS=${FLAT_SESSIONS:-4}; FANOUT_SESSIONS=${FANOUT_SESSIONS:-10}; FANOUT_BATCH=${FANOUT_BATCH:-8}
+FIX_SESSIONS=${FIX_SESSIONS:-8}; CKPT_LIMIT=${CKPT_LIMIT:-196608}; EXACT_SIZES=8000; BENCH=1
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 NAME=forkbench-${ARM%-n}
 RUNARGS=(--label "${ARM%-n}" --url "http://127.0.0.1:$PORT" --out "$OUT/fork.jsonl")
 case $ARM in *-n) RUNARGS+=(--arm n --idle 0) ;; esac
+case $ARM in
+  ckl) EXACT_SIZES=8000,100000
+       [ -x "${RAGON_BIN:-}" ] || { echo "$(date -u +%T) $ARM: RAGON_BIN is not an executable"; exit 2; } ;;
+  ck24) RUNARGS+=(--sizes 8000,32000) ;;
+  paged-x100) EXACT_SIZES=100000; BENCH=0 ;;
+esac
 DOCKER=(docker run -d --name "$NAME" --gpus all --network host --shm-size 64m
         -v "$HF_CACHE:/root/.cache/huggingface" -v "$DF_CACHE:/root/.cache/dreamference" -e HF_HUB_OFFLINE=1)
+[ -n "${RAGON_BIN:-}" ] && [ "$ARM" = ckl ] && DOCKER+=(-v "$RAGON_BIN:/usr/local/bin/ragon-serve:ro")
 RAGON=(ragon-serve --model "$MODEL" --served-model-name RadixArk/Qwen3.8-27B-NVFP4 --host 127.0.0.1 --port "$PORT"
        --max-context 196608 --draft "$DRAFT" --draft-block 12 --fair-pairing 0 --vision on --sparse-head-dir "$SPARSE"
        --graphs --pdl)
@@ -39,6 +53,11 @@ case ${ARM%-n} in
   flat)   "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FLAT_SESSIONS" --batch "$FLAT_SESSIONS" --no-kv-pages > /dev/null ;;
   paged)  "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FLAT_SESSIONS" --batch "$FLAT_SESSIONS" --kv-pages > /dev/null ;;
   fanout) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FANOUT_SESSIONS" --batch "$FANOUT_BATCH" --kv-pages > /dev/null ;;
+  ckl)    "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
+            --checkpoint-limit "$CKPT_LIMIT" > /dev/null ;;
+  ck24)   "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
+            --prefix-checkpoints 24 > /dev/null ;;
+  paged-x100) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FLAT_SESSIONS" --batch "$FLAT_SESSIONS" --kv-pages > /dev/null ;;
   *) echo "unknown arm $ARM"; exit 2 ;;
 esac || { echo "$(date -u +%T) $ARM: docker run failed"; exit 1; }
 down() { docker stop -t 30 "$NAME" > /dev/null 2>&1; docker logs "$NAME" > "$OUT/$ARM.server.log" 2>&1; docker rm "$NAME" > /dev/null 2>&1; }
@@ -49,10 +68,12 @@ until curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null; do
   [ $(( $(date +%s) - T0 )) -gt 1500 ] && { echo "$(date -u +%T) $ARM: not up after 1500 s"; exit 1; }
   sleep 5
 done
-echo "$(date -u +%T) $ARM up after $(( $(date +%s) - T0 )) s; $(docker logs "$NAME" 2>&1 | grep -m1 -oE 'drafter head: [a-z]+|kv pages[^,;]*' | tr '\n' ' ')"
-python3 "$HERE/run.py" "${RUNARGS[@]}" "$@" > "$OUT/$ARM.run.log" 2>&1
-echo "$(date -u +%T) $ARM bench exit $?; $(grep -c . "$OUT/fork.jsonl" 2>/dev/null) rows"
+echo "$(date -u +%T) $ARM up after $(( $(date +%s) - T0 )) s; $(docker logs "$NAME" 2>&1 | grep -m2 -oE 'drafter head: [a-z]+|prefix checkpoints: .*|kv pages[^,;]*' | tr '\n' ' ')"
+if [ $BENCH = 1 ]; then
+  python3 "$HERE/run.py" "${RUNARGS[@]}" "$@" > "$OUT/$ARM.run.log" 2>&1
+  echo "$(date -u +%T) $ARM bench exit $?; $(grep -c . "$OUT/fork.jsonl" 2>/dev/null) rows"
+fi
 case $ARM in *-n) ;; *)  # exactness probe: the same 8k history and 4 instructions on every arm; compare text_sha
   python3 "$HERE/run.py" --label "$ARM-exact" --url "http://127.0.0.1:$PORT" --out "$OUT/exact.jsonl" --fixed-nonce \
-    --sizes 8000 --forks 4 --reps 1 --idle 0 --no-warmup > "$OUT/$ARM.exact.log" 2>&1
+    --sizes "$EXACT_SIZES" --forks 4 --reps 1 --idle 0 --no-warmup > "$OUT/$ARM.exact.log" 2>&1
   echo "$(date -u +%T) $ARM exact probe exit $?" ;; esac
