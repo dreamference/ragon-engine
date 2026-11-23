@@ -594,6 +594,7 @@ bool Engine::can_speculate(const SamplingParams& p) const {
 }
 
 void Engine::set_step_graphs(bool on) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!on) clear_graphs();
   graphs_ = on && graphs_allowed_;
 }
@@ -905,7 +906,7 @@ void Engine::draft_launch(int B, bool sparse) {
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
   const int K16 = d.selector_top_k;
-  check(gpu::memcpy_async(ids_dev_, pin_->draft_ids, B * sizeof(int), gpu::kH2D, stream_), "draft ids");
+    check(gpu::memcpy_async(ids_dev_, pin_->draft_ids, B * sizeof(int), gpu::kH2D, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, B, H, dres_, stream_);
   Session* const self[1] = {s_};
   const int nrows[1] = {B};
@@ -1064,6 +1065,7 @@ void Engine::draft_propose(int anchor, int B, bool graph) {
   s_->sh_last_sparse = sparse;
   if (sparse) ++s_->spec.sparse_steps;
   check(gpu::stream_sync(stream_), "draft");
+  tail_pending_ = false;  // the last step's unsynced commit ran before this draft on stream_
   ss.mark(5, "draft: sync wait");
   ss.span(6, "draft: GPU span (events)", 0, 1);
   // BACKLOG 19's offline input (bench/sparse_head): RAGON_DUMP_DRAFT_H=FILE appends each one-stream draft's rows' final
@@ -1454,6 +1456,7 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   sp.p = &p;
   sp.anchor = anchor;
   plan_begin(sp, B);
+  if (sp.use_lookup) settle_tail();  // no draft sync on a lookup chain's path
   ss.mark(1, "draft: plan_begin (lookup)");
   if (graph && sp.use_lookup && sp.E < B - 1) {
     // Pad the chain to the block's rows with its last token: a pad row is verified like any proposal (accepted only
@@ -1541,11 +1544,16 @@ std::vector<int> Engine::speculate(int anchor, const SamplingParams& p, std::vec
   } else {
     commit_launch(0, n);
   }
+  if (commit_kick_) {  // RAGON_COMMIT_KICK (HIP A/B)
+    gpu::kick(commit_stream_);
+    gpu::kick(stream_);
+  }
   ss.record(3, stream_);
   ss.mark(11, "commit: launch issue");
   s_->history.insert(s_->history.end(), sp.rows.begin(), sp.rows.begin() + n);
   s_->pos += n;
-  check(gpu::stream_sync(stream_), "commit");
+  if (commit_nosync_) tail_pending_ = true;  // the next draft's sync (or settle_tail) waits for it
+  else check(gpu::stream_sync(stream_), "commit");
   ss.mark(12, "commit: sync wait");
   ss.span(16, "commit: GPU span (events)", 2, 3);
   s_->spec.commit_seconds += seconds_since(t2);
@@ -1618,6 +1626,7 @@ bool Engine::cascade_batch(std::span<const StepPlan> plans) const {
 }
 
 void Engine::speculate_batch(std::span<SeqStep> seqs) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (seqs.empty()) return;
   // A sequence marked drafter_off rides along (BATCHING §5.8 stage 10): its guard has the step plain, so it adds one
   // row (its anchor) to the verify and commits it as a step that accepted nothing, which is the plain step's state,

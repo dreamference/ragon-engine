@@ -166,6 +166,7 @@ bool Engine::can_step_batch(int session) const {
 }
 
 void Engine::step_batch(std::span<SeqStep> seqs) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (seqs.empty()) return;
   const int n = static_cast<int>(seqs.size());
   if (n > kernels::kMaxSeqs) throw std::runtime_error("step_batch: more sequences than kMaxSeqs");
@@ -328,6 +329,7 @@ int Engine::kv_fork_need(int from, int to, const KvGone* gone) const {
 }
 
 void Engine::fork_session(int from) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   Session& parent = sessions_.at(from);
   if (&parent == s_) throw std::runtime_error("fork_session: a session is not forked onto itself");
   if (parent.drafter != s_->drafter)  // the ring it adopts is its drafter's (MULTI_DRAFTER §2.3)

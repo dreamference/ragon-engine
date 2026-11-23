@@ -10,15 +10,19 @@
 namespace ragon::kernels {
 void launch_log_range_push(const char* name);  // launch_log_hip.cu: a no-op unless RAGON_LAUNCH_LOG=1
 void launch_log_range_pop();
+void stream_kick(gpu::Stream s);
 }  // namespace ragon::kernels
 namespace ragon::gpu {
 inline void range_push(const char* name) { kernels::launch_log_range_push(name); }
 inline void range_pop() { kernels::launch_log_range_pop(); }
+// One stream query outside a capture, so the runtime sends the batch it holds to the GPU now (TheRock #8786).
+inline void kick(Stream s) { kernels::stream_kick(s); }
 }  // namespace ragon::gpu
 #else
 #include <nvtx3/nvToolsExt.h>
 namespace ragon::gpu {
 inline void range_push(const char* name) { nvtxRangePushA(name); }
 inline void range_pop() { nvtxRangePop(); }
+inline void kick(Stream) {}  // CUDA submits each launch at once
 }  // namespace ragon::gpu
 #endif

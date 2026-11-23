@@ -746,6 +746,18 @@ class Engine {
   bool topk_batch_ = true;  // RAGON_TOPK_BATCH (default on, 0 off): one top-K launch per run of joint-verify sequences with the same K
   long topk_batch_launches_ = 0, topk_batch_seqs_ = 0;
   bool commit_pending_ = false;
+  // RAGON_COMMIT_NOSYNC=1 (default off): speculate returns without waiting for its commit (the drafter's context KV
+  // on stream_, the replay beside it); the next draft queues behind it on stream_ and its own sync covers both, so
+  // the GPU runs from the commit into the draft without a host round trip between them. tail_pending_ marks the
+  // unsynced commit; every other public entry point settles it first (settle_tail), since they may read device
+  // memory from the host or another stream.
+  bool commit_nosync_ = false;
+  // RAGON_COMMIT_KICK=1 (default off; a no-op under CUDA): query commit_stream_ and stream_ right after the commit's
+  // issue, so the HIP runtime sends the launches it holds to the GPU at once instead of at the next sync (TheRock
+  // #8786). Querying stream_ after every drafter layer as well measured slower on gfx1151 (w48 lane 10).
+  bool commit_kick_ = false;
+  bool tail_pending_ = false;
+  void settle_tail();
   gpu::Stream commit_stream_ = nullptr;
   gpu::Event commit_done_ = nullptr;
   float* commit_core_ = nullptr;  // the replay's recurrence output, which nothing reads (core_ belongs to stream_)

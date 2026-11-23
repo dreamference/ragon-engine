@@ -269,4 +269,10 @@ void launch_kick(gpu::Stream s) {
   (void)hipStreamQuery(s);  // NotReady is the expected answer
 }
 
+void stream_kick(gpu::Stream s) {
+  hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
+  if (hipStreamIsCapturing(s, &st) != hipSuccess || st != hipStreamCaptureStatusNone) return;
+  (void)hipStreamQuery(s);
+}
+
 }  // namespace ragon::kernels

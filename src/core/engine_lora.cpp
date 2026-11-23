@@ -127,6 +127,7 @@ void Engine::lora_alloc_drafter() {
 }
 
 void Engine::lora_upload(int slot, const LoraAdapter& adapter) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (slot < 0 || slot >= opts_.lora_slots) throw std::runtime_error("lora: no such GPU slot");
   const ModelConfig& c = model_->config();
   const size_t su = static_cast<size_t>(slot);

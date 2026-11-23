@@ -379,6 +379,8 @@ Engine::Engine(const std::string& model_dir, EngineOptions opts) : opts_(opts) {
   else inpass_ = false;
   commit_overlap_ = opts_.commit_overlap && draft_ != nullptr;
   if (const char* e = std::getenv("RAGON_COMMIT_OVERLAP")) commit_overlap_ = draft_ != nullptr && std::atoi(e) != 0;
+  if (const char* e = std::getenv("RAGON_COMMIT_NOSYNC")) commit_nosync_ = std::atoi(e) != 0;
+  if (const char* e = std::getenv("RAGON_COMMIT_KICK")) commit_kick_ = std::atoi(e) != 0;
   if (const char* e = std::getenv("RAGON_COMMIT_STATE_BATCH")) commit_state_batch_ = std::atoi(e) != 0;
   if (commit_overlap_) {
     check(gpu::stream_create(&commit_stream_, gpu::kStreamNonBlocking), "commit stream");
@@ -555,6 +557,12 @@ void Engine::swap_side() {
   side_active_ = !side_active_;
 }
 
+void Engine::settle_tail() {
+  if (!tail_pending_) return;
+  tail_pending_ = false;
+  check(gpu::stream_sync(stream_), "commit (settled)");
+}
+
 void Engine::join_commit() {
   // A side pass belongs to another session than the step whose commit is pending: it neither reads nor writes
   // that state, so it does not wait (and the main stream's join stays pending).
@@ -707,6 +715,7 @@ void Engine::dump_kv_calib() {
 }
 
 Engine::~Engine() {
+  if (tail_pending_) (void)gpu::stream_sync(stream_);
   if (gdn_fused_)
     std::fprintf(stderr, "gdn fused: %lld verifies, %lld sequences replayed in them, %lld flushes\n",
                  gdn_fused_verifies_, gdn_fused_seqs_, gdn_fused_flushes_);
@@ -757,12 +766,14 @@ Engine::~Engine() {
 }
 
 void Engine::reset() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   reset_session();
   ckpts_.clear();
   if (kv_tree_) kv_store_dropped([&] { kv_tree_->clear(); });
 }
 
 void Engine::reset_session() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   reset_state();
   check(gpu::stream_sync(stream_), "reset");
   s_->history.clear();
@@ -898,11 +909,13 @@ void Engine::touch_session() { s_->last_used = std::chrono::steady_clock::now();
 void Engine::touch_session(int i) { sessions_.at(i).last_used = std::chrono::steady_clock::now(); }
 
 void Engine::select_session(int i) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (i < 0 || i >= static_cast<int>(sessions_.size())) throw std::runtime_error("no such session");
   bind_session(&sessions_[i]);
 }
 
 void Engine::reset_all() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   side_join();
   for (Session& s : sessions_) {
     bind_session(&s);
@@ -1015,6 +1028,7 @@ void Engine::kv_gone_refs(const KvGone& gone, std::vector<std::vector<int>>& tre
 int Engine::kv_store_pages() const { return kv_reclaimable({}, true); }
 
 bool Engine::kv_store_evict(const std::vector<int>& keep) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!kv_tree_ || !kv_book_) return false;
   bool evicted = false;
   kv_store_dropped([&] { evicted = kv_tree_->evict_lru_leaf(keep); });
@@ -1065,6 +1079,7 @@ void Engine::kv_record_release() {
 }
 
 bool Engine::kv_retire(bool wait) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!kv_book_ || kv_book_->pending_pages() == 0) return true;
   for (int i = 0; i < 3; ++i) {
     if (!kv_release_rec_[i]) continue;
@@ -1163,6 +1178,7 @@ void Engine::kv_release(Session& s, int n) {
 }
 
 void Engine::kv_evict(int session) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!kv_book_) return;
   if (side_cur_ && side_cur_->session == session) throw std::logic_error("kv_evict: the session's chunk is in flight");
   Session& s = sessions_.at(session);
@@ -1238,6 +1254,7 @@ void Engine::reset_state() {
 }
 
 uint64_t Engine::state_hash() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   const ModelConfig& c = model_->config();
   const size_t gdn = size_t(c.lin_v_heads) * c.lin_k_dim * c.lin_v_dim, conv = size_t(c.lin_conv_channels()) * (c.conv_kernel - 1);
   std::vector<float> host(gdn);
@@ -1257,6 +1274,7 @@ uint64_t Engine::state_hash() {
 }
 
 uint64_t Engine::draft_hash() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!draft_) return 0;
   const DraftConfig& d = draft_->config();
   const size_t dkv = size_t(d.kv_heads) * d.head_dim;
@@ -1277,6 +1295,7 @@ uint64_t Engine::draft_hash() {
 }
 
 void Engine::set_draft_block(int b) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (b < 2 || b > kernels::kMaxSeqRows) throw std::runtime_error("draft block must be in [2, 32]");
   if (b != opts_.draft_block) clear_graphs();  // they were captured for the old block
   opts_.draft_block = b;
@@ -2653,6 +2672,7 @@ const gpu::bf16* Engine::image_embedding(const PromptImage& im, const std::vecto
 }
 
 bool Engine::prefill_chunk(PrefillCursor& cur, int max_tokens) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (cur.done()) return true;
   if (side_cur_) throw std::runtime_error("prefill_chunk while a side chunk is in flight");
   // A prompt whose earlier chunk ran on the side stream: that chunk's finish queued the snap and checkpoint copies of
@@ -2679,6 +2699,7 @@ bool Engine::joint_eligible(const PrefillCursor& cur) const {
 }
 
 std::vector<std::exception_ptr> Engine::prefill_joint(std::span<PrefillCursor* const> curs) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (side_cur_) throw std::runtime_error("prefill_joint while a side chunk is in flight");
   side_join();
   static const bool lm_rows = [] {
@@ -2906,6 +2927,7 @@ bool Engine::chunk_end(PrefillCursor& cur, const ChunkRun& run) {
 }
 
 void Engine::prefill_chunk_launch(PrefillCursor& cur, int max_tokens) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!side_.stream_) throw std::runtime_error("prefill_chunk_launch without side_prefill");
   if (side_cur_) throw std::runtime_error("a side chunk is already in flight");
   if (cur.done()) throw std::runtime_error("prefill_chunk_launch on a finished prompt");
@@ -2938,6 +2960,7 @@ bool Engine::side_ready() {
 }
 
 bool Engine::prefill_chunk_finish() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!side_cur_) throw std::runtime_error("prefill_chunk_finish without a side chunk");
   PrefillCursor& cur = *side_cur_;
   side_cur_ = nullptr;
@@ -2958,11 +2981,13 @@ bool Engine::prefill_chunk_finish() {
 }
 
 void Engine::side_join() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (side_cur_) check(gpu::event_sync(side_done_), "side chunk");
   if (side_.stream_ && !side_active_) check(gpu::stream_sync(side_.stream_), "side stream");
 }
 
 void Engine::side_abandon() {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   if (!side_cur_) return;
   check(gpu::event_sync(side_done_), "side chunk");
   side_cur_ = nullptr;
@@ -2978,6 +3003,7 @@ const std::vector<float>& Engine::prefill(const std::vector<int>& prompt, Engine
 }
 
 const std::vector<float>& Engine::step(int token) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   const int pos0 = s_->pos;
   forward(&token, 1, Pass::Decode);
   if (draft_) draft_materialize(1, pos0, 0);
@@ -2996,6 +3022,7 @@ int Engine::sample(const std::vector<float>& logits, const SamplingParams& p, co
 }
 
 void Engine::set_constraint(int i, std::shared_ptr<TokenConstraint> c, int arm_token) {
+  settle_tail();  // RAGON_COMMIT_NOSYNC: the last speculate's commit, unsynced
   Session& s = sessions_.at(i);
   if (c) {
     const int words = c->words();
