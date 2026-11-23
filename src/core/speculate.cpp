@@ -407,6 +407,33 @@ void Engine::alloc_sparse_head() {
     return d;
   };
   sh_us_ = reinterpret_cast<gpu::bf16*>(put(us));
+#if defined(RAGON_BACKEND_HIP)
+  // RAGON_SH_US8=1 (HIP, default off): an INT8 copy of US for the approximate scores, symmetric per row (scale =
+  // max |u| / 127), so the selection streams half the bytes; the gathered rows' logits stay exact.
+  if (const char* e = std::getenv("RAGON_SH_US8"); e && std::atoi(e) != 0) {
+    const int R = sh_rank_;
+    std::vector<int8_t> q(size_t(V) * R);
+    std::vector<float> sc(V);
+    for (int n = 0; n < V; ++n) {
+      float u[256], mx = 0.f;
+      for (int k = 0; k < R; ++k) {
+        uint16_t b;
+        std::memcpy(&b, us.data + (size_t(n) * R + k) * 2, 2);
+        const uint32_t w = uint32_t(b) << 16;
+        std::memcpy(&u[k], &w, 4);
+        mx = std::max(mx, std::fabs(u[k]));
+      }
+      sc[n] = mx / 127.f;
+      const float inv = mx > 0.f ? 127.f / mx : 0.f;
+      for (int k = 0; k < R; ++k) q[size_t(n) * R + k] = static_cast<int8_t>(std::clamp(std::lrint(u[k] * inv), -127L, 127L));
+    }
+    sh_us8_ = reinterpret_cast<int8_t*>(alloc<uint8_t>(q.size()));
+    sh_us8s_ = alloc<float>(sc.size());
+    check(gpu::memcpy_sync(sh_us8_, q.data(), q.size(), gpu::kH2D), "sparse head us8 upload");
+    check(gpu::memcpy_sync(sh_us8s_, sc.data(), sc.size() * 4, gpu::kH2D), "sparse head us8 upload");
+    std::fprintf(stderr, "sparse head: INT8 US for the approximate scores (RAGON_SH_US8)\n");
+  }
+#endif
   sh_vt_ = reinterpret_cast<gpu::bf16*>(put(vt));
   sh_fixed_.assign(V, 0);
   const int nf = static_cast<int>(fixed.numel());
@@ -537,6 +564,7 @@ void Engine::draft_head(int n, int E, const uint8_t* const* masks) {
   // Each sequence as it is drafted alone: its own selection, or the full head for a session in fallback.
   kernels::SparseHeadBufs b;
   b.w = lm.w, b.table = lm.table, b.raw = lm.scales, b.scale2 = lm.scale2, b.N = c.vocab, b.K = d.hidden;
+  b.us8 = sh_us8_, b.us8s = sh_us8s_;
   b.us = sh_us_, b.vt = sh_vt_, b.R = sh_rank_, b.dynamic = opts_.sparse_head_dynamic, b.cap = sh_cap_;
   b.p = sh_p_, b.scratch = sh_scratch_, b.rows = sh_rows_, b.nrows = sh_nrows_, b.xtmp = sh_xtmp_;
   b.xh = xh_, b.xinv = xinv_, b.logits = dlogits_, b.topk_scratch = topk_scratch_;

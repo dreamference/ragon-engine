@@ -105,6 +105,68 @@ __global__ void __launch_bounds__(256) approx_kernel(const float* __restrict__ p
     }
   }
 }
+
+// RAGON_SH_US8 (HIP, BACKLOG 19 bytes): the same scores from an INT8 copy of US, one FP32 scale per row (us8[n][k] *
+// us8s[n] ~ us[n][k]), so the stage streams half the bytes. Each lane widens its 64 INT8 values to BF16 once (exact:
+// |q| <= 127), the products and sums are approx_kernel's, and the row's maximum is multiplied by its scale at the end.
+__device__ __forceinline__ uint32_t i8x2_bf16(uint32_t w, int k) {  // bytes 2k, 2k + 1 of w as two BF16, low first
+  const float lo = static_cast<float>(static_cast<int8_t>((w >> (16 * k)) & 0xffu));
+  const float hi = static_cast<float>(static_cast<int8_t>((w >> (16 * k + 8)) & 0xffu));
+  return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
+}
+template <int NT>
+__global__ void __launch_bounds__(256) approx8_kernel(const float* __restrict__ p, int M, const int8_t* __restrict__ us8,
+                                                      const float* __restrict__ us8s, int N, SelMasks fixed,
+                                                      uint32_t* __restrict__ keys) {
+  pdl_begin();
+  constexpr int PS = kRank + 8;
+  __shared__ __align__(16) gpu::bf16 ps[NT * 8 * PS];
+  for (int i = threadIdx.x; i < NT * 8 * kRank; i += blockDim.x) {
+    const int m = i / kRank, c = i % kRank;
+    ps[m * PS + c] = __float2bfloat16(m < M ? p[m * kRank + c] : 0.f);
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int warps = gridDim.x * (blockDim.x / 32), warp = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+  for (int n0 = warp * 16; n0 < N; n0 += warps * 16) {
+    uint4 a[2][8];
+    float sc[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int n = min(n0 + g + 8 * h, N - 1);
+      const uint4* src = reinterpret_cast<const uint4*>(us8 + static_cast<size_t>(n) * kRank + t * 64);
+      sc[h] = __ldg(us8s + n);
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const uint4 v = __ldg(src + q);
+        a[h][2 * q] = make_uint4(i8x2_bf16(v.x, 0), i8x2_bf16(v.x, 1), i8x2_bf16(v.y, 0), i8x2_bf16(v.y, 1));
+        a[h][2 * q + 1] = make_uint4(i8x2_bf16(v.z, 0), i8x2_bf16(v.z, 1), i8x2_bf16(v.w, 0), i8x2_bf16(v.w, 1));
+      }
+    }
+    float best[2] = {-INFINITY, -INFINITY};
+    for (int m = 0; m < M; ++m) {
+      const uint4* pr = reinterpret_cast<const uint4*>(ps + m * PS + t * 64);
+      float acc[2] = {0.f, 0.f};
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        const uint4 pv = pr[q];
+        acc[0] = dot8_bf16(a[0][q], pv, acc[0]);
+        acc[1] = dot8_bf16(a[1][q], pv, acc[1]);
+      }
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        acc[h] += __shfl_xor_sync(gpu::kWarpMask, acc[h], 1);
+        acc[h] += __shfl_xor_sync(gpu::kWarpMask, acc[h], 2);
+        best[h] = fmaxf(best[h], acc[h]);
+      }
+    }
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int n = n0 + g + 8 * h;
+      if (t == 0 && n < N) keys[n] = marked(fixed, n) ? 0u : float_key(best[h] * sc[h]);
+    }
+  }
+}
 #else
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
@@ -284,7 +346,8 @@ size_t cub_bytes(int N) {
 size_t sparse_head_scratch_bytes(int N) { return size_t(N) * 5 + 256 + 3 * 4096 * 4 + cub_bytes(N); }
 
 void sparse_head_select(const float* p, int M, const gpu::bf16* us, int N, int R, SelMasks fixed_mask, int dynamic,
-                        int cap, void* scratch, int* rows, int* nrows, gpu::Stream s) {
+                        int cap, void* scratch, int* rows, int* nrows, gpu::Stream s, const int8_t* us8,
+                        const float* us8s) {
   if (R != kRank) throw std::runtime_error("sparse_head_select: built for rank 256");
   if (fixed_mask.n < 1 || fixed_mask.n > kMaxSeqs) throw std::runtime_error("sparse_head_select: 1 to kMaxSeqs masks");
   if (M < 1 || M > kMaxSeqRows) throw std::runtime_error("sparse_head_select: M must be in [1, 32]");  // one sequence
@@ -305,6 +368,15 @@ void sparse_head_select(const float* p, int M, const gpu::bf16* us, int N, int R
     (void)gpu::blocks_per_sm(&per, kernel, 256, 0);
     return dim3(sms * std::max(per, 1));
   };
+#if defined(RAGON_BACKEND_HIP)
+  if (us8) {
+    if (M <= 8) launch_kernel("sparse_head approx", approx8_kernel<1>, grid(approx8_kernel<1>), dim3(256), 0, s, p, M, us8, us8s, N, fixed_mask, keys);
+    else if (M <= 16) launch_kernel("sparse_head approx", approx8_kernel<2>, grid(approx8_kernel<2>), dim3(256), 0, s, p, M, us8, us8s, N, fixed_mask, keys);
+    else launch_kernel("sparse_head approx", approx8_kernel<4>, grid(approx8_kernel<4>), dim3(256), 0, s, p, M, us8, us8s, N, fixed_mask, keys);
+  } else
+#else
+  (void)us8, (void)us8s;  // the tensor-core kernel reads BF16 US only
+#endif
   if (M <= 8) launch_kernel("sparse_head approx", approx_kernel<1>, grid(approx_kernel<1>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
   else if (M <= 16) launch_kernel("sparse_head approx", approx_kernel<2>, grid(approx_kernel<2>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
   else launch_kernel("sparse_head approx", approx_kernel<4>, grid(approx_kernel<4>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
@@ -378,7 +450,8 @@ void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, cons
     const float* xi = x + size_t(i) * E * b.K;
     const size_t o = size_t(i) * E * K16;
     bf16_rows(xi, E, b.vt, b.p, b.R, b.K, s);
-    sparse_head_select(b.p, E, b.us, b.N, b.R, SelMasks{{masks[i]}, 1}, b.dynamic, b.cap, b.scratch, b.rows, b.nrows, s);
+    sparse_head_select(b.p, E, b.us, b.N, b.R, SelMasks{{masks[i]}, 1}, b.dynamic, b.cap, b.scratch, b.rows, b.nrows, s,
+                       b.us8, b.us8s);
     to_half_rows(xi, E, b.K, b.xh, b.xinv, s);
     stream_gemm_gather_nvfp4(b.xh, b.xinv, E, b.w, b.table ? b.raw : nullptr, b.scale2, b.rows, b.nrows, b.cap, b.logits,
                              b.K, s);
@@ -434,7 +507,8 @@ void draft_head_rows(const SparseHeadBufs& b, const float* x, int n, int E, cons
     const float* xi = x + size_t(i) * E * b.K;
     const size_t o = size_t(i) * E * K16;
     bf16_rows(xi, E, b.vt, b.p, b.R, b.K, s);
-    sparse_head_select(b.p, E, b.us, b.N, b.R, SelMasks{{masks[i]}, 1}, b.dynamic, b.cap, b.scratch, b.rows, b.nrows, s);
+    sparse_head_select(b.p, E, b.us, b.N, b.R, SelMasks{{masks[i]}, 1}, b.dynamic, b.cap, b.scratch, b.rows, b.nrows, s,
+                       b.us8, b.us8s);
     to_half_rows(xi, E, b.K, b.xh, b.xinv, s);
     stream_gemm_gather_nvfp4_kmajor(b.xh, b.xinv, E, b.w, b.scale2, b.rows, b.nrows, b.cap, b.logits, b.N, b.K, s);
     topk_rows(b.logits, E, b.cap, K16, b.topk_scratch, vals + o, ids + o, s);

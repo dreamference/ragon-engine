@@ -1129,6 +1129,38 @@ void test_sparse_head(Rng& r) {
     const auto got = download(static_cast<const uint32_t*>(scratch), N);
     check(Mh <= 8 ? "sparse_head_approx_hip_m3" : "sparse_head_approx_hip_m20", got, mismatches(got, want), 0);
   }
+  // RAGON_SH_US8: the INT8 copy of US (one scale per row), the same order over the values widened exactly, the
+  // maximum times the row's scale.
+  for (const int Mh : {3, 20}) {
+    const auto pf = from_bits(to_bits(r.vec(size_t(Mh) * R)));
+    std::vector<int8_t> q(size_t(N) * R);
+    std::vector<float> sc(N);
+    for (auto& v : q) v = static_cast<int8_t>(r.below(255) - 127);
+    for (int n = 0; n < N; ++n) sc[n] = 0.001f * static_cast<float>(1 + r.below(64));
+    std::vector<uint32_t> want(N);
+    for (int n = 0; n < N; ++n) {
+      float best = -INFINITY;
+      for (int m = 0; m < Mh; ++m) {
+        float s[4];
+        for (int t = 0; t < 4; ++t) {
+          s[t] = 0.f;
+          for (int k = t * 64; k < t * 64 + 64; ++k)
+            s[t] = std::fma(static_cast<float>(q[size_t(n) * R + k]), pf[size_t(m) * R + k], s[t]);
+        }
+        best = std::max(best, (s[0] + s[1]) + (s[2] + s[3]));
+      }
+      best *= sc[n];
+      uint32_t b;
+      std::memcpy(&b, &best, 4);
+      want[n] = (m0[n] || m1[n]) ? 0u : ((b & 0x80000000u) ? ~b : (b | 0x80000000u));
+    }
+    auto* rows = dev_zero<int>(N);
+    auto* nrows = dev_zero<int>(1);
+    const auto ub = to_bits(r.vec(size_t(N) * R));  // BF16 US: present, not read when us8 is set
+    K::sparse_head_select(dev(pf), Mh, dev_bf16(ub), N, R, masks, 40, N, scratch, rows, nrows, nullptr, dev(q), dev(sc));
+    const auto got = download(static_cast<const uint32_t*>(scratch), N);
+    check(Mh <= 8 ? "sparse_head_approx8_hip_m3" : "sparse_head_approx8_hip_m20", got, mismatches(got, want), 0);
+  }
 #endif
 }
 

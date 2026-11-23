@@ -1119,6 +1119,8 @@ class Engine {
   bool sparse_head_ = false;
   int sh_rank_ = 0, sh_cap_ = 0, sh_nfixed_ = 0;
   gpu::bf16 *sh_us_ = nullptr, *sh_vt_ = nullptr;
+  int8_t* sh_us8_ = nullptr;  // RAGON_SH_US8 (HIP): US as INT8, sh_us8s_ its per-row scales
+  float* sh_us8s_ = nullptr;
   std::vector<uint8_t> sh_fixed_;
   float* sh_p_ = nullptr;
   void* sh_scratch_ = nullptr;

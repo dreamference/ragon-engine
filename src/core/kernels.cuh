@@ -371,8 +371,11 @@ struct SelMasks {
   int n;
 };
 size_t sparse_head_scratch_bytes(int N);
+// us8/us8s (HIP only, ignored under CUDA): an INT8 copy of US with one FP32 scale per row; when set, the scores are
+// read from it instead (half the bytes; RAGON_SH_US8).
 void sparse_head_select(const float* p, int M, const gpu::bf16* us, int N, int R, SelMasks masks, int dynamic,
-                        int cap, void* scratch, int* rows, int* nrows, gpu::Stream s);
+                        int cap, void* scratch, int* rows, int* nrows, gpu::Stream s, const int8_t* us8 = nullptr,
+                        const float* us8s = nullptr);
 // ids[i] = rows[ids[i]] for the M x K top-K indices (the sparse head's columns back to token ids).
 void sparse_head_ids(const int* rows, int* ids, int n, gpu::Stream s);
 // mask[ids[i]] = 1 for i < n (a session's context vocabulary, BACKLOG 19).
@@ -391,6 +394,8 @@ struct SparseHeadBufs {
   float scale2 = 0.f;
   int N = 0, K = 0;                // vocab x hidden
   const gpu::bf16 *us = nullptr, *vt = nullptr;
+  const int8_t* us8 = nullptr;     // RAGON_SH_US8 (HIP): US as INT8, us8s its per-row scales
+  const float* us8s = nullptr;
   int R = 256, dynamic = 0, cap = 0;
   float* p = nullptr;              // [32][R]
   void* scratch = nullptr;         // sparse_head_scratch_bytes(N)
