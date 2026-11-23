@@ -107,6 +107,9 @@ struct EngineOptions {
   // state at a multiple of kResumeAlign, as every other). With inpass_checkpoints its state is captured inside a pass
   // (alone it cost a short extra pass, BACKLOG 34). RAGON_BRANCH_CKPT=0/1 overrides.
   bool branch_checkpoints = true;
+  // How far past the furthest stored checkpoint a fork's resumed snap must be to join the store (see the branch
+  // point save in the prompt pass); <= 0 means prefill_chunk. RAGON_BRANCH_CKPT_MIN overrides (fork bench, f2).
+  int branch_checkpoint_min = 0;
   // BACKLOG 35: the message ends' and the branch point's states captured inside the pass that crosses them (as the
   // end-of-prompt snap is), so they cut no chunk short; a chunk holding the snap or a second such point still ends
   // there. Exact: the captured state is the one a chunk ending there would leave. RAGON_CKPT_INPASS=0/1 overrides.

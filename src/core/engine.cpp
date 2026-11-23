@@ -2469,7 +2469,8 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
     int furthest = 0;
     for (const Checkpoint& k : ckpts_)
       if (k.pos <= reuse && k.pos > furthest && ckpt_match(k, prompt, prefix_hash, s_->scope)) furthest = k.pos;
-    if (reuse - furthest >= opts_.prefill_chunk) save_checkpoint(reuse, cur.ckpt_epoch, &s_->snap, true);
+    const int min_gap = opts_.branch_checkpoint_min > 0 ? opts_.branch_checkpoint_min : opts_.prefill_chunk;
+    if (reuse - furthest >= min_gap) save_checkpoint(reuse, cur.ckpt_epoch, &s_->snap, true);
   }
   if (draft_ && window > reuse) s_->dkv_lo = window;
   if (kv_book_) {

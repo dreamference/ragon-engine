@@ -2515,7 +2515,7 @@ int main(int argc, char** argv) try {
   std::string model_dir, host = "0.0.0.0", name;
   double draft_off_below = 1.5;  // the drafter-off guard (BACKLOG 10)
   int port = 8000, max_context = 0, draft_block = 12, lookup = 1, lookup_min = 8, checkpoints = 8, tree_nodes = 7, prefix_kv_mb = -1,
-      checkpoint_limit = -1;
+      checkpoint_limit = -1, branch_checkpoint_min = -1;
   std::string draft_dir, pretokenizer = "production";
   std::vector<std::string> drafter_args;  // --drafter ID=DIR, repeatable (MULTI_DRAFTER §5.3)
   std::string drafter_routes_file;
@@ -2578,6 +2578,7 @@ int main(int argc, char** argv) try {
     else if (a == "--pretokenizer") pretokenizer = next();
     else if (a == "--prefix-checkpoints") checkpoints = std::stoi(next());
     else if (a == "--checkpoint-limit") checkpoint_limit = std::stoi(next());
+    else if (a == "--branch-checkpoint-min") branch_checkpoint_min = std::stoi(next());
     else if (a == "--prefix-kv-mb") prefix_kv_mb = std::stoi(next());
     else if (a == "--graphs") graphs = true;
     else if (a == "--pdl") pdl = true;
@@ -2637,7 +2638,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-off-wide 0|1] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N] [--sparse-head-batch N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--checkpoint-limit N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-off-wide 0|1] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N] [--sparse-head-batch N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--checkpoint-limit N] [--branch-checkpoint-min N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2736,6 +2737,13 @@ int main(int argc, char** argv) try {
   if (checkpoint_limit > 0) {
     opts.checkpoint_limit = checkpoint_limit;
     std::fprintf(stderr, "prefix checkpoints: %d slots, up to position %d\n", checkpoints, checkpoint_limit);
+  }
+  // A fork that resumes a resident session's snap saves it as a checkpoint for its sibling forks when it is at least
+  // this far past the furthest stored one (prefill_chunk by default); lower, the siblings re-read fewer tokens.
+  if (const char* e = std::getenv("RAGON_BRANCH_CKPT_MIN")) branch_checkpoint_min = std::atoi(e);
+  if (branch_checkpoint_min > 0) {
+    opts.branch_checkpoint_min = branch_checkpoint_min;
+    std::fprintf(stderr, "branch checkpoints: saved %d or more tokens past the furthest\n", branch_checkpoint_min);
   }
   if (prefix_kv_mb >= 0) opts.prefix_kv_mb = prefix_kv_mb;
   opts.boundary_token = tok.token_id("<|im_end|>");
