@@ -132,6 +132,7 @@ class Model {
   int H_ = 0, KV_ = 0, D_ = 0, Hk_ = 0, Hv_ = 0, Dk_ = 0, Dv_ = 0, hidden_ = 0, ffn_ = 0, V_ = 0, rot_ = 0;
   int max_ctx_ = 0, C_ = 0, nchunk_max_ = 32, mm_min_ = 64;
   bool attn_gqa_ = true;
+  int mq_nch_ = 32;  // verify attention key chunks (RAGON_METAL_MQ_NCH, 0: the decode kernel per row)
   bool g8_ = true;  // the simdgroup-matrix GEMV for 2..8 rows (gemv8)
   View xp8_;
   size_t xp8_cap_ = 0;

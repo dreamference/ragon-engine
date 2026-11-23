@@ -278,6 +278,7 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   fxw_ = q.alloc(hidden_ * 4);
   fpart_ = q.alloc(hidden_ / 8 * 4);
   g8_ = !std::getenv("RAGON_METAL_G8_OFF");
+  if (const char* v = std::getenv("RAGON_METAL_MQ_NCH")) mq_nch_ = std::max(0, std::atoi(v));
   xp8_cap_ = size_t(std::max({hidden_, ffn_, H_ * D_, 8192})) * 16;
   xp8_ = q.alloc(xp8_cap_);
   qkv_ = q.alloc(C * std::max(conv_w, size_t(H_) * 2 * D_) * 4);
@@ -673,6 +674,11 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
 struct RopeArgs {
   uint32_t heads, ldt, ldh, half_rot, pos0;
 };
+struct PrefAttnArgs {
+  uint32_t T, Tp, H, D, ldq, qh, pos0, kvp;
+  float scale;
+};
+
 struct AttnArgs {
   uint32_t H, KV, D, ldq, qh, pos0, chunk, nchunks;
   float scale;
@@ -723,6 +729,31 @@ void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::st
   if (T >= mm_min_ && (attn_flash_ || !S_.empty())) {
     attention_mm(L, T, pos0);
     e = q_->encoder();
+  } else if (mq_nch_ && T >= 2 && T <= 10 && !qb_.empty() && !kv8_ && D_ == 256 && H_ == 6 * KV_) {
+    // the verify rows: the G * T query rows of a kv head as one 64-row tensor-op tile, keys split in chunks
+    const uint32_t Tp = 16, D = uint32_t(D_), g = uint32_t(H_ / KV_), kvlen = uint32_t(pos0 + T);
+    PrefAttnArgs pa{uint32_t(T), Tp, uint32_t(H_), D, uint32_t(qw), 2 * D, uint32_t(pos0), uint32_t(pad64(pos0 + T)),
+                    1.0f / std::sqrt(float(D_))};
+    [e setComputePipelineState:q_->pipe("q_bf16g")];
+    bind(e, {qg_, qb_});
+    bind_args(e, 2, pa);
+    [e setBytes:&g length:4 atIndex:3];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(D, Tp, H_) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    const uint32_t nmax = uint32_t(std::max(1, std::min(mq_nch_, C_ * nchunk_max_ / T)));
+    uint32_t chunk = (kvlen + nmax - 1) / nmax;
+    chunk = std::max(64u, (chunk + 63) / 64 * 64);
+    const uint32_t nch = (kvlen + chunk - 1) / chunk, sp[2] = {chunk, nch};
+    [e setComputePipelineState:q_->pipe("attn_flash2_6s")];
+    bind(e, {qb_, L.kc, L.vc, part_});
+    bind_args(e, 4, pa);
+    [e setBytes:&flash_dbg_ length:4 atIndex:5];
+    [e setBytes:sp length:8 atIndex:6];
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(nch, KV_, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    AttnArgs a{uint32_t(H_), uint32_t(KV_), D, uint32_t(qw), 2 * D, uint32_t(pos0), chunk, nch, 1.0f / std::sqrt(float(D_))};
+    [e setComputePipelineState:q_->pipe("attn_combine")];
+    bind(e, {part_, ob_});
+    bind_args(e, 2, a);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(H_, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   } else {
   const int kvlen = pos0 + T;
   const bool fused = attn_gqa_ && D_ == 256 && H_ == 6 * KV_;
@@ -768,11 +799,6 @@ void Model::attention(Layer& L, int T, int pos0, const Dump& dump, const std::st
   gemv(L.o, ob_, h_, T, H_ * D_, hidden_, true);
 }
 
-struct PrefAttnArgs {
-  uint32_t T, Tp, H, D, ldq, qh, pos0, kvp;
-  float scale;
-};
-
 // Prefill attention as matmuls: S = Q K^T over the padded keys, causal softmax, O = P V into ob_ (bfloat inputs).
 void Model::attention_mm(Layer& L, int T, int pos0) {
   id<MTLComputeCommandEncoder> e = q_->encoder();
@@ -804,6 +830,8 @@ void Model::attention_mm(Layer& L, int T, int pos0) {
     bind(e, {qb_, kc, vc, ob_});
     bind_args(e, 4, a);
     [e setBytes:&flash_dbg_ length:4 atIndex:5];
+    const uint32_t sp0[2] = {0, 0};
+    [e setBytes:sp0 length:8 atIndex:6];
     [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Tp * g / br, KV_, 1) threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
     return;
   }

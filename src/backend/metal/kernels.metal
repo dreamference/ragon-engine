@@ -1145,11 +1145,13 @@ template [[host_name("attn_flash6_192")]] kernel void attn_flash<6, 12, 192, 16>
 // division uses the same reference max as the numerator. Layout of the MPP destination (measured for 64x64 and 64x128
 // over 8 simdgroups; 128-key blocks were slower, register pressure): elements 4g..4g+3 of a thread are 4 consecutive columns of one row, and lanes l, l^1, l^8, l^9
 // hold the same row's 16 consecutive columns starting at a multiple of 16 (a column chunk).
-template <uint G, uint BC>
+// SPLIT (the verify rows, T <= 10): one 64-row tile, keys split in chunks of sp.x over grid x (sp.y chunks); o is
+// then the attn_combine partials [T][H][nchunks][2 + D] (m in natural log units, the row sum, the unnormalized O).
+template <uint G, uint BC, bool SPLIT>
 kernel void attn_flash2(device bfloat* qg [[buffer(0)]], device bfloat* kc [[buffer(1)]],
                         device bfloat* vc [[buffer(2)]], device float* o [[buffer(3)]],
                         constant PrefAttnArgs& a [[buffer(4)]], constant uint& dbg [[buffer(5)]],
-                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        constant uint2& sp [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   constexpr uint D = 256, BR = 64, NSG = 8, NG = BR * BC / (32 * NSG * 4), NCH = BC / 16;
   constexpr float TAU = 8.0f;
@@ -1157,7 +1159,7 @@ kernel void attn_flash2(device bfloat* qg [[buffer(0)]], device bfloat* kc [[buf
   threadgroup float smx[NCH * BR];  // per column chunk row maxima, then the final per chunk row sums
   threadgroup float sa[BR];
   threadgroup uint sflag;
-  const uint kvh = tg.y, r0 = tg.x * BR, rows = a.Tp * G, kw = (a.H / G) * D;
+  const uint kvh = tg.y, r0 = SPLIT ? 0 : tg.x * BR, rows = a.Tp * G, kw = (a.H / G) * D;
   auto tQ = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
       qg + (ulong)kvh * rows * D, dextents<int32_t, 2>(D, rows), array<int32_t, 2>{1, int(D)});
   auto tK = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(kc + kvh * D, dextents<int32_t, 2>(D, a.kvp),
@@ -1197,7 +1199,8 @@ kernel void attn_flash2(device bfloat* qg [[buffer(0)]], device bfloat* kc [[buf
   const uint tfirst = r0 / G;
   const uint kend = tfirst < a.T ? a.pos0 + min((r0 + BR - 1) / G, a.T - 1) + 1 : 0;  // keys [0, kend)
   const uint nmin = tfirst < a.T ? a.pos0 + tfirst + 1 : 0;  // blocks ending at or below nmin need no mask
-  for (uint j0 = 0, it = 0; j0 < kend; j0 += BC, ++it) {
+  const uint jb = SPLIT ? tg.x * sp.x : 0, je = SPLIT ? min(kend, jb + sp.x) : kend;
+  for (uint j0 = jb, it = 0; j0 < je; j0 += BC, ++it) {
     auto mK = tK.slice(0, j0);
     op1.run(mQ, mK, cS);
     const bool full = j0 + BC <= nmin;
@@ -1256,9 +1259,29 @@ kernel void attn_flash2(device bfloat* qg [[buffer(0)]], device bfloat* kc [[buf
     x += simd_shuffle_xor(x, 1);
     x += simd_shuffle_xor(x, 8);
     if (wr) smx[(cc[k] / 16) * BR + rr[k]] = x;
+    if (SPLIT && wr && cc[k] < 16) sa[rr[k]] = m[k];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint H = a.H;
+  if (SPLIT) {
+#pragma unroll
+    for (uint16_t i = 0; i < cO.get_capacity(); ++i)
+      if (cO.is_valid_element(i)) {
+        const auto ix = cO.get_multidimensional_index(i);
+        const uint rl = uint(ix[1]), t = rl / G, c = uint(ix[0]);
+        if (t >= a.T) continue;
+        device float* pr = o + (((ulong)t * H + kvh * G + rl % G) * sp.y + tg.x) * (2 + D);
+        pr[2 + c] = cO[i];
+        if (c == 0) {
+          float s = 0.0f;
+#pragma unroll
+          for (uint q = 0; q < NCH; ++q) s += smx[q * BR + rl];
+          pr[0] = sa[rl] == -INFINITY ? -INFINITY : sa[rl] * M_LN2_F;
+          pr[1] = s;
+        }
+      }
+    return;
+  }
 #pragma unroll
   for (uint16_t i = 0; i < cO.get_capacity(); ++i)
     if (cO.is_valid_element(i)) {
@@ -1270,7 +1293,8 @@ kernel void attn_flash2(device bfloat* qg [[buffer(0)]], device bfloat* kc [[buf
       o[(ulong)t * H * D + (kvh * G + r % G) * D + c] = t < a.T && s > 0.0f ? cO[i] / s : 0.0f;
     }
 }
-template [[host_name("attn_flash2_6")]] kernel void attn_flash2<6, 64>(device bfloat*, device bfloat*, device bfloat*, device float*, constant PrefAttnArgs&, constant uint&, uint2, uint, uint, uint);
+template [[host_name("attn_flash2_6")]] kernel void attn_flash2<6, 64, false>(device bfloat*, device bfloat*, device bfloat*, device float*, constant PrefAttnArgs&, constant uint&, constant uint2&, uint2, uint, uint, uint);
+template [[host_name("attn_flash2_6s")]] kernel void attn_flash2<6, 64, true>(device bfloat*, device bfloat*, device bfloat*, device float*, constant PrefAttnArgs&, constant uint&, constant uint2&, uint2, uint, uint, uint);
 
 // Causal softmax over S [H][Tp][kvp] f32 -> P bfloat (masked and padded entries 0). Grid (Tp, H), 256 threads.
 kernel void softmax_causal(device const float* S [[buffer(0)]], device bfloat* P [[buffer(1)]],
