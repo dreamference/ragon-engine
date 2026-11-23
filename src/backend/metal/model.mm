@@ -292,6 +292,7 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   fxw_ = q.alloc(hidden_ * 4);
   fpart_ = q.alloc(hidden_ / 8 * 4);
   g8_ = !std::getenv("RAGON_METAL_G8_OFF");
+  if (const char* v = std::getenv("RAGON_METAL_G8_MIN_N")) g8_min_n_ = uint32_t(std::atoi(v));
   if (const char* v = std::getenv("RAGON_METAL_MQ_NCH")) mq_nch_ = std::max(0, std::atoi(v));
   xp8_cap_ = size_t(std::max({hidden_, ffn_, H_ * D_, 8192})) * 16;
   xp8_ = q.alloc(xp8_cap_);
@@ -495,7 +496,7 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     e = pm_sync(e, 3);
     return;
   }
-  if (g8_ && T >= 2 && T <= 8 && (l.fmt == Lin::kNvfp4 || l.fmt == Lin::kQ4) && l.K % 128 == 0 &&
+  if (g8_ && T >= 2 && T <= 8 && (l.fmt == Lin::kNvfp4 || l.fmt == Lin::kQ4) && l.K % 256 == 0 && l.N >= g8_min_n_ &&
       size_t(l.K) * 16 <= xp8_cap_) {
     // the verify rows: x packed as half pairs, then the simdgroup-matrix GEMV (gemv8 in kernels.metal)
     const bool have = xp8_buf_ == (__bridge const void*)x.buf && xp8_off_ == x.off && xp8_k_ == l.K &&
@@ -1275,17 +1276,22 @@ void Model::draft_forward(int B, uint32_t anchor, int pos) {
     bind_args(e2, 2, a);
     [q_->pre(e2) dispatchThreadgroups:MTLSizeMake(heads, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   };
+  auto tick = [&](int k) {  // RAGON_METAL_PROF=6: the draft layers split by kind
+    if (prof_ == 6) dpm[k] += q_->sync();
+  };
   for (size_t l = 0; l < dl_.size(); ++l) {
     DraftLayer& L = dl_[l];
     if (l > 0) add(dres_, dout_);
     norm(dres_, L.in_norm, View{}, dh_, B, H, 1, H, 0, H, 0, 3);
     gemv(L.attn_kproj, dh_, dcoef_, B, H, 4 * dgroups_, false);
     gconv(dh_, L.attn_base, 0, dh2_);
+    tick(3);
     gemv(L.q, dh2_, dq_, B, H, dq, false);
     q_->overlap();
     gemv(L.k, dh2_, dk_, B, H, kvw, false, 0, true);
     q_->overlap();
     gemv(L.v, dh2_, dv_, B, H, kvw, false, 0, true);
+    tick(0);
     rope(dq_, L.q_norm, dHq_, dq);
     q_->overlap();
     rope(dk_, L.k_norm, dKV_, kvw);
@@ -1300,29 +1306,37 @@ void Model::draft_forward(int B, uint32_t anchor, int pos) {
     DAttnArgsH aa{uint32_t(pos), uint32_t(B), uint32_t(dwin_ - 1), uint32_t(ring_), uint32_t(dHq_), uint32_t(dKV_)};
     bind_args(e, 4, aa);
     [q_->pre(e) dispatchThreadgroups:MTLSizeMake(B, dKV_, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    tick(1);
     gemv(L.o, dattn_, dh2_, B, dq, H, false);
+    tick(0);
     gconv(dh2_, L.attn_base, 1, dout_);
     add(dres_, dout_);
     norm(dres_, L.post_norm, View{}, dh_, B, H, 1, H, 0, H, 0, 3);
     gemv(L.mlp_kproj, dh_, dcoef_, B, H, 4 * dgroups_, false);
     gconv(dh_, L.mlp_base, 0, dh2_);
+    tick(3);
     gemv(L.gate, dh2_, dg_, B, H, dI_, false);
     q_->overlap();
     gemv(L.up, dh2_, du_, B, H, dI_, false, 0, true);
+    tick(2);
     e = q_->encoder();
     [e setComputePipelineState:q_->pipe("silu_mul")];
     bind(e, {dg_, du_, dg_});
     const uint32_t ng = uint32_t(B * dI_);
     [e setBytes:&ng length:4 atIndex:3];
     [q_->pre(e) dispatchThreads:MTLSizeMake(ng, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    tick(3);
     gemv(L.down, dg_, dh2_, B, dI_, H, false);
+    tick(2);
     gconv(dh2_, L.mlp_base, 1, dout_);
   }
   add(dres_, dout_);
   norm(dres_.at(size_t(H) * 4), dnorm_, View{}, dh_, E, H, 1, H, 0, H, 0, 3);
+  if (prof_ == 5) dpm[2] += q_->sync();
   gemv(head_, dh_, logits_, E, H, V_, false);
   q_->overlap();
   gemv(dsel_, dh_, dhp_, E, H, 256, false);
+  if (prof_ == 5) dpm[3] += q_->sync();
   e = q_->encoder();
   [e setComputePipelineState:q_->pipe("topk16_rows")];
   bind(e, {logits_, dunary_, dcand_});
@@ -1333,7 +1347,8 @@ void Model::draft_forward(int B, uint32_t anchor, int pos) {
   bind(e, {dhp_, dcand_, dunary_, dpred_, dsucc_, dscores_});
   [e setBytes:&anchor length:4 atIndex:6];
   [q_->pre(e) dispatchThreadgroups:MTLSizeMake(E, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-  q_->sync();
+  if (prof_ == 5) dpm[4] += q_->sync();
+  else q_->sync();
 }
 
 void Model::commit(int n, int pos0) {
@@ -1353,7 +1368,9 @@ void Model::commit(int n, int pos0) {
     bind_args(e, 5, g);
     [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
+  if (prof_ == 5) dpm[0] += q_->sync();
   draft_materialize(n, pos0);
+  if (prof_ == 5) dpm[1] += q_->sync();
   q_->flush();  // the GPU starts the commit while the host prepares the next draft
 }
 

@@ -389,6 +389,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "spec B=%d: %ld steps, %.3f tokens a step; ms a step: draft %.3f, verify %.3f, accept %.3f\n",
                      spec_block, m.spec_steps, double(m.spec_tokens) / ns, 1e3 * m.spec_s[0] / ns,
                      1e3 * m.spec_s[1] / ns, 1e3 * m.spec_s[2] / ns);
+        if (const char* pr = std::getenv("RAGON_METAL_PROF"); pr && std::atoi(pr) == 5)
+          std::fprintf(stderr, "spec GPU ms a step: commit GDN %.3f, materialize %.3f, draft layers %.3f, head+selector %.3f, "
+                       "top-16+lattice %.3f\n", 1e3 * m.dpm[0] / ns, 1e3 * m.dpm[1] / ns, 1e3 * m.dpm[2] / ns,
+                       1e3 * m.dpm[3] / ns, 1e3 * m.dpm[4] / ns);
+        if (const char* pr = std::getenv("RAGON_METAL_PROF"); pr && std::atoi(pr) == 6)
+          std::fprintf(stderr, "draft layers GPU ms a step: attention GEMV %.3f, attention core %.3f, MLP GEMV %.3f, "
+                       "other %.3f\n", 1e3 * m.dpm[0] / ns, 1e3 * m.dpm[1] / ns, 1e3 * m.dpm[2] / ns, 1e3 * m.dpm[3] / ns);
       }
       if (pipe) {
         const Top t = top2(m.logits(), m.vocab(), banned);

@@ -244,7 +244,10 @@ kernel void x_pack8(device const float* x [[buffer(0)]], device half2* xp [[buff
   const float v0 = r0 < a.y ? x[(ulong)r0 * a.z + k] : 0.0f;
   const float v1 = r1 < a.y ? x[(ulong)r1 * a.z + k] : 0.0f;
   const uint s = k >> 5, t = (k & 31u) >> 1, e = k & 1u;
-  xp[((s * 2 + e) * 4 + rp) * 16 + t] = half2(clamp(float2(v0, v1), -65504.0f, 65504.0f));
+  // coalesced for gemv8: a lane's slot (s % 4, e, rp) takes 4 consecutive t as one 16-byte load, and the 32 slots
+  // of a load sit side by side
+  const uint slot = ((s & 3u) * 2 + e) * 4 + rp;
+  xp[(((s >> 2) * 4 + (t >> 2)) * 32 + slot) * 4 + (t & 3u)] = half2(clamp(float2(v0, v1), -65504.0f, 65504.0f));
 }
 
 template <uint F>  // 0: NVFP4, 1: Q4
@@ -261,26 +264,41 @@ kernel void gemv8(device const half2* xp [[buffer(0)]], device const uchar* w [[
   const uint cw = fn / 2, cx = fm / 2, ex = fm & 1u, rp = fn / 2;
   simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
   const uint steps = a.K / 32;
-  for (uint it = 0; it < steps; it += 4) {
-    const uint4 q = wr[it + cw];
-    half2 wv[16];
+  // two steps a pass: a row's 4 lanes read 128 contiguous weight bytes, both loads in flight before the MMAs
+  for (uint it = 0; it < steps; it += 8) {
+    uint4 q2[2] = {wr[it + cw], wr[it + 4 + cw]};
+    float2 sf[2];
     if (F == 0) {
-      const uint sv = ((device const ushort*)(sc + (ulong)n * (a.K / 16)))[it + cw];
-      const float s0 = e4m3(sv & 0xFFu) * kFp4Unscale, s1 = e4m3(sv >> 8) * kFp4Unscale;
-      for (uint t = 0; t < 16; ++t) wv[t] = half2(fp4x2(q[t / 4] >> (8 * (t % 4))) * (t < 8 ? s0 : s1));
+      device const ushort* sp = (device const ushort*)(sc + (ulong)n * (a.K / 16));
+      for (uint h = 0; h < 2; ++h) {
+        const uint sv = sp[it + 4 * h + cw];
+        sf[h] = float2(e4m3(sv & 0xFFu), e4m3(sv >> 8)) * kFp4Unscale;
+      }
     } else {
-      const float2 cb = float2(((device const half2*)(sc + (ulong)n * (a.K / 64) * 4))[(it + cw) >> 1]);
-      for (uint t = 0; t < 16; ++t) wv[t] = half2(float2(q4x2(q[t / 4], t % 4)) * cb.x + cb.y);
+      device const half2* sp = (device const half2*)(sc + (ulong)n * (a.K / 64) * 4);
+      for (uint h = 0; h < 2; ++h) sf[h] = float2(sp[(it + 4 * h + cw) >> 1]);
     }
-    device const half2* xr = xp + (((it + cx) * 2 + ex) * 4 + rp) * 16;
-    for (uint t = 0; t < 16; ++t) {
-      simdgroup_half8x8 A, B;
-      const half2 xv = xr[t];
-      A.thread_elements()[0] = wv[t].x;
-      A.thread_elements()[1] = wv[t].y;
-      B.thread_elements()[0] = xv.x;
-      B.thread_elements()[1] = xv.y;
-      simdgroup_multiply_accumulate(acc, A, B, acc);
+    device const uint4* xr = (device const uint4*)xp + it * 32 + (cx * 2 + ex) * 4 + rp;
+    uint4 xq[8];
+    for (uint j = 0; j < 8; ++j) xq[j] = xr[j * 32];
+    for (uint h = 0; h < 2; ++h) {
+      const uint4 q = q2[h];
+      half2 wv[16];
+      if (F == 0) {
+        for (uint t = 0; t < 16; ++t) wv[t] = half2(fp4x2(q[t / 4] >> (8 * (t % 4))) * (t < 8 ? sf[h].x : sf[h].y));
+      } else {
+        const half2 sc2 = half2(sf[h].x), bi2 = half2(sf[h].y);
+        for (uint t = 0; t < 16; ++t) wv[t] = q4x2(q[t / 4], t % 4) * sc2 + bi2;
+      }
+      for (uint t = 0; t < 16; ++t) {
+        simdgroup_half8x8 A, B;
+        const half2 xv = as_type<half2>(xq[4 * h + t / 4][t % 4]);
+        A.thread_elements()[0] = wv[t].x;
+        A.thread_elements()[1] = wv[t].y;
+        B.thread_elements()[0] = xv.x;
+        B.thread_elements()[1] = xv.y;
+        simdgroup_multiply_accumulate(acc, A, B, acc);
+      }
     }
   }
   const uint nn = n0 + fm;

@@ -131,6 +131,7 @@ class Model {
   // store, silu_mul; pm[5] = the other work queued before each matmul (these seconds are then missing from
   // prof[0..3]). RAGON_METAL_PROF=4 also syncs around each GEMV (decode): pm[2] = the GEMVs, pm[5] = the rest.
   double pm[6] = {0, 0, 0, 0, 0, 0};
+  double dpm[5] = {0, 0, 0, 0, 0};  // RAGON_METAL_PROF=5: draft-step sections (speculate)
 
  private:
   // y[T][N] (=|+=) x[T][K] W^T: GEMV kernels for decode and short chunks, tensor-op matmul for T >= mm_min_.
@@ -184,6 +185,7 @@ class Model {
   bool attn_gqa_ = true;
   int mq_nch_ = 32;  // verify attention key chunks (RAGON_METAL_MQ_NCH, 0: the decode kernel per row)
   bool g8_ = true;  // the simdgroup-matrix GEMV for 2..8 rows (gemv8)
+  uint32_t g8_min_n_ = 0;  // gemv8 only for N at least this (RAGON_METAL_G8_MIN_N); smaller N take the row GEMV
   View xp8_;
   size_t xp8_cap_ = 0;
   const void* xp8_buf_ = nullptr;  // what xp8_ holds: x's buffer, offset, K, T, ldx
