@@ -277,6 +277,9 @@ void Model::load(Queue& q, const std::string& dir, int max_ctx, int chunk) {
   xn_ = q.alloc(C * hidden_ * 4);
   fxw_ = q.alloc(hidden_ * 4);
   fpart_ = q.alloc(hidden_ / 8 * 4);
+  g8_ = !std::getenv("RAGON_METAL_G8_OFF");
+  xp8_cap_ = size_t(std::max({hidden_, ffn_, H_ * D_, 8192})) * 16;
+  xp8_ = q.alloc(xp8_cap_);
   qkv_ = q.alloc(C * std::max(conv_w, size_t(H_) * 2 * D_) * 4);
   zb_ = q.alloc(C * Hv_ * Dv_ * 4);
   ab_ = q.alloc(C * Hv_ * 4);
@@ -475,6 +478,30 @@ void Model::gemv(const Lin& l, View x, View y, int T, int ldx, int ldy, bool add
     [e setBytes:f length:8 atIndex:3];
     [q_->pre(e) dispatchThreads:MTLSizeMake(l.N, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     e = pm_sync(e, 3);
+    return;
+  }
+  if (g8_ && T >= 2 && T <= 8 && (l.fmt == Lin::kNvfp4 || l.fmt == Lin::kQ4) && l.K % 128 == 0 &&
+      size_t(l.K) * 16 <= xp8_cap_) {
+    // the verify rows: x packed as half pairs, then the simdgroup-matrix GEMV (gemv8 in kernels.metal)
+    const bool have = xp8_buf_ == (__bridge const void*)x.buf && xp8_off_ == x.off && xp8_k_ == l.K &&
+                      xp8_t_ == uint32_t(T) && xp8_ld_ == uint32_t(ldx) && reuse_x;
+    if (!have) {
+      const uint32_t pa[4] = {l.K, uint32_t(T), uint32_t(ldx), 0};
+      [e setComputePipelineState:q_->pipe("x_pack8")];
+      bind(e, {x, xp8_});
+      [e setBytes:pa length:16 atIndex:2];
+      [q_->pre(e) dispatchThreads:MTLSizeMake(l.K, 4, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      xp8_buf_ = (__bridge const void*)x.buf;
+      xp8_off_ = x.off;
+      xp8_k_ = l.K;
+      xp8_t_ = uint32_t(T);
+      xp8_ld_ = uint32_t(ldx);
+    }
+    GemvArgs a{l.N, l.K, uint32_t(ldx), uint32_t(ldy), uint32_t(T), l.scale, add ? 1u : 0u, eps_, 0};
+    [e setComputePipelineState:q_->pipe(l.fmt == Lin::kQ4 ? "gemv8_q4" : "gemv8_nvfp4")];
+    bind(e, {xp8_, l.w, l.sc, y});
+    bind_args(e, 4, a);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake((l.N + 63) / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     return;
   }
   const char* k = l.fmt == Lin::kNvfp4 ? "gemv_nvfp4"

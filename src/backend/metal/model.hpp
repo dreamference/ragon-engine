@@ -132,6 +132,12 @@ class Model {
   int H_ = 0, KV_ = 0, D_ = 0, Hk_ = 0, Hv_ = 0, Dk_ = 0, Dv_ = 0, hidden_ = 0, ffn_ = 0, V_ = 0, rot_ = 0;
   int max_ctx_ = 0, C_ = 0, nchunk_max_ = 32, mm_min_ = 64;
   bool attn_gqa_ = true;
+  bool g8_ = true;  // the simdgroup-matrix GEMV for 2..8 rows (gemv8)
+  View xp8_;
+  size_t xp8_cap_ = 0;
+  const void* xp8_buf_ = nullptr;  // what xp8_ holds: x's buffer, offset, K, T, ldx
+  size_t xp8_off_ = 0;
+  uint32_t xp8_k_ = 0, xp8_t_ = 0, xp8_ld_ = 0;
   bool mm_old_ = false;  // RAGON_METAL_MM_OLD=1: the lane 2 prefill matmul (64x64 tiles, separate store pass)
   const void* xh_buf_ = nullptr;  // what xh_ holds: x's buffer, offset, K, T, ldx
   size_t xh_off_ = 0;

@@ -184,6 +184,7 @@ int main(int argc, char** argv) {
     std::string model, prompts_file, check_file, greedy_out, dump_dir, teacher_file;
     std::vector<std::vector<uint32_t>> prompts;
     int max_tokens = 256, ctx = 40960, chunk = 128, teacher_chunk = 0;
+    bool step_curve = false;
     bool ban_eos = false, stdio = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -207,6 +208,7 @@ int main(int argc, char** argv) {
       else if (a == "--chunk") chunk = std::stoi(next());
       else if (a == "--ban-eos") ban_eos = true;
       else if (a == "--stdio") stdio = true;
+      else if (a == "--step-curve") step_curve = true;
       else {
         std::fprintf(stderr, "unknown argument %s\n", a.c_str());
         return 2;
@@ -241,6 +243,36 @@ int main(int argc, char** argv) {
       });
       write_npy(dump_dir + "/logits.npy", m.logits(), {int64_t(ids.size()), m.vocab()});
       std::fprintf(stderr, "dumped to %s\n", dump_dir.c_str());
+      return 0;
+    }
+
+    if (step_curve) {
+      // The cost of a T-row forward with every row's logits (a speculative verify) after each prompt, T = 1..16:
+      // five runs each at the same position (the rows' KV is overwritten), the median printed.
+      for (size_t p = 0; p < prompts.size(); ++p) {
+        const std::vector<uint32_t>& pr = prompts[p];
+        const int P = int(pr.size());
+        m.reset();
+        m.prefill(pr.data(), P);
+        std::vector<uint32_t> rows(pr.begin(), pr.begin() + 64);
+        for (int T : {1, 2, 4, 8, 12, 16, 32, 64}) {
+          std::vector<double> ts;
+          std::fill(m.prof, m.prof + 5, 0.0);
+          std::fill(m.pm, m.pm + 6, 0.0);
+          for (int k = 0; k < 6; ++k) {
+            const double t0 = now();
+            m.forward(rows.data(), T, P, true);
+            if (k) ts.push_back(now() - t0);
+          }
+          std::sort(ts.begin(), ts.end());
+          std::printf("prompt %zu: pos %d, T %d: %.2f ms (min %.2f)\n", p, P, T, 1e3 * ts[ts.size() / 2], 1e3 * ts[0]);
+          if (std::getenv("RAGON_METAL_PROF"))
+            std::printf("  GPU ms a pass: attention %.2f, GDN %.2f (recurrence %.2f), MLP %.2f, head %.2f; gemv %.2f rest %.2f\n",
+                        1e3 * m.prof[0] / 6, 1e3 * m.prof[1] / 6, 1e3 * m.prof[4] / 6, 1e3 * m.prof[2] / 6,
+                        1e3 * m.prof[3] / 6, 1e3 * m.pm[2] / 6, 1e3 * m.pm[5] / 6);
+          std::fflush(stdout);
+        }
+      }
       return 0;
     }
 

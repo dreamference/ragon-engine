@@ -229,6 +229,75 @@ kernel void dq_q4(device const uchar* w [[buffer(0)]], device const uchar* sb [[
     for (uint j = 0; j < 4; ++j) o[k * 4 + j] = half2(float2(q4x2(q[k], j)) * cb.x + cb.y);
 }
 
+// ---- Small-T GEMV (2..8 activation rows, the speculative verify) on the simdgroup matrix units ----------------
+// The weights are decoded once into the 8x8 A fragments of a simdgroup that owns 8 output rows; each 8x8x8 MMA
+// takes 8 k values of 8 output rows against those k of the 8 activation rows, so the per-row cost is one MMA, not a
+// pass of FMAs over decoded values. Fragment coordinates (lane -> row fm, columns fn, fn+1) follow the Apple layout.
+// k order: the sum runs over k, so a lane's fragment pairs take a contiguous run of its row's weights; tile t of
+// step s covers k = 32 (s + i/2) + 2t + i%2 for k-index i. x_pack8 lays x out to match: half2 pairs of activation
+// rows (2rp, 2rp+1) at ((s*2 + e)*4 + rp)*16 + t for k = 32s + 2t + e, rows >= T zero.
+kernel void x_pack8(device const float* x [[buffer(0)]], device half2* xp [[buffer(1)]],
+                    constant uint4& a [[buffer(2)]], uint2 id [[thread_position_in_grid]]) {  // a: K, T, ldx
+  const uint k = id.x, rp = id.y;
+  if (k >= a.x) return;
+  const uint r0 = 2 * rp, r1 = r0 + 1;
+  const float v0 = r0 < a.y ? x[(ulong)r0 * a.z + k] : 0.0f;
+  const float v1 = r1 < a.y ? x[(ulong)r1 * a.z + k] : 0.0f;
+  const uint s = k >> 5, t = (k & 31u) >> 1, e = k & 1u;
+  xp[((s * 2 + e) * 4 + rp) * 16 + t] = half2(clamp(float2(v0, v1), -65504.0f, 65504.0f));
+}
+
+template <uint F>  // 0: NVFP4, 1: Q4
+kernel void gemv8(device const half2* xp [[buffer(0)]], device const uchar* w [[buffer(1)]],
+                  device const uchar* sc [[buffer(2)]], device float* y [[buffer(3)]],
+                  constant GemvArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                  uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const uint n0 = (tg.x * 8 + sg) * 8;
+  if (n0 >= a.N) return;
+  const uint qid = lane / 4;
+  const uint fm = (qid & 4u) + ((lane / 2) % 4), fn = (qid & 2u) * 2 + (lane % 2) * 2;
+  const uint n = min(n0 + fm, a.N - 1);
+  device const uint4* wr = (device const uint4*)(w + (ulong)n * (a.K / 2));
+  const uint cw = fn / 2, cx = fm / 2, ex = fm & 1u, rp = fn / 2;
+  simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  const uint steps = a.K / 32;
+  for (uint it = 0; it < steps; it += 4) {
+    const uint4 q = wr[it + cw];
+    half2 wv[16];
+    if (F == 0) {
+      const uint sv = ((device const ushort*)(sc + (ulong)n * (a.K / 16)))[it + cw];
+      const float s0 = e4m3(sv & 0xFFu) * kFp4Unscale, s1 = e4m3(sv >> 8) * kFp4Unscale;
+      for (uint t = 0; t < 16; ++t) wv[t] = half2(fp4x2(q[t / 4] >> (8 * (t % 4))) * (t < 8 ? s0 : s1));
+    } else {
+      const float2 cb = float2(((device const half2*)(sc + (ulong)n * (a.K / 64) * 4))[(it + cw) >> 1]);
+      for (uint t = 0; t < 16; ++t) wv[t] = half2(float2(q4x2(q[t / 4], t % 4)) * cb.x + cb.y);
+    }
+    device const half2* xr = xp + (((it + cx) * 2 + ex) * 4 + rp) * 16;
+    for (uint t = 0; t < 16; ++t) {
+      simdgroup_half8x8 A, B;
+      const half2 xv = xr[t];
+      A.thread_elements()[0] = wv[t].x;
+      A.thread_elements()[1] = wv[t].y;
+      B.thread_elements()[0] = xv.x;
+      B.thread_elements()[1] = xv.y;
+      simdgroup_multiply_accumulate(acc, A, B, acc);
+    }
+  }
+  const uint nn = n0 + fm;
+  if (nn >= a.N) return;
+  const float c[2] = {acc.thread_elements()[0] * a.scale, acc.thread_elements()[1] * a.scale};
+  for (uint e = 0; e < 2; ++e) {
+    const uint r = fn + e;
+    if (r >= a.rows) continue;
+    device float* p = y + (ulong)r * a.ldy + nn;
+    *p = a.add ? *p + c[e] : c[e];
+  }
+}
+template [[host_name("gemv8_nvfp4")]] kernel void gemv8<0>(device const half2*, device const uchar*, device const uchar*,
+                                                          device float*, constant GemvArgs&, uint2, uint, uint);
+template [[host_name("gemv8_q4")]] kernel void gemv8<1>(device const half2*, device const uchar*, device const uchar*,
+                                                       device float*, constant GemvArgs&, uint2, uint, uint);
+
 // FP8 [N][K] -> Q4: one thread per group of 64 values. Searches a shrunken [min, max] range for the least squared
 // error, refines (scale, bias) by least squares on the chosen codes, and quantizes with the half-rounded pair.
 kernel void q4_quant(device const uchar* src [[buffer(0)]], device uchar* w [[buffer(1)]],
