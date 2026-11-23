@@ -11,7 +11,9 @@
 // - one engine thread runs one request at a time (the Metal model holds one sequence). The sequence stays in the
 //   model between requests: a prompt that extends it (an agent's next turn) feeds only the new tokens; any other
 //   prompt starts over (the recurrent state cannot be rewound).
-// - greedy on the CPU pick at temperature 0, else the serve's sampler (core/sampling.hpp) on the host logits.
+// - plain greedy (temperature 0, no penalties) runs the GPU pick loop, two steps in flight (Model::greedy_step);
+//   RAGON_METAL_SERVE_HOST_LOOP=1 forces the host loop. Otherwise the serve's sampler (core/sampling.hpp) on
+//   the host logits.
 // - the HTTP layer is plain POSIX sockets, HTTP/1.1, one thread a connection, `Connection: close`. The engine
 //   thread never writes to a socket: it appends to the request's outbox, which the connection thread drains, so a
 //   slow client never stalls decoding; a failed write cancels the request.
@@ -31,6 +33,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -274,7 +277,7 @@ class Engine {
     }
     if (banned_.empty()) return ragon::sample_logits(std::span<const float>(lg, size_t(V)), sp, out, rng);
     row_.assign(lg, lg + V);
-    for (int b : banned_) row_[size_t(b)] = -INFINITY;
+    for (int b : banned_) row_[size_t(b)] = -1e30f;  // finite: the sampler refuses non-finite logits
     return ragon::sample_logits(row_, sp, out, rng);
   }
 
@@ -314,15 +317,16 @@ class Engine {
     int newlines_after_think = 0, reasoning = 0, produced = 0;
     const double td = now_s();
     int steps = 0;
-    for (;;) {
-      const int t = pick(out, req.sampling, rng);
+    // accept(t): one produced token through the stop ids, the think accounting, the stop strings and the
+    // repetition detector; false ends the request (finish says why).
+    auto accept = [&](int t) -> bool {
       if (j.cancelled->load()) {
         finish = "cancelled";
-        break;
+        return false;
       }
       if (std::find(stop_ids_.begin(), stop_ids_.end(), t) != stop_ids_.end()) {
         finish = "stop";
-        break;
+        return false;
       }
       ++produced;
       out.push_back(t);
@@ -347,17 +351,67 @@ class Engine {
       if (!ready.empty()) j.sink.text(ready);
       if (stops.stopped()) {
         finish = "stop";
-        break;
+        return false;
       }
       if (repeat && repeat->push(t)) {
         finish = "repetition";
-        break;
+        return false;
       }
-      if (produced >= limit) break;
-      const uint32_t u = uint32_t(t);
-      m_.forward(&u, 1, int(fed_.size()), false);
-      fed_.push_back(u);
-      ++steps;
+      return produced < limit;
+    };
+    const SamplingParams& spm = req.sampling;
+    const bool gpu_greedy = spm.temperature <= 0.f && spm.presence_penalty == 0.f && spm.repetition_penalty == 1.f &&
+                            banned_.size() <= 8 && !std::getenv("RAGON_METAL_SERVE_HOST_LOOP");
+    int t = pick(out, spm, rng);
+    if (gpu_greedy) {
+      // The GPU picks each next id itself (Model::greedy_step), two steps in flight: step k feeds the token
+      // produced last at position fed_.size() and leaves the next id in greedy_out(k). The host handles token k
+      // while step k+1 runs, and encodes step k+2 only once token k is accepted, so a stop leaves exactly one step
+      // in flight; that step's input (the stopping token) is then part of the model's sequence, and fed_ says so.
+      if (accept(t)) {
+        const int base = int(fed_.size());
+        const int nsteps = limit - produced;  // step k produces token produced+k+1
+        m_.greedy_begin(uint32_t(t), banned_, nsteps);
+        int enq = 0;
+        auto enqueue = [&] {
+          m_.greedy_step(base + enq);
+          ++enq;
+        };
+        enqueue();
+        if (nsteps > 1) enqueue();
+        uint32_t fed_tok = uint32_t(t);  // the input of the oldest unfinished step
+        for (int k = 0;; ++k) {
+          m_.greedy_wait(k);
+          fed_.push_back(fed_tok);
+          ++steps;
+          const uint32_t* o = m_.greedy_out(k);
+          const float top = std::bit_cast<float>(o[1]);
+          if (!std::isfinite(top)) {
+            if (enq > k + 1) m_.greedy_wait(k + 1);
+            fed_.clear();
+            throw ragon::NonFiniteLogits();
+          }
+          t = int(o[0]);
+          fed_tok = uint32_t(t);
+          const bool more = accept(t);
+          if (!more) {
+            if (enq > k + 1) {  // the step that took t as its input
+              m_.greedy_wait(k + 1);
+              fed_.push_back(fed_tok);
+            }
+            break;
+          }
+          if (enq < nsteps) enqueue();
+        }
+      }
+    } else {
+      while (accept(t)) {
+        const uint32_t u = uint32_t(t);
+        m_.forward(&u, 1, int(fed_.size()), false);
+        fed_.push_back(u);
+        ++steps;
+        t = pick(out, spm, rng);
+      }
     }
     const double decode_s = now_s() - td;
     if (finish == "cancelled") {
