@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -107,10 +108,19 @@ class Model {
   // tokens (the last is the next anchor, not fed); returns n, or -1 when a verify row's top logit is not finite.
   // The accepted rows' GDN state and drafter context are committed into the command buffer that the next GPU work
   // (the next step, or any forward) runs first.
+  // With sampling set, the step samples instead: each drafted token is drawn from the selector's softmax over its
+  // 16 candidates at the request's temperature, and the chain is accepted by the standard rule against the target's
+  // distribution from each row's top-k logits (core/accept.hpp), so the tokens are distributed as plain sampling.
+  struct SpecSampling {
+    float temperature = 1.f, top_p = 1.f, min_p = 0.f;
+    int top_k = 20;  // 1..64
+    std::mt19937_64* rng = nullptr;
+  };
   void draft_load(const std::string& dir);
   bool has_draft() const { return !dl_.empty(); }
   int draft_block() const { return dblock_; }
-  int speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out);
+  int speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out,
+                const SpecSampling* sampling = nullptr);
   double spec_s[3] = {0, 0, 0};  // host seconds in the draft, the verify and the accept (commit encoding included)
   long spec_steps = 0, spec_tokens = 0;
   // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head;

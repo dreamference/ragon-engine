@@ -221,8 +221,8 @@ struct Specials {
 
 class Engine {
  public:
-  Engine(Model& m, const Tokenizer& tok, Specials sp, int max_ctx, int chunk, bool ignore_eos)
-      : m_(m), tok_(tok), sp_(sp), max_ctx_(max_ctx), chunk_(chunk) {
+  Engine(Model& m, const Tokenizer& tok, Specials sp, int max_ctx, int chunk, bool ignore_eos, int spec_block)
+      : m_(m), tok_(tok), sp_(sp), max_ctx_(max_ctx), chunk_(chunk), spec_block_(m.has_draft() ? spec_block : 0) {
     stop_ids_ = m.eos_ids;
     if (sp.im_end >= 0 && std::find(stop_ids_.begin(), stop_ids_.end(), sp.im_end) == stop_ids_.end())
       stop_ids_.push_back(sp.im_end);
@@ -363,7 +363,50 @@ class Engine {
     const bool gpu_greedy = spm.temperature <= 0.f && spm.presence_penalty == 0.f && spm.repetition_penalty == 1.f &&
                             banned_.size() <= 8 && !std::getenv("RAGON_METAL_SERVE_HOST_LOOP");
     int t = pick(out, spm, rng);
-    if (gpu_greedy) {
+    long spec_steps0 = m_.spec_steps, spec_tokens0 = m_.spec_tokens;
+    // Speculation as core's can_speculate allows it: no penalties (they need the whole vocabulary), and greedy or
+    // a top-k of at most 64 (the accept step builds the target's distribution from each row's top-k logits).
+    const bool spec = spec_block_ > 0 && spm.presence_penalty == 0.f && spm.repetition_penalty == 1.f &&
+                      banned_.size() <= 8 && (spm.temperature <= 0.f || (spm.top_k > 0 && spm.top_k <= 64));
+    Model::SpecSampling smp;
+    smp.temperature = spm.temperature;
+    smp.top_p = spm.top_p;
+    smp.min_p = spm.min_p;
+    smp.top_k = spm.top_k;
+    smp.rng = &rng;
+    const Model::SpecSampling* sampled = spm.temperature > 0.f ? &smp : nullptr;
+    if (spec) {
+      // Speculative decode: the drafter drafts spec_block_ rows from the last token, the target verifies them in
+      // one forward; greedy keeps the longest matching prefix plus the target's own next token (the same ids as
+      // plain greedy decode), sampling accepts by the standard rule (Model::speculate). The accepted inputs are committed, so fed_ holds every row the model
+      // has taken, including drafted rows past a stop.
+      uint32_t buf[16];
+      bool more = accept(t);
+      while (more) {
+        const int pos = int(fed_.size());
+        if (pos + spec_block_ > max_ctx_) {  // no room for a whole block: one plain step
+          const uint32_t u = uint32_t(t);
+          m_.forward(&u, 1, pos, false);
+          fed_.push_back(u);
+          ++steps;
+          t = pick(out, spm, rng);
+          more = accept(t);
+          continue;
+        }
+        const int n = m_.speculate(uint32_t(t), pos, spec_block_, banned_, buf, sampled);
+        if (n < 0) {
+          fed_.clear();
+          throw ragon::NonFiniteLogits();
+        }
+        fed_.push_back(uint32_t(t));
+        for (int i = 0; i + 1 < n; ++i) fed_.push_back(buf[i]);
+        ++steps;
+        for (int i = 0; i < n && more; ++i) {
+          t = int(buf[i]);
+          more = accept(t);
+        }
+      }
+    } else if (gpu_greedy) {
       // The GPU picks each next id itself (Model::greedy_step), two steps in flight: step k feeds the token
       // produced last at position fed_.size() and leaves the next id in greedy_out(k). The host handles token k
       // while step k+1 runs, and encodes step k+2 only once token k is accepted, so a stop leaves exactly one step
@@ -423,11 +466,16 @@ class Engine {
       if (!stops.stopped()) rest += stops.finish();
       if (!rest.empty()) j.sink.text(rest);
     }
+    char spec_note[96] = "";
+    if (const long ns = m_.spec_steps - spec_steps0; ns > 0)
+      std::snprintf(spec_note, sizeof spec_note, " (speculative: %.2f tokens a step)",
+                    double(m_.spec_tokens - spec_tokens0) / double(ns));
     std::fprintf(stderr,
-                 "[%s] prompt %d reused %zu prefill %d tok in %.3f s (%.0f tok/s) | out %d (reasoning %d) steps %d in "
+                 "[%s] prompt %d reused %zu prefill %d tok in %.3f s (%.0f tok/s) | out %d (reasoning %d) steps %d%s in "
                  "%.3f s = %.2f tok/s | finish %s\n",
                  j.route.c_str(), P, reuse, P - int(reuse), prefill_s, prefill_s > 0 ? (P - reuse) / prefill_s : 0.0,
-                 produced, reasoning, steps, decode_s, steps > 0 ? steps / decode_s : 0.0, finish.c_str());
+                 produced, reasoning, steps, spec_note, decode_s, produced > 0 ? produced / decode_s : 0.0,
+                 finish.c_str());
     std::fflush(stderr);
     j.sink.done(finish, P, produced, int(reuse), reasoning);
   }
@@ -435,7 +483,7 @@ class Engine {
   Model& m_;
   const Tokenizer& tok_;
   Specials sp_;
-  int max_ctx_, chunk_;
+  int max_ctx_, chunk_, spec_block_;
   std::vector<int> stop_ids_, banned_;
   std::vector<uint32_t> fed_;  // the sequence in the model (prompt and the tokens fed after it)
   std::vector<float> row_;
@@ -739,11 +787,14 @@ void handle(Server& S, int fd) {
   write_all(fd, json_response(404, error_body("no route " + hr.method + " " + hr.path, "invalid_request_error")));
 }
 
+constexpr int kSpecBlock = 8;  // the draft block on the M5 Max (lane 7 sweep)
+
 int usage() {
   std::fprintf(stderr,
                "usage: ragon-serve --model DIR [--host 127.0.0.1] [--port 8000] [--served-model-name NAME] "
                "[--max-context N] [--chunk C] [--keepalive-seconds N] [--repetition-detection P,p,R,K|off] "
-               "[--repetition-report incomplete|completed] [--api-key KEY] [--pretokenizer production|checkpoint]\n");
+               "[--repetition-report incomplete|completed] [--api-key KEY] [--pretokenizer production|checkpoint] "
+               "[--draft DIR [--spec-block N] [--sparse-head-dir DIR]]\n");
   return 2;
 }
 
@@ -753,7 +804,8 @@ int main(int argc, char** argv) {
   @autoreleasepool {
     std::string model_dir, host = "127.0.0.1", name, pretokenizer = "production", repetition_arg, report = "incomplete";
     std::string api_key = std::getenv("RAGON_API_KEY") ? std::getenv("RAGON_API_KEY") : "";
-    int port = 8000, max_ctx = 65536, chunk = 2048, keepalive_s = 15;
+    std::string draft_dir, sparse_head_dir;
+    int port = 8000, max_ctx = 65536, chunk = 2048, keepalive_s = 15, spec_block = 0;
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
       auto next = [&]() -> std::string {
@@ -774,6 +826,9 @@ int main(int argc, char** argv) {
       else if (a == "--repetition-report") report = next();
       else if (a == "--api-key") api_key = next();
       else if (a == "--pretokenizer") pretokenizer = next();
+      else if (a == "--draft") draft_dir = next();
+      else if (a == "--spec-block") spec_block = std::atoi(next().c_str());
+      else if (a == "--sparse-head-dir") sparse_head_dir = next();
       else return usage();
     }
     if (model_dir.empty() || max_ctx < 2 || chunk < 1 || (report != "incomplete" && report != "completed") ||
@@ -817,7 +872,16 @@ int main(int argc, char** argv) {
     const bool ignore_eos = ie && std::atoi(ie) == 1;
     std::fprintf(stderr, "metal serve: %s loaded in %.1f s, max context %d, chunk %d%s\n", name.c_str(), now_s() - t0,
                  max_ctx, chunk, ignore_eos ? ", END TOKENS BANNED (RAGON_METAL_IGNORE_EOS=1)" : "");
-    Engine engine(m, tok, sp, max_ctx, chunk, ignore_eos);
+    if (!draft_dir.empty()) {
+      m.draft_load(draft_dir);
+      if (spec_block <= 0) spec_block = kSpecBlock;
+      spec_block = std::min(spec_block, m.draft_block());
+      // The sparse head (a top-k candidate head over the target's LM head) is not ported to Metal yet: the
+      // drafter scores the full vocabulary, and the log says so rather than claiming the production head.
+      std::fprintf(stderr, "metal serve: drafter %s, block %d, drafter head: dense%s\n", draft_dir.c_str(), spec_block,
+                   sparse_head_dir.empty() ? "" : " (--sparse-head-dir given; the sparse head is not used on Metal yet)");
+    }
+    Engine engine(m, tok, sp, max_ctx, chunk, ignore_eos, spec_block);
     S.engine = &engine;
 
     signal(SIGPIPE, SIG_IGN);

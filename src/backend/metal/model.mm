@@ -1,5 +1,9 @@
 #include "backend/metal/model.hpp"
 
+#include <dispatch/dispatch.h>
+
+#include "core/accept.hpp"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1353,7 +1357,73 @@ void Model::commit(int n, int pos0) {
   q_->flush();  // the GPU starts the commit while the host prepares the next draft
 }
 
-int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out) {
+namespace {
+// The target's sampling distribution for one row from its top-k logits (descending): temperature, top-p, min-p,
+// as core's speculative path builds it (target_dist in core/speculate.cpp).
+Dist row_dist(const float* vals, const int* ids, int k, const Model::SpecSampling& p) {
+  std::vector<double> probs(static_cast<size_t>(k));
+  double sum = 0;
+  for (int i = 0; i < k; ++i) sum += probs[size_t(i)] = std::exp((double(vals[i]) - vals[0]) / p.temperature);
+  for (double& pr : probs) pr /= sum;
+  int keep = k;
+  if (p.top_p < 1.f) {
+    double cum = 0;
+    for (int i = 0; i < k; ++i) {
+      cum += probs[size_t(i)];
+      if (cum >= p.top_p) {
+        keep = i + 1;
+        break;
+      }
+    }
+  }
+  if (p.min_p > 0.f) {
+    const double floor = probs[0] * p.min_p;
+    int n = 0;
+    while (n < keep && probs[size_t(n)] >= floor) ++n;
+    keep = std::max(n, 1);
+  }
+  double kept = 0;
+  for (int i = 0; i < keep; ++i) kept += probs[size_t(i)];
+  Dist d(static_cast<size_t>(keep));
+  for (int i = 0; i < keep; ++i) d[size_t(i)] = {ids[i], probs[size_t(i)] / kept};
+  return d;
+}
+
+// The k largest logits of a row (descending) and their ids, banned ids left out; false when one is not finite.
+bool row_topk(const float* lg, int V, int k, const std::vector<int>& banned, float* vals, int* ids) {
+  int n = 0;  // vals[0..n) ascending while scanning
+  for (int i = 0; i < V; ++i) {
+    const float x = lg[i];
+    if (n == k && !(x > vals[0])) continue;
+    if (!banned.empty() && std::find(banned.begin(), banned.end(), i) != banned.end()) continue;
+    int j = n < k ? n++ : 0;
+    if (n == k && j == 0) {  // drop the smallest, sift x up
+      while (j + 1 < k && vals[j + 1] < x) {
+        vals[j] = vals[j + 1];
+        ids[j] = ids[j + 1];
+        ++j;
+      }
+    } else {
+      while (j > 0 && vals[j - 1] > x) {
+        vals[j] = vals[j - 1];
+        ids[j] = ids[j - 1];
+        --j;
+      }
+    }
+    vals[j] = x;
+    ids[j] = i;
+  }
+  std::reverse(vals, vals + n);
+  std::reverse(ids, ids + n);
+  if (n < k) return false;
+  for (int i = 0; i < n; ++i)
+    if (!std::isfinite(vals[i])) return false;
+  return true;
+}
+}  // namespace
+
+int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out,
+                     const SpecSampling* smp) {
   if (!has_draft()) fail("speculate: no drafter loaded");
   if (B < 2 || B > dblock_ || B > 15 || B > vmax_) fail("speculate: block length out of range");
   if (banned.size() > 8) fail("speculate: more than 8 banned ids");
@@ -1366,12 +1436,34 @@ int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& ba
   rows[0] = anchor;
   const uint32_t* cand = dcand_.host<uint32_t>();
   const float* sc = dscores_.host<float>();
+  if (smp && (smp->top_k < 1 || smp->top_k > 64 || !smp->rng || !(smp->temperature > 0.f)))
+    fail("speculate: sampling needs 1 <= top_k <= 64, a temperature above zero and a generator");
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  double q[16][16] = {};  // q[e][c]: the draft's probability of candidate c at drafted position e
   int prev = 0;
   for (int e = 0; e < E; ++e) {
     const float* s = sc + (size_t(e) * 16 + size_t(e == 0 ? 0 : prev)) * 16;
     int pick = 0;
-    for (int c = 1; c < 16; ++c)
-      if (s[c] > s[pick]) pick = c;
+    if (!smp) {
+      for (int c = 1; c < 16; ++c)
+        if (s[c] > s[pick]) pick = c;  // ties to the lower index
+    } else {
+      const double T = std::max(double(smp->temperature), 1e-5);
+      double mx = s[0], sum = 0;
+      for (int c = 1; c < 16; ++c) mx = std::max(mx, double(s[c]));
+      for (int c = 0; c < 16; ++c) sum += q[e][c] = std::exp((s[c] - mx) / T);
+      const double u = uni(*smp->rng) * sum;
+      double cum = 0;
+      pick = 15;
+      for (int c = 0; c < 16; ++c) {
+        cum += q[e][c];
+        if (u < cum) {
+          pick = c;
+          break;
+        }
+      }
+      for (int c = 0; c < 16; ++c) q[e][c] /= sum;
+    }
     rows[e + 1] = cand[e * 16 + pick];
     prev = pick;
   }
@@ -1388,10 +1480,42 @@ int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& ba
     if (!std::isfinite(top)) return -1;
   }
   int a = 0;
-  while (a < E && rows[a + 1] == vo[size_t(a) * 3]) ++a;
+  uint32_t next = 0;
+  if (!smp) {
+    while (a < E && rows[a + 1] == vo[size_t(a) * 3]) ++a;
+    next = vo[size_t(a) * 3];
+  } else {
+    const int k = smp->top_k;
+    std::vector<float> vals(size_t(B) * size_t(k));
+    std::vector<int> ids(size_t(B) * size_t(k));
+    bool finite[16];
+    // one row per core: blocks capture by value, so the block gets plain pointers
+    const float* lg = logits_.host<float>();
+    float* vp = vals.data();
+    int* ip = ids.data();
+    bool* fp = finite;
+    const std::vector<int>* bp = &banned;
+    const int V = V_;
+    dispatch_apply(size_t(B), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t r) {
+      fp[r] = row_topk(lg + r * size_t(V), V, k, *bp, vp + r * size_t(k), ip + r * size_t(k));
+    });
+    for (int r = 0; r < B; ++r)
+      if (!finite[r]) return -1;
+    std::vector<Dist> P(static_cast<size_t>(B));
+    for (int r = 0; r < B; ++r) P[size_t(r)] = row_dist(vals.data() + size_t(r) * k, ids.data() + size_t(r) * k, k, *smp);
+    auto q_of = [&](int e, int token) {
+      double qt = 0;
+      for (int c = 0; c < 16; ++c)
+        if (int(cand[e * 16 + c]) == token) qt += q[e][c];
+      return qt;
+    };
+    const auto [acc, tok] = accept_sampled(P, std::vector<int>(rows + 1, rows + B), q_of, *smp->rng);
+    a = acc;
+    next = uint32_t(tok);
+  }
   const int n = a + 1;
   for (int i = 0; i < a; ++i) out[i] = rows[i + 1];
-  out[a] = vo[size_t(a) * 3];
+  out[a] = next;
   commit(n, pos);
   const auto t3 = clk::now();
   spec_s[0] += std::chrono::duration<double>(t1 - t0).count();

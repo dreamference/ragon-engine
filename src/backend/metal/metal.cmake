@@ -21,6 +21,7 @@ add_custom_command(
 add_library(ragon_metal STATIC
   src/backend/metal/device.mm
   src/backend/metal/model.mm
+  src/core/accept.cpp
   ${_metal_hdr})
 target_include_directories(ragon_metal PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_options(ragon_metal PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter)
