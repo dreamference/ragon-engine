@@ -108,6 +108,12 @@ bool launch_dup_wants(const char* what);
 // RAGON_LAUNCH_SKIP=a,b (a measurement that breaks the results; never for serving): launches named exactly a or b do
 // not run, so a step's time shrinks by their in-situ cost (for in-place kernels, which RAGON_LAUNCH_DUP cannot time).
 bool launch_skip_wants(const char* what);
+// RAGON_LAUNCH_HOLLOW=1|2 (a measurement that breaks the results; never for serving; launch_log_hip.cu): inside the
+// "draft" range every launch not named in RAGON_LAUNCH_HOLLOW_KEEP=a,b is replaced by an empty one-block kernel (=1,
+// the same launch count) or dropped (=2), so the draft falls to the floor of its host issue, copies, the runtime's
+// batching and the sync, plus the kept kernels.
+bool launch_hollow_wants(const char* what);
+void launch_hollow(gpu::Stream s);
 // RAGON_LAUNCH_LOG=2: not waited for, keyed by grid size too (launch_log_hip.cu); otherwise launch_log_end.
 void launch_log_end_grid(void* h, const char* what, gpu::Stream s, unsigned gx, unsigned gy);
 // RAGON_HIP_KICK_EVERY=N (an A/B switch, 0 = off; launch_log_hip.cu): every N-th launch outside a capture queries
@@ -118,6 +124,7 @@ template <typename... Params, typename... Args>
 void launch_kernel_pdl(bool /*pdl*/, const char* what, void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
                        gpu::Stream s, Args&&... args) {
   if (launch_skip_wants(what)) return;
+  if (launch_hollow_wants(what)) return launch_hollow(s);
   void* h = launch_log_enabled() && launch_log_wants(what) ? launch_log_begin(s) : nullptr;
   kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
   const hipError_t e = hipGetLastError();

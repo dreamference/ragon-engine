@@ -303,9 +303,12 @@ void sparse_head_select(const float* p, int M, const gpu::bf16* us, int N, int R
         gpu::kSuccess)
       throw std::runtime_error("sparse_head_select: compaction");
   };
-  compact();
 #if defined(RAGON_BACKEND_HIP)
+  if (launch_hollow_wants("sparse_head compaction")) launch_hollow(s);  // RAGON_LAUNCH_HOLLOW (measurement only)
+  else compact();
   if (launch_dup_wants("sparse_head compaction")) compact();  // RAGON_LAUNCH_DUP (measurement only; idempotent)
+#else
+  compact();
 #endif
   launch_kernel("sparse_head clamp", clamp_kernel, dim3(1), dim3(32), 0, s, nrows, cap);
   const gpu::Error e = gpu::last_error();

@@ -149,7 +149,38 @@ bool launch_dup_wants(const char* what) {
   return false;
 }
 
+namespace {
+int hollow_mode() {
+  static const int m = [] { const char* e = std::getenv("RAGON_LAUNCH_HOLLOW"); return e ? std::atoi(e) : 0; }();
+  return m;
+}
+std::vector<char> hollow_scope;  // per open range: is it a "draft" range
+int hollow_depth = 0;
+__global__ void hollow_kernel() {}
+}  // namespace
+
+bool launch_hollow_wants(const char* what) {
+  if (hollow_mode() == 0 || hollow_depth == 0) return false;
+  static const std::vector<std::string> keep = name_list("RAGON_LAUNCH_HOLLOW_KEEP");
+  for (const std::string& k : keep)
+    if (k == what) return false;
+  return true;
+}
+
+void launch_hollow(gpu::Stream s) {
+  if (hollow_mode() == 1) hollow_kernel<<<1, 32, 0, s>>>();
+}
+
 void launch_log_range_push(const char* name) {
+  if (hollow_mode()) {
+    // RAGON_LAUNCH_HOLLOW_AFTER=N: the first N draft ranges run for real, so the gathers after them see a real
+    // selection's row count.
+    static const int after = [] { const char* e = std::getenv("RAGON_LAUNCH_HOLLOW_AFTER"); return e ? std::atoi(e) : 0; }();
+    static int seen = 0;
+    const bool d = std::strcmp(name, "draft") == 0 && ++seen > after;
+    hollow_scope.push_back(d);
+    hollow_depth += d;
+  }
   if (!launch_log_enabled()) return;
   ranges.push_back(name);
   if (mode() == 2) {
@@ -159,6 +190,10 @@ void launch_log_range_push(const char* name) {
 }
 
 void launch_log_range_pop() {
+  if (hollow_mode() && !hollow_scope.empty()) {
+    hollow_depth -= hollow_scope.back();
+    hollow_scope.pop_back();
+  }
   if (launch_log_enabled() && !ranges.empty()) ranges.pop_back();
   if (mode() == 2) {
     std::lock_guard<std::mutex> g(q_mu);
