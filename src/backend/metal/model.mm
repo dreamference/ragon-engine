@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -41,8 +42,14 @@ static float bf16_to_f32(uint16_t v) {
 
 void Checkpoint::open(Queue& q, const std::string& dir) {
   q_ = &q;
-  NSDictionary* idx = read_json(dir + "/model.safetensors.index.json");
-  NSDictionary* wm = idx[@"weight_map"];
+  const std::string ix = dir + "/model.safetensors.index.json";
+  const bool single = ![[NSFileManager defaultManager] fileExistsAtPath:[NSString stringWithUTF8String:ix.c_str()]];
+  NSDictionary* wm = single ? @{} : read_json(ix)[@"weight_map"];
+  if (single) {  // one model.safetensors: the names come from its header
+    Shard s;
+    s.path = dir + "/model.safetensors";
+    shards_.push_back(s);
+  }
   std::map<std::string, int> file_ix;
   for (NSString* k in wm) {
     std::string f = [wm[k] UTF8String];
@@ -73,6 +80,9 @@ void Checkpoint::open(Queue& q, const std::string& dir) {
     NSError* err = nil;
     s.hdr = [NSJSONSerialization JSONObjectWithData:hd options:0 error:&err];
     if (!s.hdr) fail("bad header " + s.path);
+    if (single)
+      for (NSString* k in s.hdr)
+        if (![k isEqualToString:@"__metadata__"]) where_[[k UTF8String]] = 0;
     s.buf = [q.dev newBufferWithBytesNoCopy:(void*)s.base length:len options:MTLResourceStorageModeShared
                                 deallocator:nil];
     if (!s.buf) {  // the OS refused to wrap the mapping: copy (slower load, same result)
@@ -133,7 +143,7 @@ float Checkpoint::scalar(const std::string& name) {
 
 static const char* kPfx = "model.language_model.";
 
-Lin Model::lin(const std::string& prefix) {
+Lin Model::lin_of(Checkpoint& ck_, const std::string& prefix) {
   Lin l;
   Tensor w = ck_.get(prefix + ".weight");
   l.w = w.v;
@@ -568,7 +578,7 @@ void Model::norm(View x, View w, View z, View out, int rows, int n, int rpt, int
 }
 
 struct GdnArgs {
-  uint32_t T, Hk, Hv, Dk, Dv, ldc;
+  uint32_t T, Hk, Hv, Dk, Dv, ldc, keep;
 };
 struct GdnChunkArgs {
   uint32_t T, Hk, Hv, ldc;
@@ -587,13 +597,15 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     q_->sync();
     dump(tag + "qkv", qkv_, {T, cw});
   }
+  const size_t li = size_t(&L - layers_.data());
+  if (verify_) copy_rows(qkv_, vpre_[li], T, cw, cw, cw);  // the conv input, for the commit's replay
   id<MTLComputeCommandEncoder> e = q_->encoder();
-  const bool chunked = gdn_min_ && T >= gdn_min_;  // the chunked path runs its own conv (half output)
+  const bool chunked = !verify_ && gdn_min_ && T >= gdn_min_;  // the chunked path runs its own conv (half output)
   if (!chunked) {
     [e setComputePipelineState:q_->pipe("gdn_conv")];
     bind(e, {qkv_, L.conv_state, L.conv_w});
-    uint32_t ca[2] = {uint32_t(cw), uint32_t(T)};
-    [e setBytes:ca length:8 atIndex:3];
+    uint32_t ca[4] = {uint32_t(cw), uint32_t(T), verify_ ? 1u : 0u, 0};
+    [e setBytes:ca length:16 atIndex:3];
     [q_->pre(e) dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
   if (!chunked) q_->overlap();  // the gates do not touch the conv's buffers
@@ -602,6 +614,12 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
   uint32_t ga[2] = {uint32_t(Hv_), uint32_t(T)};
   [e setBytes:ga length:8 atIndex:4];
   [q_->pre(e) dispatchThreads:MTLSizeMake(Hv_ * T, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  if (verify_) {
+    copy_rows(ab_, vg_[li], T, Hv_, Hv_, Hv_);
+    q_->overlap();
+    copy_rows(bb_, vbeta_[li], T, Hv_, Hv_, Hv_);
+    e = q_->encoder();
+  }
   if (dump) {
     q_->sync();
     if (!chunked) dump(tag + "conv", qkv_, {T, cw});
@@ -652,7 +670,7 @@ void Model::gdn(Layer& L, int T, const Dump& dump, const std::string& tag) {
     const bool four = T >= 16;  // prefill: four state rows a simdgroup
     [e setComputePipelineState:q_->pipe(four ? "gdn_recurrent4" : "gdn_recurrent")];
     bind(e, {qkv_, ab_, bb_, L.S, core_});
-    GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw)};
+    GdnArgs g{uint32_t(T), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw), verify_ ? 1u : 0u};
     bind_args(e, 5, g);
     [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / (four ? 32 : 8), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
@@ -895,6 +913,7 @@ void Model::layer(size_t i, int T, int pos0, const Dump& dump) {
   if (fold) fold_out_ = i + 1 < layers_.size() ? layers_[i + 1].in_norm : final_norm_;
   gemv(L.down, gb_, h_, T, ffn_, hidden_, true, 0, false, h3 ? xh2_ : View{});
   fold_out_ = View{};
+  if (!feat_.empty() && feat_[i] >= 0) capture(T, pos0, i);
   if (prof_) prof[2] += q_->sync();
   if (dump) {
     q_->sync();
@@ -918,10 +937,13 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
     dump("embed", h_, {T, hidden_});
   }
   const bool flush = flush_ > 0 && T < mm_min_ && !prof_ && !dump;
+  cap_lo_ = pos0;
+  cap_hi_ = pos0 + T;
   for (size_t i = 0; i < layers_.size(); ++i) {
     layer(i, T, pos0, dump);
     if (flush && (i + 1) % size_t(flush_) == 0) q_->flush();
   }
+  if (has_draft() && !verify_) draft_materialize(T, pos0);  // verify rows: the commit writes the accepted ones
   const int r0 = all_logits ? 0 : T - 1, rows = all_logits ? T : 1;
   View hr = h_.at(size_t(r0) * hidden_ * 4);
   fold_in_ = fold_ && T == 1 && !dump;  // the last down GEMV wrote fxw_ and fpart_ with the final norm's weight
@@ -933,6 +955,20 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
   gemv(head_, xn_, logits_, rows, hidden_, V_, false);
   fold_in_ = false;
   q_->concurrent = false;  // the encoder in use keeps its kind
+  if (verify_) {  // the target's greedy pick of every row, on the GPU
+    struct {
+      uint32_t n, nb, banned[8];
+    } a{uint32_t(V_), uint32_t(gban_.size()), {}};
+    std::copy(gban_.begin(), gban_.end(), a.banned);
+    for (int r = 0; r < rows; ++r) {
+      id<MTLComputeCommandEncoder> e2 = q_->encoder();
+      [e2 setComputePipelineState:q_->pipe("top2_ban")];
+      bind(e2, {logits_.at(size_t(r) * V_ * 4), vout_.at(size_t(vmax_) * 12 + size_t(r) * 4), vout_.at(size_t(r) * 12)});
+      bind_args(e2, 3, a);
+      if (r) q_->overlap();
+      [q_->pre(e2) dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    }
+  }
   if (greedy_) {
     struct {
       uint32_t n, nb, banned[8];
@@ -1006,6 +1042,8 @@ void Model::prefill(const uint32_t* ids, int P) {
     q_->sync();
   }
   const View h0 = h_;
+  cap_lo_ = std::max(0, P - cap_rows_);  // the drafter's context: the prompt's last rows only
+  cap_hi_ = P;
   for (size_t i = 0; i < layers_.size(); ++i) {
     Layer& L = layers_[i];
     size_t off = 0;
@@ -1026,10 +1064,342 @@ void Model::prefill(const uint32_t* ids, int P) {
     q_->sync();  // one command buffer a layer
   }
   h_ = h0;
+  if (has_draft()) draft_materialize(cap_hi_ - cap_lo_, cap_lo_);
   norm(hall_.at(size_t(P - 1) * row), final_norm_, View{}, xn_, 1, hidden_, 1, hidden_, 0, hidden_, 0, 0);
   gemv(head_, xn_, logits_, 1, hidden_, V_, false);
   const double th = q_->sync();
   if (prof_) prof[3] += th;
+}
+
+
+// ---- the DFlash2 drafter ------------------------------------------------------------------------
+
+namespace {
+struct CopyArgsH {
+  uint32_t cols, lds, ldd;
+};
+struct GconvArgsH {
+  uint32_t C, groups, block, side;
+};
+struct DRopeArgsH {
+  uint32_t ld, pos0;
+  float theta, eps;
+};
+struct DStoreArgsH {
+  uint32_t w, pos0, ring;
+};
+struct DAttnArgsH {
+  uint32_t L, B, wl, ring, Hq, KV;
+};
+}  // namespace
+
+void Model::copy_rows(View src, View dst, int rows, int cols, int lds, int ldd) {
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("copy_rows")];
+  bind(e, {src, dst});
+  CopyArgsH a{uint32_t(cols), uint32_t(lds), uint32_t(ldd)};
+  bind_args(e, 2, a);
+  [q_->pre(e) dispatchThreads:MTLSizeMake(cols, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+void Model::draft_load(const std::string& dir) {
+  NSDictionary* cfg = read_json(dir + "/config.json");
+  NSDictionary* dc = cfg[@"dflash_config"];
+  if (!dc) fail("drafter: no dflash_config in " + dir + "/config.json");
+  auto I = [&](NSString* k) { return [cfg[k] intValue]; };
+  dH_ = I(@"hidden_size");
+  dI_ = I(@"intermediate_size");
+  dHq_ = I(@"num_attention_heads");
+  dKV_ = I(@"num_key_value_heads");
+  const int hd = I(@"head_dim"), nl = I(@"num_hidden_layers");
+  if (dH_ != hidden_) fail("drafter: hidden size does not match the target");
+  if (hd != 128 || dHq_ != 4 * dKV_) fail("drafter: the Metal kernels need head_dim 128 and 4 query heads a kv head");
+  if (cfg[@"sliding_window"]) dwin_ = I(@"sliding_window");
+  deps_ = [cfg[@"rms_norm_eps"] floatValue];
+  NSDictionary* rp = cfg[@"rope_parameters"];
+  dtheta_ = rp ? [rp[@"rope_theta"] floatValue] : [cfg[@"rope_theta"] floatValue];
+  dblock_ = [dc[@"block_size"] intValue];
+  dgroups_ = dH_ / [dc[@"conv_group_size"] intValue];
+  dmask_ = [dc[@"mask_token_id"] intValue];
+  if ([dc[@"conv_kernel_size"] intValue] != 2) fail("drafter: conv_kernel_size must be 2");
+  if ([dc[@"selector_top_k"] intValue] != 16 || [dc[@"selector_rank"] intValue] != 256)
+    fail("drafter: the Metal selector needs top_k 16 and rank 256");
+  NSArray* tl = dc[@"target_layer_ids"];
+  nfeat_ = int(tl.count);
+  feat_.assign(layers_.size(), -1);
+  for (int i = 0; i < nfeat_; ++i) {
+    const int li = [tl[i] intValue];
+    if (li < 0 || li >= int(layers_.size())) fail("drafter: target layer out of range");
+    feat_[size_t(li)] = i;
+  }
+  dck_.open(*q_, dir);
+  dfc_ = lin_of(dck_, "fc");
+  if (int(dfc_.K) != nfeat_ * dH_) fail("drafter: fc input does not match the target layers");
+  dsel_ = lin_of(dck_, "candidate_selector.hidden_projection");
+  dhnorm_ = dck_.f32("hidden_norm.weight");
+  dnorm_ = dck_.f32("norm.weight");
+  dpred_ = dck_.get("candidate_selector.predecessor_codebook").v;
+  dsucc_ = dck_.get("candidate_selector.successor_codebook").v;
+  cap_rows_ = std::max(C_, dwin_);
+  ring_ = cap_rows_ + 2 * vmax_;
+  const size_t kvw = size_t(dKV_) * 128;
+  for (int l = 0; l < nl; ++l) {
+    const std::string p = "layers." + std::to_string(l) + ".";
+    DraftLayer L;
+    L.in_norm = dck_.f32(p + "input_layernorm.weight");
+    L.post_norm = dck_.f32(p + "post_attention_layernorm.weight");
+    L.q_norm = dck_.f32(p + "self_attn.q_norm.weight");
+    L.k_norm = dck_.f32(p + "self_attn.k_norm.weight");
+    L.attn_base = dck_.f32(p + "attention_conv.base_kernel");
+    L.mlp_base = dck_.f32(p + "mlp_conv.base_kernel");
+    L.q = lin_of(dck_, p + "self_attn.q_proj");
+    L.k = lin_of(dck_, p + "self_attn.k_proj");
+    L.v = lin_of(dck_, p + "self_attn.v_proj");
+    L.o = lin_of(dck_, p + "self_attn.o_proj");
+    L.gate = lin_of(dck_, p + "mlp.gate_proj");
+    L.up = lin_of(dck_, p + "mlp.up_proj");
+    L.down = lin_of(dck_, p + "mlp.down_proj");
+    L.attn_kproj = lin_of(dck_, p + "attention_conv.kernel_projection");
+    L.mlp_kproj = lin_of(dck_, p + "mlp_conv.kernel_projection");
+    if (int(L.attn_kproj.N) != 4 * dgroups_) fail("drafter: kernel projection is not 2 sides x 2 taps x groups");
+    L.kc = q_->alloc(size_t(ring_) * kvw * 4);
+    L.vc = q_->alloc(size_t(ring_) * kvw * 4);
+    dl_.push_back(L);
+  }
+  const size_t B = size_t(vmax_), H = size_t(dH_);
+  cap_ = q_->alloc(size_t(cap_rows_) * nfeat_ * H * 4);
+  dctx_ = q_->alloc(size_t(cap_rows_) * H * 4);
+  dk_ = q_->alloc(size_t(cap_rows_) * kvw * 4);
+  dv_ = q_->alloc(size_t(cap_rows_) * kvw * 4);
+  dres_ = q_->alloc(B * H * 4);
+  dh_ = q_->alloc(B * H * 4);
+  dh2_ = q_->alloc(B * H * 4);
+  dout_ = q_->alloc(B * H * 4);
+  dcoef_ = q_->alloc(B * 4 * dgroups_ * 4);
+  dq_ = q_->alloc(B * dHq_ * 128 * 4);
+  dattn_ = q_->alloc(B * dHq_ * 128 * 4);
+  dg_ = q_->alloc(B * dI_ * 4);
+  du_ = q_->alloc(B * dI_ * 4);
+  dunary_ = q_->alloc(B * 16 * 4);
+  dcand_ = q_->alloc(B * 16 * 4);
+  dhp_ = q_->alloc(B * 256 * 4);
+  dscores_ = q_->alloc(B * 256 * 4);
+  dids_ = q_->alloc(B * 4);
+  vout_ = q_->alloc(B * 16);
+  vpre_.assign(layers_.size(), View{});
+  vg_.assign(layers_.size(), View{});
+  vbeta_.assign(layers_.size(), View{});
+  for (size_t i = 0; i < layers_.size(); ++i)
+    if (!layers_[i].attn) {
+      vpre_[i] = q_->alloc(B * layers_[i].qkv.N * 4);
+      vg_[i] = q_->alloc(B * Hv_ * 4);
+      vbeta_[i] = q_->alloc(B * Hv_ * 4);
+    }
+  const size_t need = size_t(std::max({dI_, dH_, dHq_ * 128})) * 16;
+  if (need > xp8_cap_) {
+    xp8_cap_ = need;
+    xp8_ = q_->alloc(xp8_cap_);
+    xp8_buf_ = nullptr;
+  }
+  std::fprintf(stderr, "metal drafter: %d layers, block %d, window %d, %d target features, %.2f GB mapped\n", nl,
+               dblock_, dwin_, nfeat_, dck_.mapped_bytes() / 1e9);
+}
+
+void Model::capture(int T, int pos0, size_t layer) {
+  const int r0 = std::max(0, cap_lo_ - pos0), r1 = std::min(T, cap_hi_ - pos0);
+  if (r1 <= r0) return;
+  const size_t H = size_t(hidden_);
+  copy_rows(h_.at(size_t(r0) * H * 4), cap_.at((size_t(pos0 + r0 - cap_lo_) * nfeat_ + size_t(feat_[layer])) * H * 4),
+            r1 - r0, hidden_, hidden_, nfeat_ * hidden_);
+}
+
+void Model::draft_materialize(int n, int pos0) {
+  if (n <= 0) return;
+  const int H = dH_, kvw = dKV_ * 128;
+  gemv(dfc_, cap_, dctx_, n, nfeat_ * H, H, false);
+  norm(dctx_, dhnorm_, View{}, dctx_, n, H, 1, H, 0, H, 0, 3);
+  for (DraftLayer& L : dl_) {
+    gemv(L.k, dctx_, dk_, n, H, kvw, false);
+    q_->overlap();
+    gemv(L.v, dctx_, dv_, n, H, kvw, false, 0, true);
+    id<MTLComputeCommandEncoder> e = q_->encoder();
+    [e setComputePipelineState:q_->pipe("draft_qk_rope")];
+    bind(e, {dk_, L.k_norm});
+    DRopeArgsH ra{uint32_t(kvw), uint32_t(pos0), dtheta_, deps_};
+    bind_args(e, 2, ra);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(dKV_, n, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [e setComputePipelineState:q_->pipe("draft_store_kv")];
+    bind(e, {dk_, dv_, L.kc, L.vc});
+    DStoreArgsH sa{uint32_t(kvw), uint32_t(pos0), uint32_t(ring_)};
+    bind_args(e, 4, sa);
+    [q_->pre(e) dispatchThreads:MTLSizeMake(kvw, n, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+}
+
+void Model::draft_forward(int B, uint32_t anchor, int pos) {
+  const int H = dH_, E = B - 1, dq = dHq_ * 128, kvw = dKV_ * 128;
+  uint32_t* ids = dids_.host<uint32_t>();
+  ids[0] = anchor;
+  for (int i = 1; i < B; ++i) ids[i] = uint32_t(dmask_);
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("embed_bf16")];
+  bind(e, {dids_, embed_, dres_});
+  const uint32_t dim = uint32_t(H);
+  [e setBytes:&dim length:4 atIndex:3];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  auto add = [&](View x, View y) {
+    id<MTLComputeCommandEncoder> e2 = q_->encoder();
+    [e2 setComputePipelineState:q_->pipe("add_rows")];
+    bind(e2, {x, y});
+    const uint32_t n = uint32_t(B * H);
+    [e2 setBytes:&n length:4 atIndex:2];
+    [q_->pre(e2) dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  };
+  auto gconv = [&](View h, View base, int side, View out) {
+    id<MTLComputeCommandEncoder> e2 = q_->encoder();
+    [e2 setComputePipelineState:q_->pipe("draft_gconv")];
+    bind(e2, {h, dcoef_, base, out});
+    GconvArgsH a{uint32_t(H), uint32_t(dgroups_), uint32_t(B), uint32_t(side)};
+    bind_args(e2, 4, a);
+    [q_->pre(e2) dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  };
+  auto rope = [&](View x, View w, int heads, int ld) {
+    id<MTLComputeCommandEncoder> e2 = q_->encoder();
+    [e2 setComputePipelineState:q_->pipe("draft_qk_rope")];
+    bind(e2, {x, w});
+    DRopeArgsH a{uint32_t(ld), uint32_t(pos), dtheta_, deps_};
+    bind_args(e2, 2, a);
+    [q_->pre(e2) dispatchThreadgroups:MTLSizeMake(heads, B, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  };
+  for (size_t l = 0; l < dl_.size(); ++l) {
+    DraftLayer& L = dl_[l];
+    if (l > 0) add(dres_, dout_);
+    norm(dres_, L.in_norm, View{}, dh_, B, H, 1, H, 0, H, 0, 3);
+    gemv(L.attn_kproj, dh_, dcoef_, B, H, 4 * dgroups_, false);
+    gconv(dh_, L.attn_base, 0, dh2_);
+    gemv(L.q, dh2_, dq_, B, H, dq, false);
+    q_->overlap();
+    gemv(L.k, dh2_, dk_, B, H, kvw, false, 0, true);
+    q_->overlap();
+    gemv(L.v, dh2_, dv_, B, H, kvw, false, 0, true);
+    rope(dq_, L.q_norm, dHq_, dq);
+    q_->overlap();
+    rope(dk_, L.k_norm, dKV_, kvw);
+    e = q_->encoder();
+    [e setComputePipelineState:q_->pipe("draft_store_kv")];
+    bind(e, {dk_, dv_, L.kc, L.vc});
+    DStoreArgsH sa{uint32_t(kvw), uint32_t(pos), uint32_t(ring_)};
+    bind_args(e, 4, sa);
+    [q_->pre(e) dispatchThreads:MTLSizeMake(kvw, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e setComputePipelineState:q_->pipe("draft_attn")];
+    bind(e, {dq_, L.kc, L.vc, dattn_});
+    DAttnArgsH aa{uint32_t(pos), uint32_t(B), uint32_t(dwin_ - 1), uint32_t(ring_), uint32_t(dHq_), uint32_t(dKV_)};
+    bind_args(e, 4, aa);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(B, dKV_, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    gemv(L.o, dattn_, dh2_, B, dq, H, false);
+    gconv(dh2_, L.attn_base, 1, dout_);
+    add(dres_, dout_);
+    norm(dres_, L.post_norm, View{}, dh_, B, H, 1, H, 0, H, 0, 3);
+    gemv(L.mlp_kproj, dh_, dcoef_, B, H, 4 * dgroups_, false);
+    gconv(dh_, L.mlp_base, 0, dh2_);
+    gemv(L.gate, dh2_, dg_, B, H, dI_, false);
+    q_->overlap();
+    gemv(L.up, dh2_, du_, B, H, dI_, false, 0, true);
+    e = q_->encoder();
+    [e setComputePipelineState:q_->pipe("silu_mul")];
+    bind(e, {dg_, du_, dg_});
+    const uint32_t ng = uint32_t(B * dI_);
+    [e setBytes:&ng length:4 atIndex:3];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(ng, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    gemv(L.down, dg_, dh2_, B, dI_, H, false);
+    gconv(dh2_, L.mlp_base, 1, dout_);
+  }
+  add(dres_, dout_);
+  norm(dres_.at(size_t(H) * 4), dnorm_, View{}, dh_, E, H, 1, H, 0, H, 0, 3);
+  gemv(head_, dh_, logits_, E, H, V_, false);
+  q_->overlap();
+  gemv(dsel_, dh_, dhp_, E, H, 256, false);
+  e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("topk16_rows")];
+  bind(e, {logits_, dunary_, dcand_});
+  const uint32_t nv = uint32_t(V_);
+  [e setBytes:&nv length:4 atIndex:3];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(E, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+  [e setComputePipelineState:q_->pipe("selector_lattice")];
+  bind(e, {dhp_, dcand_, dunary_, dpred_, dsucc_, dscores_});
+  [e setBytes:&anchor length:4 atIndex:6];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(E, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  q_->sync();
+}
+
+void Model::commit(int n, int pos0) {
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    Layer& L = layers_[i];
+    if (L.attn) continue;
+    const int cw = int(L.qkv.N);
+    id<MTLComputeCommandEncoder> e = q_->encoder();
+    [e setComputePipelineState:q_->pipe("gdn_conv")];
+    bind(e, {vpre_[i], L.conv_state, L.conv_w});
+    uint32_t ca[4] = {uint32_t(cw), uint32_t(n), 0, 0};
+    [e setBytes:ca length:16 atIndex:3];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(cw, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e setComputePipelineState:q_->pipe("gdn_recurrent")];
+    bind(e, {vpre_[i], vg_[i], vbeta_[i], L.S, core_});
+    GdnArgs g{uint32_t(n), uint32_t(Hk_), uint32_t(Hv_), uint32_t(Dk_), uint32_t(Dv_), uint32_t(cw), 0};
+    bind_args(e, 5, g);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(Hv_ * Dv_ / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+  draft_materialize(n, pos0);
+  q_->flush();  // the GPU starts the commit while the host prepares the next draft
+}
+
+int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out) {
+  if (!has_draft()) fail("speculate: no drafter loaded");
+  if (B < 2 || B > dblock_ || B > 15 || B > vmax_) fail("speculate: block length out of range");
+  if (banned.size() > 8) fail("speculate: more than 8 banned ids");
+  if (pos + B > max_ctx_) fail("speculate: context exceeds max_ctx");
+  using clk = std::chrono::steady_clock;
+  const auto t0 = clk::now();
+  draft_forward(B, anchor, pos);
+  const int E = B - 1;
+  uint32_t rows[16];
+  rows[0] = anchor;
+  const uint32_t* cand = dcand_.host<uint32_t>();
+  const float* sc = dscores_.host<float>();
+  int prev = 0;
+  for (int e = 0; e < E; ++e) {
+    const float* s = sc + (size_t(e) * 16 + size_t(e == 0 ? 0 : prev)) * 16;
+    int pick = 0;
+    for (int c = 1; c < 16; ++c)
+      if (s[c] > s[pick]) pick = c;
+    rows[e + 1] = cand[e * 16 + pick];
+    prev = pick;
+  }
+  const auto t1 = clk::now();
+  gban_.assign(banned.begin(), banned.end());
+  verify_ = true;
+  forward(rows, B, pos, true);
+  verify_ = false;
+  const auto t2 = clk::now();
+  const uint32_t* vo = vout_.host<uint32_t>();
+  for (int i = 0; i < B; ++i) {
+    float top;
+    std::memcpy(&top, vo + size_t(i) * 3 + 1, 4);
+    if (!std::isfinite(top)) return -1;
+  }
+  int a = 0;
+  while (a < E && rows[a + 1] == vo[size_t(a) * 3]) ++a;
+  const int n = a + 1;
+  for (int i = 0; i < a; ++i) out[i] = rows[i + 1];
+  out[a] = vo[size_t(a) * 3];
+  commit(n, pos);
+  const auto t3 = clk::now();
+  spec_s[0] += std::chrono::duration<double>(t1 - t0).count();
+  spec_s[1] += std::chrono::duration<double>(t2 - t1).count();
+  spec_s[2] += std::chrono::duration<double>(t3 - t2).count();
+  ++spec_steps;
+  spec_tokens += n;
+  return n;
 }
 
 }  // namespace ragon::metal

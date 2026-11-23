@@ -183,7 +183,8 @@ int main(int argc, char** argv) {
   @autoreleasepool {
     std::string model, prompts_file, check_file, greedy_out, dump_dir, teacher_file;
     std::vector<std::vector<uint32_t>> prompts;
-    int max_tokens = 256, ctx = 40960, chunk = 128, teacher_chunk = 0;
+    int max_tokens = 256, ctx = 40960, chunk = 128, teacher_chunk = 0, spec_block = 0;
+    std::string draft_dir;
     bool step_curve = false;
     bool ban_eos = false, stdio = false;
     for (int i = 1; i < argc; ++i) {
@@ -209,6 +210,8 @@ int main(int argc, char** argv) {
       else if (a == "--ban-eos") ban_eos = true;
       else if (a == "--stdio") stdio = true;
       else if (a == "--step-curve") step_curve = true;
+      else if (a == "--draft") draft_dir = next();
+      else if (a == "--spec-block") spec_block = std::stoi(next());
       else {
         std::fprintf(stderr, "unknown argument %s\n", a.c_str());
         return 2;
@@ -230,6 +233,8 @@ int main(int argc, char** argv) {
     Model m;
     const double t0 = now();
     m.load(q, model, ctx, chunk);
+    if (!draft_dir.empty()) m.draft_load(draft_dir);
+    if (!draft_dir.empty() && spec_block == 0) spec_block = m.draft_block();
     std::fprintf(stderr, "loaded in %.1f s\n", now() - t0);
     if (stdio) return serve_stdio(m, ctx, chunk);
 
@@ -351,7 +356,40 @@ int main(int argc, char** argv) {
       // Greedy on the GPU, pipelined two steps deep (RAGON_METAL_PIPE=0: the CPU picks each token). The CPU path
       // stays for the reference check (it needs the logits) and the profiles (they sync inside each step).
       const char* pe = std::getenv("RAGON_METAL_PIPE");
-      const bool pipe = !(pe && std::atoi(pe) == 0) && !ref && !std::getenv("RAGON_METAL_PROF") && max_tokens > 1;
+      const bool spec = spec_block > 0 && m.has_draft() && max_tokens > 1;
+      const bool pipe = !spec && !(pe && std::atoi(pe) == 0) && !ref && !std::getenv("RAGON_METAL_PROF") && max_tokens > 1;
+      if (spec) {
+        // speculative decode: the drafter's block of spec_block rows verified by the target in one forward
+        const Top t = top2(m.logits(), m.vocab(), banned);
+        gen.push_back(t.id);
+        std::fill(m.spec_s, m.spec_s + 3, 0.0);
+        m.spec_steps = m.spec_tokens = 0;
+        uint32_t anchor = uint32_t(t.id), buf[16];
+        int pos = P;
+        td = now();
+        while (int(gen.size()) < max_tokens) {
+          if (pos + spec_block > ctx) break;
+          const int n = m.speculate(anchor, pos, spec_block, banned, buf);
+          if (n < 0) {
+            std::fprintf(stderr, "speculate: non-finite logits at position %d\n", pos);
+            return 1;
+          }
+          for (int i = 0; i < n && int(gen.size()) < max_tokens; ++i) gen.push_back(int(buf[i]));
+          pos += n;
+          anchor = buf[n - 1];
+        }
+        if (ref)
+          for (int k = 0; k < int(gen.size()) && k < int(ref->size()); ++k)
+            if ((*ref)[k] != gen[k]) {
+              div = k;
+              div_ref = (*ref)[k];
+              break;
+            }
+        const double ns = double(std::max(1L, m.spec_steps));
+        std::fprintf(stderr, "spec B=%d: %ld steps, %.3f tokens a step; ms a step: draft %.3f, verify %.3f, accept %.3f\n",
+                     spec_block, m.spec_steps, double(m.spec_tokens) / ns, 1e3 * m.spec_s[0] / ns,
+                     1e3 * m.spec_s[1] / ns, 1e3 * m.spec_s[2] / ns);
+      }
       if (pipe) {
         const Top t = top2(m.logits(), m.vocab(), banned);
         min_gap = std::min(min_gap, t.v - t.second);
@@ -371,7 +409,7 @@ int main(int argc, char** argv) {
           gen.push_back(int(o[0]));
         }
       }
-      for (int k = 0; k < (pipe ? 0 : max_tokens); ++k) {
+      for (int k = 0; k < (pipe || spec ? 0 : max_tokens); ++k) {
         const float* lg = m.logits();
         const double tt = now();
         Top t = top2(lg, m.vocab(), banned);
@@ -391,7 +429,9 @@ int main(int argc, char** argv) {
       }
       const double decode_s = now() - td;
       const double dec_tps = max_tokens > 1 ? (max_tokens - 1) / decode_s : 0;
-      if (pipe)  // two steps in flight: no per-step GPU time (RAGON_METAL_PIPE=0 for the wall/GPU split)
+      if (spec)
+        ;
+      else if (pipe)  // two steps in flight: no per-step GPU time (RAGON_METAL_PIPE=0 for the wall/GPU split)
         std::fprintf(stderr, "decode ms a step: wall %.3f (pipelined)\n", decode_s * 1e3 / (max_tokens - 1));
       else if (max_tokens > 1)
         std::fprintf(stderr, "decode ms a step: wall %.3f, GPU (step command buffers) %.3f, top-2 %.3f\n",

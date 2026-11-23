@@ -68,6 +68,13 @@ struct Layer {
   Lin gate, up, down;
 };
 
+// One layer of the DFlash2 drafter (speculative decode): attention and MLP each wrapped in a grouped convolution
+// whose per-row coefficients come from a BF16 kernel projection; sliding-window K/V in a ring of positions.
+struct DraftLayer {
+  View in_norm, post_norm, q_norm, k_norm, attn_base, mlp_base, kc, vc;
+  Lin q, k, v, o, gate, up, down, attn_kproj, mlp_kproj;
+};
+
 class Model {
  public:
   using Dump = std::function<void(const std::string& name, View v, std::vector<int64_t> shape)>;
@@ -93,6 +100,19 @@ class Model {
   int vocab() const { return V_; }
   int chunk() const { return C_; }
   std::vector<int> eos_ids;
+  // The DFlash2 drafter (METAL spec, lane 7): draft_load maps it; from then on every forward captures the
+  // drafter's target features and writes its context K/V (verify rows wait for the commit). speculate() runs one
+  // step at pos: the anchor (the next token, not fed yet) and B - 1 drafted tokens through the target at once, the
+  // longest prefix the target's greedy pick agrees with, plus the target's own next token. out gets those n >= 1
+  // tokens (the last is the next anchor, not fed); returns n, or -1 when a verify row's top logit is not finite.
+  // The accepted rows' GDN state and drafter context are committed into the command buffer that the next GPU work
+  // (the next step, or any forward) runs first.
+  void draft_load(const std::string& dir);
+  bool has_draft() const { return !dl_.empty(); }
+  int draft_block() const { return dblock_; }
+  int speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out);
+  double spec_s[3] = {0, 0, 0};  // host seconds in the draft, the verify and the accept (commit encoding included)
+  long spec_steps = 0, spec_tokens = 0;
   // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head;
   // prof[4] = the GDN recurrence alone (part of prof[1]).
   double prof[5] = {0, 0, 0, 0, 0};
@@ -122,7 +142,27 @@ class Model {
   void layer(size_t i, int T, int pos0, const Dump& dump);  // one decoder layer over h_'s T rows
   void dequant(id<MTLComputeCommandEncoder> e, const Lin& l, View out);
   void attention(Layer& L, int T, int pos0, const Dump& dump, const std::string& tag);
-  Lin lin(const std::string& prefix);
+  Lin lin(const std::string& prefix) { return lin_of(ck_, prefix); }
+  Lin lin_of(Checkpoint& ck, const std::string& prefix);
+  // drafter
+  void capture(int T, int pos0, size_t layer);  // the target layer's rows inside [cap_lo_, cap_hi_) into cap_
+  void draft_materialize(int n, int pos0);        // cap_ rows 0 .. n-1 (positions pos0 ..) into the ring
+  void draft_forward(int B, uint32_t anchor, int pos);
+  void commit(int n, int pos0);
+  void copy_rows(View src, View dst, int rows, int cols, int lds, int ldd);
+  Checkpoint dck_;
+  std::vector<DraftLayer> dl_;
+  std::vector<int> feat_;  // target layer -> feature slot (-1: none)
+  Lin dfc_, dsel_;
+  View dhnorm_, dnorm_, dpred_, dsucc_;
+  int dH_ = 0, dI_ = 0, dHq_ = 0, dKV_ = 0, dblock_ = 8, dgroups_ = 0, dwin_ = 2048, ring_ = 0, dmask_ = 0, nfeat_ = 0;
+  float dtheta_ = 1e7f, deps_ = 1e-6f;
+  int cap_lo_ = 0, cap_hi_ = 0, cap_rows_ = 0;
+  View cap_, dctx_, dres_, dh_, dh2_, dcoef_, dq_, dk_, dv_, dattn_, dg_, du_, dout_, dunary_, dcand_, dhp_, dscores_,
+      dids_, vout_;
+  bool verify_ = false;
+  int vmax_ = 16;                       // verify rows the saved GDN inputs hold
+  std::vector<View> vpre_, vg_, vbeta_;  // per GDN layer: the verify rows' conv input, g and beta
 
   Queue* q_ = nullptr;
   Checkpoint ck_;
