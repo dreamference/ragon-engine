@@ -250,16 +250,24 @@ kernel void x_pack8(device const float* x [[buffer(0)]], device half2* xp [[buff
   xp[(((s >> 2) * 4 + (t >> 2)) * 32 + slot) * 4 + (t & 3u)] = half2(clamp(float2(v0, v1), -65504.0f, 65504.0f));
 }
 
-template <uint F>  // 0: NVFP4, 1: Q4
+// G = 1 (the drafter's sparse head): output column j is weight row gr[j] for j < gnr[0], -inf past it.
+template <uint F, uint G>  // F 0: NVFP4, 1: Q4
 kernel void gemv8(device const half2* xp [[buffer(0)]], device const uchar* w [[buffer(1)]],
                   device const uchar* sc [[buffer(2)]], device float* y [[buffer(3)]],
-                  constant GemvArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                  constant GemvArgs& a [[buffer(4)]], device const uint* gr [[buffer(5)]],
+                  device const uint* gnr [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   const uint n0 = (tg.x * 8 + sg) * 8;
   if (n0 >= a.N) return;
+  const uint nr = G ? gnr[0] : a.N;
+  if (G && n0 >= nr) {  // columns past the selection: -inf for the top 16
+    if (lane < 8 && n0 + lane < a.N)
+      for (uint r = 0; r < a.rows; ++r) y[(ulong)r * a.ldy + n0 + lane] = -INFINITY;
+    return;
+  }
   const uint qid = lane / 4;
   const uint fm = (qid & 4u) + ((lane / 2) % 4), fn = (qid & 2u) * 2 + (lane % 2) * 2;
-  const uint n = min(n0 + fm, a.N - 1);
+  const uint n = G ? gr[min(n0 + fm, nr - 1)] : min(n0 + fm, a.N - 1);
   device const uint4* wr = (device const uint4*)(w + (ulong)n * (a.K / 2));
   const uint cw = fn / 2, cx = fm / 2, ex = fm & 1u, rp = fn / 2;
   simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -308,13 +316,18 @@ kernel void gemv8(device const half2* xp [[buffer(0)]], device const uchar* w [[
     const uint r = fn + e;
     if (r >= a.rows) continue;
     device float* p = y + (ulong)r * a.ldy + nn;
-    *p = a.add ? *p + c[e] : c[e];
+    if (G) *p = nn < nr ? c[e] : -INFINITY;
+    else *p = a.add ? *p + c[e] : c[e];
   }
 }
-template [[host_name("gemv8_nvfp4")]] kernel void gemv8<0>(device const half2*, device const uchar*, device const uchar*,
-                                                          device float*, constant GemvArgs&, uint2, uint, uint);
-template [[host_name("gemv8_q4")]] kernel void gemv8<1>(device const half2*, device const uchar*, device const uchar*,
-                                                       device float*, constant GemvArgs&, uint2, uint, uint);
+#define GEMV8_INST(NAME, F, G)                                                                                     \
+  template [[host_name(NAME)]] kernel void gemv8<F, G>(device const half2*, device const uchar*, device const uchar*, \
+                                                      device float*, constant GemvArgs&, device const uint*,          \
+                                                      device const uint*, uint2, uint, uint);
+GEMV8_INST("gemv8_nvfp4", 0, 0)
+GEMV8_INST("gemv8_q4", 1, 0)
+GEMV8_INST("gemv8g_nvfp4", 0, 1)
+GEMV8_INST("gemv8g_q4", 1, 1)
 
 // FP8 [N][K] -> Q4: one thread per group of 64 values. Searches a shrunken [min, max] range for the least squared
 // error, refines (scale, bias) by least squares on the chosen codes, and quantizes with the half-rounded pair.
@@ -1886,4 +1899,170 @@ kernel void selector_lattice(device const float* hp [[buffer(0)]], device const 
 kernel void add_rows(device float* x [[buffer(0)]], device const float* y [[buffer(1)]], constant uint& n [[buffer(2)]],
                      uint i [[thread_position_in_grid]]) {
   if (i < n) x[i] += y[i];
+}
+
+// ---- The drafter's sparse head (BACKLOG 19; the CUDA path is core/sparse_head.cu) ----
+// Per draft step: p = h . vt^T (E x 256), approx[n] = max over the E rows of p[m] . us[n], the `dynamic` best rows
+// that no mask marks (a two-level 12-bit radix select on order-preserving keys, every tie at 24 bits taken), joined
+// with the marked rows (the fixed list and the session's context vocabulary) in id order and clamped to cap. The
+// head then scores only those rows (gemv8g, the full head's arithmetic per row) and the top 16 maps back to ids.
+struct ShArgs {
+  uint N, K, E, cap, dynamic, level, ntg, pad;
+};
+inline uint sh_key(float f) {
+  const uint b = as_type<uint>(f);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+// one simdgroup per rank row r
+kernel void sh_proj(device const float* x [[buffer(0)]], device const bfloat* vt [[buffer(1)]],
+                    device float* p [[buffer(2)]], constant ShArgs& a [[buffer(3)]],
+                    uint r [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  float acc[16];
+  for (uint m = 0; m < 16; ++m) acc[m] = 0.0f;
+  device const bfloat4* v4 = (device const bfloat4*)(vt + (ulong)r * a.K);
+  for (uint k4 = lane; k4 < a.K / 4; k4 += 32) {
+    const float4 w = float4(v4[k4]);
+    for (uint m = 0; m < a.E; ++m) acc[m] += dot(w, ((device const float4*)(x + (ulong)m * a.K))[k4]);
+  }
+  for (uint m = 0; m < a.E; ++m) {
+    const float t = simd_sum(acc[m]);
+    if (lane == 0) p[m * 256 + r] = t;
+  }
+}
+// keys[n]: 0 for a marked row, else the key of max_m p[m] . us[n]; a simdgroup per row, 8 rank values a lane
+kernel void sh_approx(device const float* p [[buffer(0)]], device const bfloat* us [[buffer(1)]],
+                      device const uchar* mask [[buffer(2)]], device uint* keys [[buffer(3)]],
+                      constant ShArgs& a [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float ps[16 * 256];
+  for (uint i = tid; i < a.E * 256; i += 256) ps[i] = p[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint q = 0; q < 16; ++q) {  // 128 rows a threadgroup: p is read once per 128 rows
+    const uint n = (tg * 8 + sg) * 16 + q;
+    if (n >= a.N) return;
+    if (mask[n]) {
+      if (lane == 0) keys[n] = 0;
+      continue;
+    }
+    device const bfloat4* u4 = (device const bfloat4*)(us + (ulong)n * 256) + lane * 2;
+    const float4 u0 = float4(u4[0]), u1 = float4(u4[1]);
+    float best = -INFINITY;
+    for (uint m = 0; m < a.E; ++m) {
+      threadgroup const float4* pm = (threadgroup const float4*)(ps + m * 256) + lane * 2;
+      best = max(best, simd_sum(dot(u0, pm[0]) + dot(u1, pm[1])));
+    }
+    if (lane == 0) keys[n] = sh_key(best);
+  }
+}
+// level 0: bins of the top 12 bits; level 1: bits 8..19 of the keys whose top 12 match state[0]
+kernel void sh_hist(device const uint* keys [[buffer(0)]], device atomic_uint* hist [[buffer(1)]],
+                    device const uint* state [[buffer(2)]], constant ShArgs& a [[buffer(3)]],
+                    uint gid [[thread_position_in_grid]], uint gsz [[threads_per_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup atomic_uint h[4096];
+  for (uint i = tid; i < 4096; i += 1024) atomic_store_explicit(&h[i], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint shift = a.level ? 8u : 20u, pmask = a.level ? 0xFFF00000u : 0u, prefix = a.level ? state[0] : 0u;
+  for (uint n = gid; n < a.N; n += gsz) {
+    const uint k = keys[n];
+    if (k != 0 && (k & pmask) == prefix) atomic_fetch_add_explicit(&h[(k >> shift) & 4095u], 1u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = tid; i < 4096; i += 1024) {
+    const uint c = atomic_load_explicit(&h[i], memory_order_relaxed);
+    if (c) atomic_fetch_add_explicit(&hist[a.level * 4096 + i], c, memory_order_relaxed);
+  }
+}
+// one threadgroup of 1024: the bin the dynamic-th best key falls in; clears the level's bins for the next step.
+// state: [0] the prefix, [1] the keys still wanted, [2] the threshold (level 1)
+kernel void sh_find(device uint* hist [[buffer(0)]], device uint* state [[buffer(1)]], constant ShArgs& a [[buffer(2)]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint part[1024];
+  device uint* h = hist + a.level * 4096;
+  const uint b0 = tid * 4;
+  const uint c0 = h[b0], c1 = h[b0 + 1], c2 = h[b0 + 2], c3 = h[b0 + 3];
+  part[tid] = c0 + c1 + c2 + c3;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    const uint want = a.level ? state[1] : a.dynamic;
+    uint above = 0;
+    int c = 1023;
+    for (; c > 0 && above + part[c] < want; --c) above += part[c];
+    int b = c * 4 + 3;
+    for (; b > c * 4 && above + h[b] < want; --b) above += h[b];
+    const uint shift = a.level ? 8u : 20u;
+    const uint prefix = (a.level ? state[0] : 0u) | (uint(b) << shift);
+    state[0] = prefix;
+    state[1] = want > above ? want - above : 0;
+    if (a.level) state[2] = prefix;
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  h[b0] = 0;
+  h[b0 + 1] = 0;
+  h[b0 + 2] = 0;
+  h[b0 + 3] = 0;
+}
+inline bool sh_flag(device const uint* keys, device const uchar* mask, uint n, uint thr) {
+  return mask[n] != 0 || (keys[n] != 0 && thr != 0 && keys[n] >= thr);
+}
+// threadgroups of 1024 rows: the count of selected rows in each
+kernel void sh_count(device const uint* keys [[buffer(0)]], device const uchar* mask [[buffer(1)]],
+                     device const uint* state [[buffer(2)]], device uint* counts [[buffer(3)]],
+                     constant ShArgs& a [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup uint ss[32];
+  const uint n = tg * 1024 + tid;
+  const uint f = n < a.N && sh_flag(keys, mask, n, state[2]) ? 1u : 0u;
+  const uint s = simd_sum(f);
+  if (lane == 0) ss[sg] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    uint t = 0;
+    for (uint i = 0; i < 32; ++i) t += ss[i];
+    counts[tg] = t;
+  }
+}
+// the selected rows' ids in id order (each block's offset the sum of the counts before it), clamped to cap
+kernel void sh_write(device const uint* keys [[buffer(0)]], device const uchar* mask [[buffer(1)]],
+                     device const uint* state [[buffer(2)]], device const uint* counts [[buffer(3)]],
+                     device uint* rows [[buffer(4)]], device uint* nrows [[buffer(5)]], constant ShArgs& a [[buffer(6)]],
+                     uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup uint ss[32], so[32];
+  threadgroup uint offs;
+  // the offset: the counts of the blocks before this one
+  uint c = 0;
+  for (uint i = tid; i < tg; i += 1024) c += counts[i];
+  c = simd_sum(c);
+  if (lane == 0) ss[sg] = c;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    uint t = 0;
+    for (uint i = 0; i < 32; ++i) t += ss[i];
+    offs = t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n = tg * 1024 + tid;
+  const uint f = n < a.N && sh_flag(keys, mask, n, state[2]) ? 1u : 0u;
+  const uint ex = simd_prefix_exclusive_sum(f), tot = simd_sum(f);
+  if (lane == 0) ss[sg] = tot;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    uint t = offs;
+    for (uint i = 0; i < 32; ++i) {
+      so[i] = t;
+      t += ss[i];
+    }
+    if (tg == a.ntg - 1) nrows[0] = min(t, a.cap);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint idx = so[sg] + ex;
+  if (f && idx < a.cap) rows[idx] = n;
+}
+// the top 16's columns back to token ids
+kernel void sh_ids(device const uint* rows [[buffer(0)]], device uint* ids [[buffer(1)]], constant uint& n [[buffer(2)]],
+                   uint i [[thread_position_in_grid]]) {
+  if (i < n) ids[i] = rows[ids[i]];
 }

@@ -4,6 +4,7 @@
 //   ragon-serve --model DIR [--host 127.0.0.1] [--port 8000] [--served-model-name NAME] [--max-context N]
 //               [--chunk C] [--keepalive-seconds N] [--repetition-detection P,p,R,K|off]
 //               [--repetition-report incomplete|completed] [--api-key KEY] [--pretokenizer production|checkpoint]
+//               [--draft DIR [--spec-block N] [--sparse-head-dir DIR]]
 //
 // The request handling is the CUDA serve's own (serve/api.hpp: parse_request, parse_responses_request,
 // OutputParser, ResponseItems, StopScanner, RepetitionDetector, the context-overflow errors), and so are the
@@ -11,9 +12,12 @@
 // - one engine thread runs one request at a time (the Metal model holds one sequence). The sequence stays in the
 //   model between requests: a prompt that extends it (an agent's next turn) feeds only the new tokens; any other
 //   prompt starts over (the recurrent state cannot be rewound).
-// - plain greedy (temperature 0, no penalties) runs the GPU pick loop, two steps in flight (Model::greedy_step);
-//   RAGON_METAL_SERVE_HOST_LOOP=1 forces the host loop. Otherwise the serve's sampler (core/sampling.hpp) on
-//   the host logits.
+// - with --draft, greedy and sampled requests without penalties (top_k 0 or at most 64) decode speculatively:
+//   the drafter (its sparse head from --sparse-head-dir, <draft>/sparse-head by default) drafts a block, the
+//   target verifies it in one pass and the accepted rows are committed (Model::speculate).
+// - otherwise plain greedy (temperature 0, no penalties) runs the GPU pick loop, two steps in flight
+//   (Model::greedy_step); RAGON_METAL_SERVE_HOST_LOOP=1 forces the host loop. Anything else uses the serve's
+//   sampler (core/sampling.hpp) on the host logits.
 // - the HTTP layer is plain POSIX sockets, HTTP/1.1, one thread a connection, `Connection: close`. The engine
 //   thread never writes to a socket: it appends to the request's outbox, which the connection thread drains, so a
 //   slow client never stalls decoding; a failed write cancels the request.
@@ -876,10 +880,9 @@ int main(int argc, char** argv) {
       m.draft_load(draft_dir);
       if (spec_block <= 0) spec_block = kSpecBlock;
       spec_block = std::min(spec_block, m.draft_block());
-      // The sparse head (a top-k candidate head over the target's LM head) is not ported to Metal yet: the
-      // drafter scores the full vocabulary, and the log says so rather than claiming the production head.
-      std::fprintf(stderr, "metal serve: drafter %s, block %d, drafter head: dense%s\n", draft_dir.c_str(), spec_block,
-                   sparse_head_dir.empty() ? "" : " (--sparse-head-dir given; the sparse head is not used on Metal yet)");
+      // the drafter's sparse head (its own "drafter head: ..." line), <draft>/sparse-head without the flag
+      m.sparse_head_load(sparse_head_dir.empty() ? draft_dir + "/sparse-head" : sparse_head_dir);
+      std::fprintf(stderr, "metal serve: drafter %s, block %d\n", draft_dir.c_str(), spec_block);
     }
     Engine engine(m, tok, sp, max_ctx, chunk, ignore_eos, spec_block);
     S.engine = &engine;

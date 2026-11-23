@@ -930,6 +930,7 @@ void Model::forward(const uint32_t* ids, int T, int pos0, bool all_logits, const
   if (T > C_) fail("forward: T exceeds the chunk");
   if (pos0 + T > max_ctx_) fail("forward: context exceeds max_ctx");
   if (ids) std::memcpy(ids_.host<uint32_t>(), ids, size_t(T) * 4);  // null: the ids are already on the device
+  if (ids && !verify_) sh_observe(ids, T, pos0);
   q_->concurrent = conc_ && T < mm_min_ && !prof_ && !dump;  // decode: independent small dispatches overlap
   id<MTLComputeCommandEncoder> e = q_->encoder();
   [e setComputePipelineState:q_->pipe("embed_bf16")];
@@ -1021,6 +1022,7 @@ void Model::prefill(const uint32_t* ids, int P) {
     return;
   }
   if (P > max_ctx_) fail("prefill: context exceeds max_ctx");
+  sh_observe(ids, P, 0);  // the layer-major path does not go through forward()
   auto lins = [](Layer& L) { return std::array<Lin*, 10>{&L.qkv, &L.z, &L.out, &L.q, &L.k, &L.v, &L.o, &L.gate, &L.up, &L.down}; };
   if (wlay_.empty()) {
     size_t cap = 0;
@@ -1210,6 +1212,161 @@ void Model::draft_load(const std::string& dir) {
                dblock_, dwin_, nfeat_, dck_.mapped_bytes() / 1e9);
 }
 
+struct ShArgsH {
+  uint32_t N, K, E, cap, dynamic, level, ntg, pad;
+};
+
+void Model::sparse_head_load(const std::string& dir) {
+  if (!has_draft()) fail("sparse head: load the drafter first");
+  const char* hd = std::getenv("RAGON_DRAFT_HEAD");
+  if (hd && std::string(hd) == "full") {
+    std::fprintf(stderr, "drafter head: full (RAGON_DRAFT_HEAD=full)\n");
+    return;
+  }
+  const std::string f = dir + "/model.safetensors";
+  if (dir.empty() || ![[NSFileManager defaultManager] fileExistsAtPath:[NSString stringWithUTF8String:f.c_str()]]) {
+    std::fprintf(stderr, "drafter head: full (no sparse head file)\n");
+    return;
+  }
+  if ((head_.fmt != Lin::kNvfp4 && head_.fmt != Lin::kQ4) || head_.K % 256 != 0) {
+    std::fprintf(stderr, "drafter head: full (the gathered head needs an NVFP4 or Q4 LM head)\n");
+    return;
+  }
+  shck_.open(*q_, dir);
+  Tensor us = shck_.get("us"), vt = shck_.get("vt"), fx = shck_.get("fixed");
+  if (us.dtype != "BF16" || vt.dtype != "BF16" || fx.dtype != "I32" || us.shape.size() != 2 || vt.shape.size() != 2 ||
+      us.shape[1] != 256 || us.shape[0] < V_ || vt.shape[0] != 256 || vt.shape[1] != dH_)
+    fail("sparse head: us must be BF16 [>= vocab][256], vt BF16 [256][hidden], fixed I32");
+  sh_us_ = us.v;  // rows past the vocabulary (padding) are never scored
+  sh_vt_ = vt.v;
+  auto envi = [](const char* k, int d) { const char* v = std::getenv(k); return v ? std::atoi(v) : d; };
+  auto envd = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
+  sh_dyn_ = envi("RAGON_SH_DYNAMIC", sh_dyn_);
+  sh_ctxmax_ = envi("RAGON_SH_CONTEXT", sh_ctxmax_);
+  sh_W_ = std::max(1, envi("RAGON_SH_WINDOW", sh_W_));
+  sh_hi_ = envd("RAGON_SH_HI", sh_hi_);
+  sh_lo_ = envd("RAGON_SH_LO", sh_lo_);
+  sh_verbose_ = envi("RAGON_SH_VERBOSE", 0) != 0;
+  sh_fixed_.assign(size_t(V_), 0);
+  sh_nfixed_ = 0;
+  const int32_t* fid = fx.v.host<int32_t>();
+  for (size_t i = 0; i < fx.bytes / 4; ++i) {
+    const int id = fid[i];
+    if (id >= 0 && id < V_ && !sh_fixed_[size_t(id)]) sh_fixed_[size_t(id)] = 1, ++sh_nfixed_;
+  }
+  // as on CUDA: the fixed rows, the context rows, the chosen ones and their ties, so the clamp never bites in practice
+  const long cap = long(sh_nfixed_) + sh_ctxmax_ + sh_dyn_ + 256;
+  sh_cap_ = int(std::min<long>((cap + 63) / 64 * 64, (V_ + 63) / 64 * 64));
+  const uint32_t ntg = uint32_t((V_ + 1023) / 1024);
+  sh_mask_ = q_->alloc((size_t(V_) + 15) / 16 * 16);
+  sh_keys_ = q_->alloc(size_t(V_) * 4);
+  sh_hist_ = q_->alloc(2 * 4096 * 4);
+  sh_state_ = q_->alloc(64);
+  sh_counts_ = q_->alloc(size_t(ntg) * 4);
+  sh_rows_ = q_->alloc(size_t(sh_cap_) * 4);
+  sh_nrows_ = q_->alloc(16);
+  sh_p_ = q_->alloc(16 * 256 * 4);
+  if (size_t(vmax_) * size_t(sh_cap_) > size_t(C_) * size_t(V_)) fail("sparse head: logits buffer too small");
+  sh_on_ = true;
+  sh_reset();
+  std::fprintf(stderr,
+               "drafter head: sparse, %d fixed + up to %d context + %d chosen rows per step (rank 256, at most %d); full "
+               "head above %.3f of the last %d tokens outside them, sparse again below %.3f\n",
+               sh_nfixed_, sh_ctxmax_, sh_dyn_, sh_cap_, sh_hi_, sh_W_, sh_lo_);
+}
+
+void Model::sh_rewin() {
+  sh_win_.assign(size_t(sh_W_), 0);
+  sh_wpos_ = sh_wn_ = sh_novel_ = 0;
+  sh_full_ = true;
+}
+
+void Model::sh_reset() {
+  std::memcpy(sh_mask_.host<uint8_t>(), sh_fixed_.data(), size_t(V_));
+  sh_ctx_ = 0;
+  sh_n_ = 0;
+  sh_rewin();
+}
+
+// The mask is only read by the draft step's selection, which has finished whenever the host gets here.
+void Model::sh_observe(const uint32_t* ids, int n, int pos0) {
+  if (!sh_on_ || n <= 0) return;
+  if (pos0 == 0) sh_reset();               // a new history: the fixed list alone
+  else if (pos0 < sh_n_) sh_rewin();       // a new turn on a kept prefix: the window decided again
+  uint8_t* mk = sh_mask_.host<uint8_t>();
+  for (int i = 0; i < n; ++i) {
+    const uint32_t t = ids[i];
+    if (t >= uint32_t(V_)) continue;
+    const int novel = mk[t] ? 0 : 1;
+    if (novel && sh_ctx_ < sh_ctxmax_) mk[t] = 1, ++sh_ctx_;
+    sh_novel_ += novel - sh_win_[size_t(sh_wpos_)];
+    sh_win_[size_t(sh_wpos_)] = uint8_t(novel);
+    sh_wpos_ = (sh_wpos_ + 1) % sh_W_;
+    sh_wn_ = std::min(sh_wn_ + 1, sh_W_);
+  }
+  sh_n_ = pos0 + n;
+}
+
+bool Model::sh_decide() {
+  const double share = sh_wn_ ? double(sh_novel_) / sh_wn_ : 1.0;
+  const bool was = sh_full_;
+  if (sh_wn_ < std::min(sh_W_, 16)) sh_full_ = true;
+  else if (!sh_full_ && share > sh_hi_) sh_full_ = true;
+  else if (sh_full_ && share < sh_lo_) sh_full_ = false;
+  if (sh_full_ && !was) ++sh_fallbacks;
+  if (sh_verbose_ && sh_full_ != was)
+    std::fprintf(stderr, "drafter head: %s at token %d (%.3f of the last %d new, %d context rows)\n",
+                 sh_full_ ? "full" : "sparse", sh_n_, share, sh_wn_, sh_ctx_);
+  return !sh_full_;
+}
+
+void Model::sh_head(int E) {
+  const uint32_t ntg = uint32_t((V_ + 1023) / 1024);
+  ShArgsH a{uint32_t(V_), uint32_t(dH_), uint32_t(E), uint32_t(sh_cap_), uint32_t(sh_dyn_), 0, ntg, 0};
+  id<MTLComputeCommandEncoder> e = q_->encoder();
+  [e setComputePipelineState:q_->pipe("sh_proj")];
+  bind(e, {dh_, sh_vt_, sh_p_});
+  bind_args(e, 3, a);
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(256, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+  [e setComputePipelineState:q_->pipe("sh_approx")];
+  bind(e, {sh_p_, sh_us_, sh_mask_, sh_keys_});
+  bind_args(e, 4, a);
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake((V_ + 127) / 128, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  for (uint32_t lv = 0; lv < 2; ++lv) {
+    a.level = lv;
+    [e setComputePipelineState:q_->pipe("sh_hist")];
+    bind(e, {sh_keys_, sh_hist_, sh_state_});
+    bind_args(e, 3, a);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    [e setComputePipelineState:q_->pipe("sh_find")];
+    bind(e, {sh_hist_, sh_state_});
+    bind_args(e, 2, a);
+    [q_->pre(e) dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+  }
+  [e setComputePipelineState:q_->pipe("sh_count")];
+  bind(e, {sh_keys_, sh_mask_, sh_state_, sh_counts_});
+  bind_args(e, 4, a);
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(ntg, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+  [e setComputePipelineState:q_->pipe("sh_write")];
+  bind(e, {sh_keys_, sh_mask_, sh_state_, sh_counts_, sh_rows_, sh_nrows_});
+  bind_args(e, 6, a);
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake(ntg, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+  // the selected rows' exact logits: gemv8 over the gathered head rows (the full head's arithmetic per row)
+  const uint32_t pa[4] = {uint32_t(dH_), uint32_t(E), uint32_t(dH_), 0};
+  [e setComputePipelineState:q_->pipe("x_pack8")];
+  bind(e, {dh_, xp8_});
+  [e setBytes:pa length:16 atIndex:2];
+  [q_->pre(e) dispatchThreads:MTLSizeMake(dH_, 4, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  xp8_buf_ = nullptr;
+  GemvArgs g{uint32_t(sh_cap_), head_.K, uint32_t(dH_), uint32_t(sh_cap_), uint32_t(E), head_.scale, 0u, eps_, 0};
+  [e setComputePipelineState:q_->pipe(head_.fmt == Lin::kQ4 ? "gemv8g_q4" : "gemv8g_nvfp4")];
+  bind(e, {xp8_, head_.w, head_.sc, logits_});
+  bind_args(e, 4, g);
+  [e setBuffer:sh_rows_.buf offset:sh_rows_.off atIndex:5];
+  [e setBuffer:sh_nrows_.buf offset:sh_nrows_.off atIndex:6];
+  [q_->pre(e) dispatchThreadgroups:MTLSizeMake((sh_cap_ + 63) / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
 void Model::capture(int T, int pos0, size_t layer) {
   const int r0 = std::max(0, cap_lo_ - pos0), r1 = std::min(T, cap_hi_ - pos0);
   if (r1 <= r0) return;
@@ -1333,16 +1490,30 @@ void Model::draft_forward(int B, uint32_t anchor, int pos) {
   add(dres_, dout_);
   norm(dres_.at(size_t(H) * 4), dnorm_, View{}, dh_, E, H, 1, H, 0, H, 0, 3);
   if (prof_ == 5) dpm[2] += q_->sync();
-  gemv(head_, dh_, logits_, E, H, V_, false);
+  const bool sparse = sh_on_ && E >= 2 && E <= 8 && sh_decide();
+  if (sparse) {
+    sh_head(E);
+    ++sh_sparse_steps;
+  } else {
+    gemv(head_, dh_, logits_, E, H, V_, false);
+    if (sh_on_) ++sh_full_steps;
+  }
   q_->overlap();
   gemv(dsel_, dh_, dhp_, E, H, 256, false);
   if (prof_ == 5) dpm[3] += q_->sync();
   e = q_->encoder();
   [e setComputePipelineState:q_->pipe("topk16_rows")];
   bind(e, {logits_, dunary_, dcand_});
-  const uint32_t nv = uint32_t(V_);
+  const uint32_t nv = uint32_t(sparse ? sh_cap_ : V_);
   [e setBytes:&nv length:4 atIndex:3];
   [q_->pre(e) dispatchThreadgroups:MTLSizeMake(E, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+  if (sparse) {  // the selected columns back to token ids
+    [e setComputePipelineState:q_->pipe("sh_ids")];
+    bind(e, {sh_rows_, dcand_});
+    const uint32_t ni = uint32_t(E * 16);
+    [e setBytes:&ni length:4 atIndex:2];
+    [q_->pre(e) dispatchThreads:MTLSizeMake(ni, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  }
   [e setComputePipelineState:q_->pipe("selector_lattice")];
   bind(e, {dhp_, dcand_, dunary_, dpred_, dsucc_, dscores_});
   [e setBytes:&anchor length:4 atIndex:6];
@@ -1534,6 +1705,12 @@ int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& ba
   for (int i = 0; i < a; ++i) out[i] = rows[i + 1];
   out[a] = next;
   commit(n, pos);
+  if (sh_on_) {  // the history grows by the anchor and the accepted drafts (the next anchor joins next step)
+    uint32_t h[16];
+    h[0] = anchor;
+    for (int i = 0; i + 1 < n; ++i) h[i + 1] = out[i];
+    sh_observe(h, n, pos);
+  }
   const auto t3 = clk::now();
   spec_s[0] += std::chrono::duration<double>(t1 - t0).count();
   spec_s[1] += std::chrono::duration<double>(t2 - t1).count();

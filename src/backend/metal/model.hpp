@@ -117,6 +117,14 @@ class Model {
     std::mt19937_64* rng = nullptr;
   };
   void draft_load(const std::string& dir);
+  // The drafter's sparse head (BACKLOG 19, core/sparse_head.cu on CUDA): model.safetensors in dir with us, vt and
+  // fixed. Each draft step then scores the fixed rows, the session's context vocabulary and the RAGON_SH_DYNAMIC rows
+  // the rank-256 copy rates best, instead of the whole head; a session whose last RAGON_SH_WINDOW tokens fall
+  // outside them too often (above RAGON_SH_HI, back below RAGON_SH_LO) drafts with the full head. The target
+  // verifies every token, so only the proposals change. RAGON_DRAFT_HEAD=full keeps the full head.
+  void sparse_head_load(const std::string& dir);
+  bool sparse_head() const { return sh_on_; }
+  long sh_sparse_steps = 0, sh_full_steps = 0, sh_fallbacks = 0;
   bool has_draft() const { return !dl_.empty(); }
   int draft_block() const { return dblock_; }
   int speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out,
@@ -159,6 +167,19 @@ class Model {
   void capture(int T, int pos0, size_t layer);  // the target layer's rows inside [cap_lo_, cap_hi_) into cap_
   void draft_materialize(int n, int pos0);        // cap_ rows 0 .. n-1 (positions pos0 ..) into the ring
   void draft_forward(int B, uint32_t anchor, int pos);
+  void sh_observe(const uint32_t* ids, int n, int pos0);  // tokens of the history at pos0 ..
+  void sh_reset();
+  void sh_rewin();
+  bool sh_decide();          // true: this step drafts with the sparse head
+  void sh_head(int E);       // the selection and the selected rows' logits (E x sh_cap_) into logits_
+  Checkpoint shck_;
+  bool sh_on_ = false, sh_full_ = true;
+  View sh_us_, sh_vt_, sh_mask_, sh_keys_, sh_hist_, sh_state_, sh_counts_, sh_rows_, sh_nrows_, sh_p_;
+  std::vector<uint8_t> sh_fixed_, sh_win_;
+  int sh_nfixed_ = 0, sh_cap_ = 0, sh_dyn_ = 16384, sh_ctxmax_ = 32768, sh_W_ = 64, sh_ctx_ = 0, sh_n_ = 0;
+  int sh_wpos_ = 0, sh_wn_ = 0, sh_novel_ = 0;
+  double sh_hi_ = 0.15, sh_lo_ = 0.08;
+  bool sh_verbose_ = false;
   void commit(int n, int pos0);
   void copy_rows(View src, View dst, int rows, int cols, int lds, int ldd);
   Checkpoint dck_;

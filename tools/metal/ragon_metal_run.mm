@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
     std::string model, prompts_file, check_file, greedy_out, dump_dir, teacher_file;
     std::vector<std::vector<uint32_t>> prompts;
     int max_tokens = 256, ctx = 40960, chunk = 128, teacher_chunk = 0, spec_block = 0;
-    std::string draft_dir;
+    std::string draft_dir, sparse_head_dir;
     bool step_curve = false;
     bool ban_eos = false, stdio = false;
     for (int i = 1; i < argc; ++i) {
@@ -211,6 +211,7 @@ int main(int argc, char** argv) {
       else if (a == "--stdio") stdio = true;
       else if (a == "--step-curve") step_curve = true;
       else if (a == "--draft") draft_dir = next();
+      else if (a == "--sparse-head-dir") sparse_head_dir = next();
       else if (a == "--spec-block") spec_block = std::stoi(next());
       else {
         std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -233,7 +234,10 @@ int main(int argc, char** argv) {
     Model m;
     const double t0 = now();
     m.load(q, model, ctx, chunk);
-    if (!draft_dir.empty()) m.draft_load(draft_dir);
+    if (!draft_dir.empty()) {
+      m.draft_load(draft_dir);
+      m.sparse_head_load(sparse_head_dir.empty() ? draft_dir + "/sparse-head" : sparse_head_dir);
+    }
     if (!draft_dir.empty() && spec_block == 0) spec_block = m.draft_block();
     std::fprintf(stderr, "loaded in %.1f s\n", now() - t0);
     if (stdio) return serve_stdio(m, ctx, chunk);
@@ -389,6 +393,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "spec B=%d: %ld steps, %.3f tokens a step; ms a step: draft %.3f, verify %.3f, accept %.3f\n",
                      spec_block, m.spec_steps, double(m.spec_tokens) / ns, 1e3 * m.spec_s[0] / ns,
                      1e3 * m.spec_s[1] / ns, 1e3 * m.spec_s[2] / ns);
+        if (m.sparse_head())
+          std::fprintf(stderr, "drafter head: %ld sparse steps, %ld full, %ld fallbacks\n", m.sh_sparse_steps,
+                       m.sh_full_steps, m.sh_fallbacks);
         if (const char* pr = std::getenv("RAGON_METAL_PROF"); pr && std::atoi(pr) == 5)
           std::fprintf(stderr, "spec GPU ms a step: commit GDN %.3f, materialize %.3f, draft layers %.3f, head+selector %.3f, "
                        "top-16+lattice %.3f\n", 1e3 * m.dpm[0] / ns, 1e3 * m.dpm[1] / ns, 1e3 * m.dpm[2] / ns,
