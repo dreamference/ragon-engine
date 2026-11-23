@@ -7,6 +7,8 @@
 #      paged       the same with paged KV
 #      fanout      paged KV with room for every fork: --sessions $FANOUT_SESSIONS --batch $FANOUT_BATCH
 #      sglang-n, fanout-n   the same servers driven with one request of n=k (run.py --arm n), no retention step
+#      <ragon arm>-t        that arm's server, and instead of the bench the engine's server tests against it:
+#                  $PYTEST ("python3 -m pytest") $TESTS_DIR/test_regressions.py test_fanout.py, log $OUT/<arm>-t.pytest.log
 #      ckl         fix arm: paged, sessions/batch $FIX_SESSIONS, --checkpoint-limit $CKPT_LIMIT (prefix checkpoints and the
 #                  branch point kept past 32768); needs $RAGON_BIN, a ragon-serve with that flag, mounted over the image's
 #                  (exact probe at 8000 and 100000)
@@ -21,6 +23,9 @@
 #      binary run in the image instead of its own; the ckl arm needs it), EXACT_ONLY=1 (no bench, the exact probe only)
 set -u
 ARM=$1; OUT=$2; shift 2
+TAG=$ARM; TESTS=0
+case $ARM in *-t) TESTS=1; ARM=${ARM%-t}
+  [ -d "${TESTS_DIR:-}" ] || { echo "$(date -u +%T) $TAG: TESTS_DIR is not a directory"; exit 2; } ;; esac
 PORT=${PORT:-18100}; FLAT_SESSIONS=${FLAT_SESSIONS:-4}; FANOUT_SESSIONS=${FANOUT_SESSIONS:-10}; FANOUT_BATCH=${FANOUT_BATCH:-8}
 FIX_SESSIONS=${FIX_SESSIONS:-8}; CKPT_LIMIT=${CKPT_LIMIT:-196608}; BRANCH_MIN=${BRANCH_MIN:-64}; EXACT_SIZES=8000; BENCH=1
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -67,7 +72,7 @@ case ${ARM%-n} in
   paged-x100) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FLAT_SESSIONS" --batch "$FLAT_SESSIONS" --kv-pages > /dev/null ;;
   *) echo "unknown arm $ARM"; exit 2 ;;
 esac || { echo "$(date -u +%T) $ARM: docker run failed"; exit 1; }
-down() { docker stop -t 30 "$NAME" > /dev/null 2>&1; docker logs "$NAME" > "$OUT/$ARM.server.log" 2>&1; docker rm "$NAME" > /dev/null 2>&1; }
+down() { docker stop -t 30 "$NAME" > /dev/null 2>&1; docker logs "$NAME" > "$OUT/$TAG.server.log" 2>&1; docker rm "$NAME" > /dev/null 2>&1; }
 trap down EXIT
 T0=$(date +%s)
 until curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null; do
@@ -76,6 +81,11 @@ until curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null; do
   sleep 5
 done
 echo "$(date -u +%T) $ARM up after $(( $(date +%s) - T0 )) s; $(docker logs "$NAME" 2>&1 | grep -m4 -oE 'drafter head: [a-z]+|prefix checkpoints: .*|branch checkpoints: .*|kv pages[^,;]*' | tr '\n' ' ')"
+if [ $TESTS = 1 ]; then
+  RAGON_SERVE_URL="http://127.0.0.1:$PORT" ${PYTEST:-python3 -m pytest} -q -rfE "$TESTS_DIR/test_regressions.py" \
+    "$TESTS_DIR/test_fanout.py" > "$OUT/$TAG.pytest.log" 2>&1
+  echo "$(date -u +%T) $TAG pytest exit $?; $(tail -1 "$OUT/$TAG.pytest.log")"; exit 0
+fi
 [ "${EXACT_ONLY:-0}" = 1 ] && BENCH=0  # re-run of an arm whose window ended before its exact probe
 if [ $BENCH = 1 ]; then
   python3 "$HERE/run.py" "${RUNARGS[@]}" "$@" > "$OUT/$ARM.run.log" 2>&1
