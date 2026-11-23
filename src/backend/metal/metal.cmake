@@ -29,3 +29,28 @@ target_link_libraries(ragon_metal PUBLIC "-framework Metal" "-framework Foundati
 add_executable(ragon-metal-run tools/metal/ragon_metal_run.mm)
 target_compile_options(ragon-metal-run PRIVATE -fobjc-arc -Wall -Wextra)
 target_link_libraries(ragon-metal-run PRIVATE ragon_metal)
+
+# ragon-serve on Metal (src/serve/metal_serve.mm): the serve's HTTP API layer (serve/api.cpp, built without the CUDA
+# engine: RAGON_API_HOST_ONLY), the tokenizer and the sampler, over ragon_metal. Needs nlohmann_json, PCRE2 and ICU
+# (Homebrew: nlohmann-json, pcre2, icu4c; put the icu4c prefix on CMAKE_PREFIX_PATH).
+find_package(nlohmann_json 3 REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
+find_package(ICU REQUIRED COMPONENTS uc)
+add_library(ragon_api_host STATIC
+  src/serve/api.cpp
+  src/core/sampling.cpp
+  src/tokenizer/tokenizer.cpp
+  src/tokenizer/chat_template.cpp)
+target_compile_features(ragon_api_host PUBLIC cxx_std_20)
+target_compile_definitions(ragon_api_host PUBLIC RAGON_API_HOST_ONLY)
+target_include_directories(ragon_api_host PUBLIC src)
+target_link_libraries(ragon_api_host PUBLIC PkgConfig::PCRE2 ICU::uc nlohmann_json::nlohmann_json)
+
+add_executable(ragon-serve src/serve/metal_serve.mm)
+target_compile_options(ragon-serve PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter)
+target_link_libraries(ragon-serve PRIVATE ragon_metal ragon_api_host)
+
+# The tokenizer tool (token ids of a text), to check the Mac's tokenization against the CUDA build's.
+add_executable(ragon-tokenize tools/ragon_tokenize.cpp)
+target_link_libraries(ragon-tokenize PRIVATE ragon_api_host)

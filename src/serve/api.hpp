@@ -3,6 +3,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -13,7 +14,13 @@
 
 #include "serve/drafter_routes.hpp"
 
+// RAGON_API_HOST_ONLY (the Metal build): the API layer without the CUDA engine; the request only needs the
+// sampling parameters. The CUDA build keeps the engine header, which its users take through this one.
+#ifdef RAGON_API_HOST_ONLY
+#include "core/sampling.hpp"
+#else
 #include "core/engine.hpp"
+#endif
 
 namespace ragon::serve {
 
@@ -74,6 +81,8 @@ struct Request {
   bool reasoning = true;            // the prompt ends inside <think> (chat with thinking on)
   json tools = json::array();
   std::vector<std::string> custom_tools;  // Responses `type: custom` tools, offered as one-parameter functions
+  // Responses `type: namespace` function tools (parse_responses_request with `namespaces`): name -> namespace.
+  std::map<std::string, std::string> tool_namespaces;
   // Logprobs, in vLLM's shapes (API §3): chat `logprobs: true` with `top_logprobs: k`; completions
   // `logprobs: k`. k is 0 .. kMaxTopLogprobs.
   bool logprobs = false;
@@ -161,7 +170,11 @@ Request parse_request(const json& body, bool chat, bool vision = false);
 // outputs become assistant tool calls and tool messages, reasoning items become reasoning_content, and
 // only `function` tools reach the template.
 // With `vision`, images in function_call_output lists render too (VISION §20.6).
-Request parse_responses_request(const json& body, bool vision = false);
+// With `namespaces` (the Metal serve; the CUDA serve keeps production's prompt), the `function` tools inside a
+// `type: namespace` tool (Codex's multi_agent_v1) are offered as plain functions and Request::tool_namespaces maps
+// each name back, so ResponseItems returns the call with its `namespace` and the agent routes it. Hosted tools
+// (`web_search`) are not offered: the server has nothing to run them with.
+Request parse_responses_request(const json& body, bool vision = false, bool namespaces = false);
 
 struct ToolCall {
   std::string name;
@@ -245,12 +258,15 @@ class ResponseItems {
   void deliver(const OutputParser::Delta& d);
   void close();                                // the open reasoning or message item is done (the end of the answer)
   const json& output() const { return output_; }  // the items that are done, in order
+  // Function calls to a name here go out with its `namespace` (Request::tool_namespaces).
+  void set_namespaces(std::map<std::string, std::string> m) { namespaces_ = std::move(m); }
 
  private:
   void close_reasoning();
   void close_message();
   bool custom(const std::string& name) const;
   std::vector<std::string> custom_tools_;
+  std::map<std::string, std::string> namespaces_;
   Emit emit_;
   json output_ = json::array();
   std::string reasoning_, content_;  // the open item's text so far
