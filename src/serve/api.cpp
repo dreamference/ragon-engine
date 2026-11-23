@@ -779,7 +779,7 @@ json as_parts(const json& c) {
 
 }  // namespace
 
-Request parse_responses_request(const json& body, bool vision) {
+Request parse_responses_request(const json& body, bool vision, bool namespaces) {
   if (!body.is_object()) throw std::invalid_argument("the request body must be a JSON object");
   json messages = json::array();
   if (body.contains("instructions") && body["instructions"].is_string() && !body["instructions"].get<std::string>().empty())
@@ -854,6 +854,7 @@ Request parse_responses_request(const json& body, bool vision) {
   json tools = json::array();
   std::vector<std::string> custom;
   std::vector<Request::CustomFormat> formats;
+  std::map<std::string, std::string> tool_namespaces;
   if (body.contains("tools") && body["tools"].is_array()) {
     for (std::size_t i = 0; i < body["tools"].size(); ++i) {
       const json& t = body["tools"][i];
@@ -894,6 +895,20 @@ Request parse_responses_request(const json& body, bool vision) {
         custom.push_back(fn["name"].get<std::string>());
         continue;
       }
+      if (type == "namespace" && namespaces) {
+        const std::string ns = t.value("name", "");
+        if (t.contains("tools") && t["tools"].is_array())
+          for (const json& f : t["tools"]) {
+            if (!f.is_object() || f.value("type", "") != "function" || f.value("name", "").empty()) continue;
+            json fn = {{"name", f.value("name", "")}};
+            fn["description"] = f.contains("description") ? f["description"] : json();
+            fn["parameters"] = f.contains("parameters") ? f["parameters"] : json();
+            fn["strict"] = f.contains("strict") ? f["strict"] : json();
+            tools.push_back({{"type", "function"}, {"function", fn}});
+            tool_namespaces.emplace(f.value("name", ""), ns);
+          }
+        continue;
+      }
       if (type != "function") continue;
       json fn = {{"name", t.value("name", "")}};
       fn["description"] = t.contains("description") ? t["description"] : json();
@@ -922,6 +937,7 @@ Request parse_responses_request(const json& body, bool vision) {
   Request r = parse_request(chat, true, vision);
   r.workload = workload_of(body);  // both carriers sit on the Responses body, which `chat` does not copy
   r.custom_tools = std::move(custom);
+  r.tool_namespaces = std::move(tool_namespaces);
   if (!r.tools.empty()) r.custom_formats = std::move(formats);
   // `text.format` (json_schema with a flat `schema`, json_object; `text` asks for nothing) as a response_format.
   if (body.contains("text") && body["text"].is_object() && body["text"].contains("format") &&
@@ -1038,6 +1054,7 @@ void ResponseItems::deliver(const OutputParser::Delta& d) {
     }
     json item = {{"type", "function_call"}, {"id", new_id("fc_")}, {"call_id", new_id("call_")},
                  {"name", c.name}, {"arguments", c.arguments}, {"status", "completed"}};
+    if (auto ns = namespaces_.find(c.name); ns != namespaces_.end()) item["namespace"] = ns->second;
     emit_("response.output_item.added", {{"output_index", index}, {"item", item}});
     output_.push_back(item);
     emit_("response.output_item.done", {{"output_index", index}, {"item", item}});

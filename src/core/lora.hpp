@@ -108,7 +108,15 @@ struct LoraAdapter {
 uint64_t lora_scope(uint64_t scope, const LoraAdapter* adapter);
 
 // Whether `name` is an adapter name the API accepts: 1 to 64 of [A-Za-z0-9._-], not starting with '.'.
-bool lora_name_ok(const std::string& name);
+// Inline (std only) so the host-only API layer of the Metal build has it without the CUDA core.
+inline bool lora_name_ok(const std::string& name) {
+  if (name.empty() || name.size() > 64 || name[0] == '.') return false;
+  for (char ch : name)
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' ||
+          ch == '-'))
+      return false;
+  return true;
+}
 
 // The loaded set (max_loaded_loras): adapters by name, loaded only from directories under the library root (resolved
 // with realpath, so neither ".." nor a symlink leaves it). A full set refuses a load (the caller unloads first); an

@@ -281,14 +281,6 @@ uint64_t lora_scope(uint64_t scope, const LoraAdapter* adapter) {
   return h | 1;
 }
 
-bool lora_name_ok(const std::string& name) {
-  if (name.empty() || name.size() > 64 || name[0] == '.') return false;
-  return std::all_of(name.begin(), name.end(), [](char ch) {
-    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' ||
-           ch == '_' || ch == '-';
-  });
-}
-
 LoraLibrary::LoraLibrary(std::string root, int max_loaded, LoraModelShape target, LoraModelShape drafter)
     : max_loaded_(max_loaded), target_(std::move(target)), drafter_(std::move(drafter)) {
   if (!root.empty()) {

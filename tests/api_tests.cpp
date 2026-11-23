@@ -699,6 +699,38 @@ int main() {
     EXPECT(t.find("Look first.") != std::string::npos && t.find("Checking.") != std::string::npos);
   }
   {
+    // Namespace tools (Codex's multi_agent_v1): dropped by default, as production does; with `namespaces` (the
+    // Metal serve) its function tools are offered as plain functions, mapped back to the namespace, and a call to
+    // one goes out as a function_call with that `namespace` (Codex routes on it). Hosted web_search stays out.
+    json body = json::parse(R"({"tools":[{"type":"namespace","name":"multi_agent_v1","description":"Sub-agents.",
+      "tools":[{"type":"function","name":"spawn_agent","description":"Spawn one.","parameters":{"type":"object",
+      "properties":{"message":{"type":"string"}},"required":["message"]}}]},
+      {"type":"web_search","external_web_access":false},
+      {"type":"function","name":"shell","description":"Run","parameters":{"type":"object"},"strict":false}],
+      "reasoning":{"effort":"none"},"input":[{"type":"message","role":"user","content":"go"}]})");
+    const ragon::serve::Request off = ragon::serve::parse_responses_request(body);
+    EXPECT(off.tool_namespaces.empty() && off.prompt_text.find("spawn_agent") == std::string::npos);
+    EXPECT(off.prompt_text.find("\"name\": \"shell\"") != std::string::npos);
+    const ragon::serve::Request on = ragon::serve::parse_responses_request(body, false, true);
+    EXPECT(on.tool_namespaces.size() == 1 && on.tool_namespaces.at("spawn_agent") == "multi_agent_v1");
+    EXPECT(on.prompt_text.find("\"name\": \"spawn_agent\"") != std::string::npos);
+    EXPECT(on.prompt_text.find("\"name\": \"shell\"") != std::string::npos);
+    EXPECT(on.prompt_text.find("web_search") == std::string::npos);
+    EXPECT(on.tools.size() == 2);
+    json out;
+    ragon::serve::ResponseItems items({}, [&](const std::string& type, json p) {
+      if (type == "response.output_item.done") out.push_back(p["item"]);
+    });
+    items.set_namespaces(on.tool_namespaces);
+    OutputParser parser(false, on.tools);
+    items.deliver(parser.push("<tool_call>\n<function=spawn_agent>\n<parameter=message>\nhi\n</parameter>\n"
+                              "</function>\n</tool_call>\n<tool_call>\n<function=shell>\n</function>\n</tool_call>"));
+    items.deliver(parser.finish());
+    items.close();
+    EXPECT(out.size() == 2 && out[0]["type"] == "function_call" && out[0]["name"] == "spawn_agent");
+    EXPECT(out[0].value("namespace", "") == "multi_agent_v1" && !out[1].contains("namespace"));
+  }
+  {
     // BACKLOG §19.13: a `type: custom` (freeform) tool is offered to the model as a function with the one
     // string parameter `input`, its grammar appended to its description; the request remembers
     // which names are custom; a replayed custom_tool_call and its output render as that call and its
