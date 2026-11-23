@@ -199,18 +199,9 @@ __global__ void __launch_bounds__(512) hist_kernel(const uint32_t* __restrict__ 
     if (h[i]) atomicAdd(&hist[level * 4096 + i], h[i]);
 }
 
-// One warp: lane l sums bins [128 l, 128 l + 128); lane 0 walks the lanes' sums from the top, then its lane's bins.
-__global__ void find_kernel(const uint32_t* __restrict__ hist, uint32_t* __restrict__ state, int dynamic, int level,
-                            uint32_t* __restrict__ thr) {
-  pdl_begin();  // first statement: see launch.cuh
-  const uint32_t* h = hist + level * 4096;
-  const int lane = threadIdx.x, per = level == 2 ? 8 : 128;
-  uint32_t sum = 0;
-  for (int b = lane * per; b < lane * per + per; ++b) sum += h[b];
-  __shared__ uint32_t lanes[32];
-  lanes[lane] = sum;
-  __syncwarp();
-  if (lane != 0) return;
+// Lane 0 of find_kernel: walks the lanes' sums from the top, then its lane's bins, and moves the prefix on.
+__device__ __forceinline__ void find_walk(const uint32_t* h, const uint32_t* lanes, uint32_t* state, int dynamic,
+                                          int level, int per, uint32_t* thr) {
   const uint32_t want = level ? state[1] : static_cast<uint32_t>(dynamic);
   uint32_t above = 0;
   int c = 31;
@@ -222,6 +213,34 @@ __global__ void find_kernel(const uint32_t* __restrict__ hist, uint32_t* __restr
   state[0] = prefix;
   state[1] = want > above ? want - above : 0;
   if (level == 2) thr[0] = prefix;
+}
+
+// One warp: lane l sums bins [128 l, 128 l + 128); lane 0 walks the lanes' sums from the top, then its lane's bins.
+// HIP: every lane then clears the bins it summed, so the histograms are zero again for the next call and
+// sparse_head_select issues no memset (on gfx1151 the hipMemsetAsync cost ~0.4 ms of each draft's sync wait).
+#if defined(RAGON_BACKEND_HIP)
+__global__ void find_kernel(uint32_t* hist, uint32_t* __restrict__ state, int dynamic, int level,
+                            uint32_t* __restrict__ thr) {
+#else
+__global__ void find_kernel(const uint32_t* __restrict__ hist, uint32_t* __restrict__ state, int dynamic, int level,
+                            uint32_t* __restrict__ thr) {
+#endif
+  pdl_begin();  // first statement: see launch.cuh
+  const uint32_t* h = hist + level * 4096;
+  const int lane = threadIdx.x, per = level == 2 ? 8 : 128;
+  uint32_t sum = 0;
+  for (int b = lane * per; b < lane * per + per; ++b) sum += h[b];
+  __shared__ uint32_t lanes[32];
+  lanes[lane] = sum;
+  __syncwarp();
+#if defined(RAGON_BACKEND_HIP)
+  if (lane == 0) find_walk(h, lanes, state, dynamic, level, per, thr);
+  __syncwarp();
+  for (int b = lane * per; b < lane * per + per; ++b) hist[level * 4096 + b] = 0;
+#else
+  if (lane != 0) return;
+  find_walk(h, lanes, state, dynamic, level, per, thr);
+#endif
 }
 
 // The selection's flags: the marked rows, and every key at or above the threshold (keys equal to it are rare; every
@@ -289,11 +308,13 @@ void sparse_head_select(const float* p, int M, const gpu::bf16* us, int N, int R
   if (M <= 8) launch_kernel("sparse_head approx", approx_kernel<1>, grid(approx_kernel<1>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
   else if (M <= 16) launch_kernel("sparse_head approx", approx_kernel<2>, grid(approx_kernel<2>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
   else launch_kernel("sparse_head approx", approx_kernel<4>, grid(approx_kernel<4>), dim3(256), 0, s, p, M, us, N, fixed_mask, keys);
+#if !defined(RAGON_BACKEND_HIP)
   if (gpu::memset_async(hist, 0, 3 * 4096 * 4, s) != gpu::kSuccess) throw std::runtime_error("sparse_head_select: memset");
+#endif  // HIP: find_kernel leaves the bins zero (the scratch starts zeroed)
   for (int level = 0; level < 3; ++level) {
     launch_kernel("sparse_head hist", hist_kernel, dim3(96), dim3(512), 0, s, static_cast<const uint32_t*>(keys), N, hist,
                   static_cast<const uint32_t*>(state), level);
-    launch_kernel("sparse_head find", find_kernel, dim3(1), dim3(32), 0, s, static_cast<const uint32_t*>(hist), state,
+    launch_kernel("sparse_head find", find_kernel, dim3(1), dim3(32), 0, s, hist, state,
                   dynamic, level, thr);
   }
   launch_kernel("sparse_head flags", flags_kernel, dim3((N + 255) / 256), dim3(256), 0, s,

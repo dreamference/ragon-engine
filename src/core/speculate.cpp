@@ -422,6 +422,11 @@ void Engine::alloc_sparse_head() {
   sh_cap_ = static_cast<int>(std::min<long>((cap + 31) / 32 * 32, (V + 31) / 32 * 32));
   sh_p_ = alloc<float>(size_t(kernels::kMaxStreamRows) * sh_rank_);
   sh_scratch_ = alloc<uint8_t>(kernels::sparse_head_scratch_bytes(V));
+  // Zeroed once: on HIP sparse_head_select relies on its histogram bins starting zero (find_kernel clears them).
+  {
+    const std::vector<uint8_t> zero(kernels::sparse_head_scratch_bytes(V), 0);
+    check(gpu::memcpy_sync(sh_scratch_, zero.data(), zero.size(), gpu::kH2D), "sparse head scratch");
+  }
   sh_rows_ = alloc<int>(V);
   sh_nrows_ = alloc<int>(1);
   sh_ids_dev_ = alloc<int>(kShMarkMax);

@@ -364,7 +364,8 @@ void stream_gemm_gather_nvfp4(const gpu::half* x, const float* xinv, int M, cons
 // The sparse head's selection (sparse_head.cu): approx[n] = max over the M rows of p[m] . us[n] (p [M][R] FP32, us
 // [N][R] BF16, R = 256); then rows = every row any of the masks marks (the fixed list joined with each session's
 // context vocabulary) and the `dynamic` best of the others (ties at the threshold all taken), in id order, *nrows
-// their count (at most cap). `scratch` holds sparse_head_scratch_bytes(N).
+// their count (at most cap). `scratch` holds sparse_head_scratch_bytes(N), zeroed before the first call (HIP keeps
+// its histograms zero between calls instead of a memset per call).
 struct SelMasks {
   const uint8_t* m[kMaxSeqs];
   int n;
