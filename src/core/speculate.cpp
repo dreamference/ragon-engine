@@ -906,6 +906,7 @@ void Engine::draft_launch(int B, bool sparse) {
   const DraftConfig& d = draft_->config();
   const int H = d.hidden, E = B - 1, dq = d.heads * d.head_dim, dkv = d.kv_heads * d.head_dim;
   const int K16 = d.selector_top_k;
+  if (!gpu::hollow_io(1))
     check(gpu::memcpy_async(ids_dev_, pin_->draft_ids, B * sizeof(int), gpu::kH2D, stream_), "draft ids");
   kernels::embed(model_->embed(), ids_dev_, B, H, dres_, stream_);
   Session* const self[1] = {s_};
@@ -955,6 +956,7 @@ void Engine::draft_launch(int B, bool sparse) {
   linear_bf16_drafter(draft_->selector_projection(), dh_, E, dhp_);
   kernels::selector_lattice(dhp_, dcand_, dunary_, draft_->predecessor_codebook(), draft_->successor_codebook(),
                             pin_->draft_ids[0], E, dscores_, stream_, ids_dev_);
+  if (gpu::hollow_io(2)) return;
   check(gpu::memcpy_async(pin_->cand, dcand_, size_t(E) * K16 * sizeof(int), gpu::kD2H, stream_),
         "draft candidates");
   check(gpu::memcpy_async(pin_->scores, dscores_, size_t(E) * K16 * K16 * sizeof(float), gpu::kD2H,

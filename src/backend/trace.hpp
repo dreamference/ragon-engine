@@ -10,11 +10,16 @@
 namespace ragon::kernels {
 void launch_log_range_push(const char* name);  // launch_log_hip.cu: a no-op unless RAGON_LAUNCH_LOG=1
 void launch_log_range_pop();
+bool launch_hollow_io(unsigned bit);
 void stream_kick(gpu::Stream s);
 }  // namespace ragon::kernels
 namespace ragon::gpu {
 inline void range_push(const char* name) { kernels::launch_log_range_push(name); }
 inline void range_pop() { kernels::launch_log_range_pop(); }
+// RAGON_LAUNCH_HOLLOW_IO=bits (a measurement that breaks the results, with RAGON_LAUNCH_HOLLOW; launch_log_hip.cu):
+// inside a hollow draft range the transfers named by the bits are skipped too: 1 the draft ids H2D, 2 the
+// candidates and scores D2H.
+inline bool hollow_io(unsigned bit) { return kernels::launch_hollow_io(bit); }
 // One stream query outside a capture, so the runtime sends the batch it holds to the GPU now (TheRock #8786).
 inline void kick(Stream s) { kernels::stream_kick(s); }
 }  // namespace ragon::gpu
@@ -23,6 +28,7 @@ inline void kick(Stream s) { kernels::stream_kick(s); }
 namespace ragon::gpu {
 inline void range_push(const char* name) { nvtxRangePushA(name); }
 inline void range_pop() { nvtxRangePop(); }
+inline bool hollow_io(unsigned) { return false; }
 inline void kick(Stream) {}  // CUDA submits each launch at once
 }  // namespace ragon::gpu
 #endif

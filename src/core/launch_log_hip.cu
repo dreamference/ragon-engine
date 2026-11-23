@@ -167,6 +167,11 @@ bool launch_hollow_wants(const char* what) {
   return true;
 }
 
+bool launch_hollow_io(unsigned bit) {
+  static const unsigned bits = [] { const char* e = std::getenv("RAGON_LAUNCH_HOLLOW_IO"); return e ? unsigned(std::atoi(e)) : 0u; }();
+  return (bits & bit) != 0 && hollow_mode() != 0 && hollow_depth != 0;
+}
+
 void launch_hollow(gpu::Stream s) {
   if (hollow_mode() == 1) hollow_kernel<<<1, 32, 0, s>>>();
 }
