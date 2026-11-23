@@ -17,8 +17,9 @@
 #                  must have that flag (eng/checkpoint-limit b706d0c)
 #      ckb-sp0     ckb with --side-prefill 0 (a sibling's suffix prefill alternates on the main stream with all SMs
 #                  instead of the 40-SM side stream), 8k and 32k
-#      ckb-nf      ckb with --decode-floor off (no floor holds or cut side chunks), 8k and 32k
-#      (CKB_SIZES overrides the sizes of ckb, ckb-sp0 and ckb-nf, e.g. 8000,32000,100000)
+#      ckb-ps      ckb with --side-prefill -1 (the suffix prefill on a plain second stream, all SMs, beside the
+#                  decode), 8k and 32k
+#      (CKB_SIZES overrides the sizes of ckb, ckb-sp0 and ckb-ps, e.g. 8000,32000,100000)
 #      ck24        fix arm: paged, sessions/batch $FIX_SESSIONS, --prefix-checkpoints 24 (the image's binary), 8k and 32k only
 #      paged-x100  no bench: the paged arm's exact probe at 100000, the baseline for ckl's
 # env: SGLANG_IMAGE RAGON_IMAGE (pinned digests), HF_CACHE DF_CACHE (host dirs mounted at /root/.cache/huggingface
@@ -40,7 +41,7 @@ case $ARM in *-n) RUNARGS+=(--arm n --idle 0) ;; esac
 case $ARM in
   ckl) EXACT_SIZES=8000,100000
        [ -x "${RAGON_BIN:-}" ] || { echo "$(date -u +%T) $ARM: RAGON_BIN is not an executable"; exit 2; } ;;
-  ckb|ckb-sp0|ckb-nf) RUNARGS+=(--sizes "${CKB_SIZES:-8000,32000}")
+  ckb|ckb-sp0|ckb-ps) RUNARGS+=(--sizes "${CKB_SIZES:-8000,32000}")
        [ -x "${RAGON_BIN:-}" ] || { echo "$(date -u +%T) $ARM: RAGON_BIN is not an executable"; exit 2; } ;;
   ck24) RUNARGS+=(--sizes 8000,32000) ;;
   paged-x100) EXACT_SIZES=100000; BENCH=0 ;;
@@ -73,8 +74,8 @@ case ${ARM%-n} in
             --checkpoint-limit "$CKPT_LIMIT" --branch-checkpoint-min "$BRANCH_MIN" > /dev/null ;;
   ckb-sp0) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
             --checkpoint-limit "$CKPT_LIMIT" --branch-checkpoint-min "$BRANCH_MIN" --side-prefill 0 > /dev/null ;;
-  ckb-nf) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
-            --checkpoint-limit "$CKPT_LIMIT" --branch-checkpoint-min "$BRANCH_MIN" --decode-floor off > /dev/null ;;
+  ckb-ps) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
+            --checkpoint-limit "$CKPT_LIMIT" --branch-checkpoint-min "$BRANCH_MIN" --side-prefill -1 > /dev/null ;;
   ck24)   "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FIX_SESSIONS" --batch "$FIX_SESSIONS" --kv-pages \
             --prefix-checkpoints 24 > /dev/null ;;
   paged-x100) "${DOCKER[@]}" "$RAGON_IMAGE" "${RAGON[@]}" --sessions "$FLAT_SESSIONS" --batch "$FLAT_SESSIONS" --kv-pages > /dev/null ;;
