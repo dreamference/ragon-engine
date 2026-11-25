@@ -470,6 +470,7 @@ bool test_gemm(int N, int Kd, uint32_t seed, const std::vector<int>& Ms) {
   for (auto& v : old) v = value(rng);
   float* dy = ragon::test::alloc<float>(old.size());
   uint16_t* dyb = ragon::test::alloc<uint16_t>(old.size());
+  const std::vector<uint16_t> oldb(old.size(), 0x7fa5);  // bf16out's prior contents (a NaN no result has)
   const float alpha = 0.0137f;
   bool ok = true;
   std::vector<float> full4, full8;
@@ -486,6 +487,7 @@ bool test_gemm(int N, int Kd, uint32_t seed, const std::vector<int>& Ms) {
     ragon::test::h2d(dy, old.data(), old.size() * 4);
     K::prefill_gemm_fp8(dq8, M, w.t8, alpha, dy, ldy, N, Kd, true, nullptr);
     auto ya = download(dy, old.size());
+    ragon::test::h2d(dyb, oldb.data(), oldb.size() * 2);
     K::prefill_gemm_fp8_bf16out(dq8, M, w.t8, alpha, reinterpret_cast<gpu::bf16*>(dyb), ldy, N, Kd, nullptr);
     auto yb = download(dyb, old.size());
     const char* err = ragon::test::sync_error();
@@ -501,7 +503,7 @@ bool test_gemm(int N, int Kd, uint32_t seed, const std::vector<int>& Ms) {
       for (int n = 0; n < ldy; ++n) {
         const size_t j = size_t(m) * ldy + n;
         if (m < M && n < N) bfe &= yb[j] == bf16_bits(y8[j]);
-        else untouched &= y4[j] == old[j] && y8[j] == old[j];
+        else untouched &= y4[j] == old[j] && y8[j] == old[j] && yb[j] == oldb[j];
       }
     good &= bfe && untouched;
     if (idx == 0) full4 = y4, full8 = y8, fullb = yb;
@@ -882,6 +884,49 @@ void time_gemm_bf16() {
     for (void* p : {static_cast<void*>(x), static_cast<void*>(w), static_cast<void*>(y)}) ragon::test::free_bytes(p);
   }
 }
+
+// RAGON_PREFILL_BENCH=1: the prefill GEMMs at one 2048-row slab of the engine's shapes (and at 256 columns, where
+// the weights stay in cache), timed: a warm-up, then the mean of five launches.
+void time_prefill() {
+  const int M = 2048;
+  struct Shape { const char* name; int kind, N, K; };  // kind 0 swiglu, 1 nvfp4, 2 fp8, 3 narrow
+  const Shape shapes[] = {{"swiglu", 0, 17408, 5120}, {"swiglu", 0, 256, 5120}, {"nvfp4_down", 1, 5120, 17408},
+                          {"nvfp4_down", 1, 256, 17408}, {"fp8", 2, 10240, 5120}, {"fp8", 2, 256, 5120},
+                          {"narrow", 3, 48, 5120}};
+  for (const auto& sh : shapes) {
+    const int N = sh.N, Kd = sh.K;
+    const size_t wbytes = sh.kind == 2 ? K::tiled_bytes_fp8(N, Kd) : sh.kind == 3 ? size_t(N) * Kd * 2 : K::tiled_bytes_nvfp4(N, Kd);
+    auto* w = ragon::test::alloc<uint8_t>(wbytes);
+    auto* w2 = ragon::test::alloc<uint8_t>(wbytes);
+    auto* xq = ragon::test::alloc<uint8_t>(size_t(M) * Kd * 2);
+    auto* xs = ragon::test::alloc<uint8_t>(size_t(M) * Kd / 16);
+    auto* y = ragon::test::alloc<float>(size_t(M) * N);
+    auto* y2 = ragon::test::alloc<float>(size_t(M) * N);
+    auto* q = ragon::test::alloc<uint8_t>(size_t(M) * N / 2);
+    auto* sf = ragon::test::alloc<uint8_t>(size_t(M) * N / 16);
+    (void)hipMemset(w, 0x22, wbytes), (void)hipMemset(w2, 0x22, wbytes);
+    (void)hipMemset(xq, 0x22, size_t(M) * Kd * 2), (void)hipMemset(xs, 0x22, size_t(M) * Kd / 16);
+    auto run = [&] {
+      if (sh.kind == 0) K::prefill_swiglu_nvfp4(xq, xs, M, w, 0.01f, w2, 0.01f, N, Kd, 0.01f, q, sf, nullptr, nullptr, nullptr);
+      else if (sh.kind == 1) K::prefill_gemm_nvfp4(xq, xs, M, w, 0.01f, y, N, N, Kd, false, nullptr, nullptr);
+      else if (sh.kind == 2) K::prefill_gemm_fp8(xq, M, w, 0.01f, y, N, N, Kd, false, nullptr);
+      else K::narrow_bf16_bf16in(reinterpret_cast<const gpu::bf16*>(xq), M, reinterpret_cast<const gpu::bf16*>(w),
+                                 reinterpret_cast<const gpu::bf16*>(w2), y, y2, N, Kd, nullptr);
+    };
+    run();
+    ragon::test::Timer t;
+    t.start();
+    for (int i = 0; i < 5; ++i) run();
+    const float ms = t.stop() / 5;
+    const char* err = ragon::test::sync_error();
+    const double flop = 2.0 * M * N * Kd * (sh.kind == 0 ? 2 : sh.kind == 3 ? 2 : 1);
+    std::printf("bench %s M=%d N=%d K=%d: %.3f ms %.1f TFLOPS%s%s\n", sh.name, M, N, Kd, ms,
+                flop / (ms * 1e9), err ? " error " : "", err ? err : "");
+    for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xq), static_cast<void*>(xs),
+                    static_cast<void*>(y), static_cast<void*>(y2), static_cast<void*>(q), static_cast<void*>(sf)})
+      ragon::test::free_bytes(p);
+  }
+}
 #endif
 
 int main() {
@@ -904,6 +949,7 @@ int main() {
 #ifdef RAGON_BACKEND_HIP
   ok &= test_gemm_bf16(48, 272, {2100, 5}, 35);       // two row slabs; a K % 256 tail (cuda's form needs K % 64 == 0)
   if (const char* e = std::getenv("RAGON_LAUNCH_LOG"); e && std::atoi(e) != 0) time_gemm_bf16();
+  if (const char* e = std::getenv("RAGON_PREFILL_BENCH"); e && std::atoi(e) != 0) time_prefill();
 #endif
   std::printf("QHASH %016llx\n", static_cast<unsigned long long>(g_qhash));
   std::printf("HASH %016llx\n", static_cast<unsigned long long>(g_hash));

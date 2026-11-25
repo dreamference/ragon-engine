@@ -258,33 +258,45 @@ struct GemmArgs {
   bool accumulate;
 };
 
-// The four B fragments (16 weight rows x 64 K) of tile `tile`, as stream_kernel decodes them.
+// The raw bytes of one lane's share of weight tile `tile` (FP4: 16 code bytes and two scales; FP8: 32 bytes).
+template <bool FP4> struct WRaw;
+template <> struct WRaw<true> { v4u c; u32 s2; };
+template <> struct WRaw<false> { v4u c0, c1; };
+
 template <bool FP4>
-__device__ __forceinline__ void weight_frags(const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc, u64 tile,
-                                             u32 r16, u32 half, v16h (&bq)[4]) {
+__device__ __forceinline__ void weight_load(const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc, u64 tile,
+                                            u32 r16, u32 half, WRaw<FP4>& r) {
+  if constexpr (FP4) {
+    r.c = *(const v4u*)(w + tile * 512 + r16 * 32 + half * 16);
+    r.s2 = *(const unsigned short*)(sc + tile * 64 + r16 * 4 + half * 2);
+  } else {
+    const uint8_t* base = w + tile * 1024 + r16 * 64 + half * 32;
+    r.c0 = *(const v4u*)base;
+    r.c1 = *(const v4u*)(base + 16);
+  }
+}
+
+// The four B fragments (16 weight rows x 64 K) of a tile's raw bytes, as stream_kernel decodes them.
+template <bool FP4>
+__device__ __forceinline__ void weight_decode(const WRaw<FP4>& r, u32 half, v16h (&bq)[4]) {
   v8u own0, own1;
   if constexpr (FP4) {
-    const v4u c = *(const v4u*)(w + tile * 512 + r16 * 32 + half * 16);
-    const u32 s2 = *(const unsigned short*)(sc + tile * 64 + r16 * 4 + half * 2);
-    const v2h sa = e4m3_h2(s2 & 0xFF), sb = e4m3_h2(s2 >> 8);
+    const v2h sa = e4m3_h2(r.s2 & 0xFF), sb = e4m3_h2(r.s2 >> 8);
     v2h o[8];
-    dec_fp4(c.x, sa, o);
-    dec_fp4(c.y, sa, o + 4);
+    dec_fp4(r.c.x, sa, o);
+    dec_fp4(r.c.y, sa, o + 4);
 #pragma unroll
     for (int e = 0; e < 8; e++) own0[e] = as_u(o[e]);
-    dec_fp4(c.z, sb, o);
-    dec_fp4(c.w, sb, o + 4);
+    dec_fp4(r.c.z, sb, o);
+    dec_fp4(r.c.w, sb, o + 4);
 #pragma unroll
     for (int e = 0; e < 8; e++) own1[e] = as_u(o[e]);
   } else {
-    const uint8_t* base = w + tile * 1024 + r16 * 64 + half * 32;
-    const v4u c0 = *(const v4u*)base;
-    const v4u c1 = *(const v4u*)(base + 16);
     v2h o[8];
-    dec_fp8(c0.x, o); dec_fp8(c0.y, o + 2); dec_fp8(c0.z, o + 4); dec_fp8(c0.w, o + 6);
+    dec_fp8(r.c0.x, o); dec_fp8(r.c0.y, o + 2); dec_fp8(r.c0.z, o + 4); dec_fp8(r.c0.w, o + 6);
 #pragma unroll
     for (int e = 0; e < 8; e++) own0[e] = as_u(o[e]);
-    dec_fp8(c1.x, o); dec_fp8(c1.y, o + 2); dec_fp8(c1.z, o + 4); dec_fp8(c1.w, o + 6);
+    dec_fp8(r.c1.x, o); dec_fp8(r.c1.y, o + 2); dec_fp8(r.c1.z, o + 4); dec_fp8(r.c1.w, o + 6);
 #pragma unroll
     for (int e = 0; e < 8; e++) own1[e] = as_u(o[e]);
   }
@@ -297,105 +309,174 @@ __device__ __forceinline__ void weight_frags(const uint8_t* __restrict__ w, cons
   bq[3] = __builtin_bit_cast(v16h, half ? own1 : oth1);
 }
 
-// A block: 64 rows (blockIdx.y) x 8 weight tiles of 16 columns (blockIdx.x, one per wave). The activations of a
-// 256-K chunk are decoded to FP16 into LDS (rows past M as zeros); each wave decodes its weight tile once per 64 K
-// and runs it against the four 16-row groups. K ascends; nothing is split.
-template <bool FP4, int MODE>
-__global__ void __launch_bounds__(kWaves * 32) prefill_gemm_kernel(GemmArgs p) {
-  __shared__ __attribute__((aligned(16))) hf XS[kBR * kXSt];
-  const u32 tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, half = lane >> 4, r16 = lane & 15;
-  const int N = p.N, K = p.K, M = p.M;
-  const u32 ntiles = N / 16;
-  const u32 nt = blockIdx.x * kWaves + wave;
-  const bool valid = nt < ntiles;  // wave-uniform
-  const int m0 = blockIdx.y * kBR;
-  const uint8_t* __restrict__ sc1 = p.w + static_cast<size_t>(N) * K / 2;
-  const uint8_t* __restrict__ sc2 = MODE == kSwiglu ? p.w2 + static_cast<size_t>(N) * K / 2 : nullptr;
+// One weight tile's 16 WMMAs: four 16-row groups x four 16-K steps, K ascending per group.
+__device__ __forceinline__ void mma_tile(const hf* XS, u32 r16, int kk, const v16h (&bq)[4], v8f (&acc)[4]) {
+#pragma unroll
+  for (int g = 0; g < 4; ++g)
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const v16h a = *(const v16h*)(XS + (g * 16 + r16) * kXSt + kk + q * 16);
+      acc[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq[q], acc[g]);
+    }
+}
 
-  v8f acc[4] = {}, acc2[4] = {};
-  for (int k0 = 0; k0 < K; k0 += kKC) {
-    const int kc = min(kKC, K - k0);
-    // Stage: 8 values (16 bytes of FP16) per item.
-    const int per_row = kc / 8;
-    for (int i = tid; i < kBR * per_row; i += kWaves * 32) {
+// Activation staging in two halves: the raw codes of a chunk into registers (issued before the previous chunk's
+// WMMAs), then decoded into LDS. Item i of a chunk: row i / (kc / 8), 8 values from K offset 8 (i % (kc / 8)).
+constexpr int kStageItems = kBR * (kKC / 8) / (kWaves * 32);
+
+template <bool FP4>
+__device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, int kc, u32 tid, u32 (&a)[kStageItems],
+                                           u32 (&b)[kStageItems]) {
+  const int per_row = kc / 8, K = p.K;
+#pragma unroll
+  for (int j = 0; j < kStageItems; ++j) {
+    const int i = static_cast<int>(tid) + j * kWaves * 32;
+    a[j] = 0, b[j] = 0;
+    if (i < kBR * per_row) {
       const int r = i / per_row, c8 = i - r * per_row, row = m0 + r, k = k0 + c8 * 8;
-      v4u v = {0, 0, 0, 0};
-      if (row < M) {
-        v2h o[4];
+      if (row < p.M) {
         if constexpr (FP4) {
-          const u32 c = *(const u32*)(p.xq + static_cast<size_t>(row) * (K / 2) + k / 2);
-          dec_fp4(c, e4m3_h2(p.xs[static_cast<size_t>(row) * (K / 16) + k / 16]), o);
+          a[j] = *(const u32*)(p.xq + static_cast<size_t>(row) * (K / 2) + k / 2);
+          b[j] = p.xs[static_cast<size_t>(row) * (K / 16) + k / 16];
         } else {
           const uint2 c = *(const uint2*)(p.xq + static_cast<size_t>(row) * K + k);
-          dec_fp8(c.x, o);
-          dec_fp8(c.y, o + 2);
+          a[j] = c.x, b[j] = c.y;
+        }
+      }
+    }
+  }
+}
+
+template <bool FP4>
+__device__ __forceinline__ void stage_store(const GemmArgs& p, int m0, int kc, u32 tid, const u32 (&a)[kStageItems],
+                                            const u32 (&b)[kStageItems], hf* XS) {
+  const int per_row = kc / 8;
+#pragma unroll
+  for (int j = 0; j < kStageItems; ++j) {
+    const int i = static_cast<int>(tid) + j * kWaves * 32;
+    if (i < kBR * per_row) {
+      const int r = i / per_row, c8 = i - r * per_row;
+      v4u v = {0, 0, 0, 0};
+      if (m0 + r < p.M) {
+        v2h o[4];
+        if constexpr (FP4) {
+          dec_fp4(a[j], e4m3_h2(b[j]), o);
+        } else {
+          dec_fp8(a[j], o);
+          dec_fp8(b[j], o + 2);
         }
         v = v4u{as_u(o[0]), as_u(o[1]), as_u(o[2]), as_u(o[3])};
       }
       *(v4u*)(XS + r * kXSt + c8 * 8) = v;
     }
+  }
+}
+
+// A block: 64 rows x 8 waves. Each wave holds two 16-column weight tiles (SwiGLU: the gate's and the up projection's
+// tile of its 16 columns; otherwise two adjacent column tiles) and feeds every A fragment it reads from LDS to both.
+// The activations of a 256-K chunk are decoded to FP16 into LDS (rows past M as zeros); the next chunk's codes are
+// loaded into registers while this chunk's WMMAs run, and the next 64-K weight tiles' bytes while this tile's are
+// decoded and used. Row blocks run fastest in the grid (blockIdx.x), so the blocks resident together read the same
+// weight tiles. K ascends and nothing is split: each output is the plain WMMA chain over K.
+template <bool FP4, int MODE>
+__global__ void __launch_bounds__(kWaves * 32) prefill_gemm_kernel(GemmArgs p) {
+  __shared__ __attribute__((aligned(16))) hf XS[kBR * kXSt];
+  constexpr bool kSw = MODE == kSwiglu;
+  constexpr int kTN = kSw ? 1 : 2;  // output tiles per wave
+  const u32 tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, half = lane >> 4, r16 = lane & 15;
+  const int N = p.N, K = p.K, M = p.M;
+  const u32 ntiles = N / 16;
+  const u32 nt = (blockIdx.y * kWaves + wave) * kTN;
+  const bool valid = nt < ntiles;              // wave-uniform
+  const bool second = kSw || nt + 1 < ntiles;  // the second weight tile (always there in SwiGLU)
+  const int m0 = blockIdx.x * kBR;
+  const uint8_t* __restrict__ sc1 = p.w + static_cast<size_t>(N) * K / 2;
+  // The second tile: the up projection's tile nt (SwiGLU) or the gate matrix's tile nt + 1.
+  const uint8_t* __restrict__ w2 = kSw ? p.w2 : p.w;
+  const uint8_t* __restrict__ sc2 = kSw ? p.w2 + static_cast<size_t>(N) * K / 2 : sc1;
+  const u32 nt2 = kSw ? nt : nt + 1;
+
+  v8f acc[kTN][4] = {}, acc2[4] = {};
+  u32 sa[kStageItems], sb[kStageItems];
+  stage_load<FP4>(p, m0, 0, min(kKC, K), tid, sa, sb);
+  WRaw<FP4> wn[2] = {};
+  if (valid) {
+    weight_load<FP4>(p.w, sc1, nt, r16, half, wn[0]);
+    if (second) weight_load<FP4>(w2, sc2, nt2, r16, half, wn[1]);
+  }
+  for (int k0 = 0; k0 < K; k0 += kKC) {
+    const int kc = min(kKC, K - k0);
+    stage_store<FP4>(p, m0, kc, tid, sa, sb, XS);
     __syncthreads();
+    if (k0 + kKC < K) stage_load<FP4>(p, m0, k0 + kKC, min(kKC, K - k0 - kKC), tid, sa, sb);
     if (valid) {
       for (int kk = 0; kk < kc; kk += kTileK) {
-        const u64 tile = static_cast<u64>((k0 + kk) / kTileK) * ntiles + nt;
-        v16h bq[4];
-        weight_frags<FP4>(p.w, sc1, tile, r16, half, bq);
-#pragma unroll
-        for (int g = 0; g < 4; ++g)
-#pragma unroll
-          for (int q = 0; q < 4; ++q) {
-            const v16h a = *(const v16h*)(XS + (g * 16 + r16) * kXSt + kk + q * 16);
-            acc[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq[q], acc[g]);
-          }
-        if constexpr (MODE == kSwiglu) {
-          weight_frags<FP4>(p.w2, sc2, tile, r16, half, bq);
+        const WRaw<FP4> wc0 = wn[0], wc1 = wn[1];
+        const int kn = k0 + kk + kTileK;
+        if (kn < K) {
+          const u64 tb = static_cast<u64>(kn / kTileK) * ntiles;
+          weight_load<FP4>(p.w, sc1, tb + nt, r16, half, wn[0]);
+          if (second) weight_load<FP4>(w2, sc2, tb + nt2, r16, half, wn[1]);
+        }
+        v16h bq[4], bq2[4];
+        weight_decode<FP4>(wc0, half, bq);
+        if (second) {
+          weight_decode<FP4>(wc1, half, bq2);
 #pragma unroll
           for (int g = 0; g < 4; ++g)
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
               const v16h a = *(const v16h*)(XS + (g * 16 + r16) * kXSt + kk + q * 16);
-              acc2[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq[q], acc2[g]);
+              acc[0][g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq[q], acc[0][g]);
+              if constexpr (kSw) acc2[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq2[q], acc2[g]);
+              else acc[kTN - 1][g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq2[q], acc[kTN - 1][g]);
             }
+        } else {
+          mma_tile(XS, r16, kk, bq, acc[0]);
         }
       }
     }
     __syncthreads();
   }
   if (!valid) return;
-  // acc[g][r]: row m0 + 16 g + 2 r + half, column 16 nt + r16.
-  const int col = nt * 16 + r16;
 #pragma unroll
-  for (int g = 0; g < 4; ++g)
+  for (int t = 0; t < kTN; ++t) {
+    if (t == 1 && !second) break;
+    // acc[t][g][r]: row m0 + 16 g + 2 r + half, column 16 (nt + t) + r16.
+    const int col = (nt + t) * 16 + r16;
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-      const int row = m0 + g * 16 + 2 * r + half;
-      if constexpr (MODE == kSwiglu) {
-        // The 16 columns of a row are one NVFP4 block, held by the 16 lanes of a half-wave.
-        const float gv = gpu::mul_rn(acc[g][r], p.alpha), uv = gpu::mul_rn(acc2[g][r], p.alpha2);
-        const float v = bf16_round(gpu::mul_rn(silu(gv), uv));
-        float amax = fabsf(v);
+    for (int g = 0; g < 4; ++g)
 #pragma unroll
-        for (int o = 1; o < 16; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(gpu::kWarpMask, amax, o));
-        const u32 s = gpu::e4m3_from_float(gpu::mul_rn(p.gscale_out, gpu::mul_rn(amax, 1.f / 6.f)));
-        const float sv = e4m3f(s);
-        const float os = sv != 0.f ? 1.f / gpu::mul_rn(sv, 1.f / p.gscale_out) : 0.f;
-        const u32 code = e2m1(gpu::mul_rn(v, os));
-        const u32 other = __shfl_xor_sync(gpu::kWarpMask, code, 1);
-        if (row < M) {
-          if ((r16 & 1) == 0) p.q_out[static_cast<size_t>(row) * (N / 2) + col / 2] = static_cast<uint8_t>(code | (other << 4));
-          if (r16 == 0) p.sf_out[static_cast<size_t>(row) * (N / 16) + nt] = static_cast<uint8_t>(s);
-        }
-      } else if constexpr (MODE == kBf16Out) {
-        if (row < M) p.yb[static_cast<size_t>(row) * p.ldy + col] = gpu::bf16_from_float(gpu::mul_rn(acc[g][r], p.alpha));
-      } else {
-        if (row < M) {
-          float* d = p.y + static_cast<size_t>(row) * p.ldy + col;
-          float v = gpu::mul_rn(acc[g][r], p.alpha);
-          if (p.accumulate) v = v + *d;
-          *d = v;
+      for (int r = 0; r < 8; ++r) {
+        const int row = m0 + g * 16 + 2 * r + half;
+        if constexpr (kSw) {
+          // The 16 columns of a row are one NVFP4 block, held by the 16 lanes of a half-wave.
+          const float gv = gpu::mul_rn(acc[0][g][r], p.alpha), uv = gpu::mul_rn(acc2[g][r], p.alpha2);
+          const float v = bf16_round(gpu::mul_rn(silu(gv), uv));
+          float amax = fabsf(v);
+#pragma unroll
+          for (int o = 1; o < 16; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(gpu::kWarpMask, amax, o));
+          const u32 s = gpu::e4m3_from_float(gpu::mul_rn(p.gscale_out, gpu::mul_rn(amax, 1.f / 6.f)));
+          const float sv = e4m3f(s);
+          const float os = sv != 0.f ? 1.f / gpu::mul_rn(sv, 1.f / p.gscale_out) : 0.f;
+          const u32 code = e2m1(gpu::mul_rn(v, os));
+          const u32 other = __shfl_xor_sync(gpu::kWarpMask, code, 1);
+          if (row < M) {
+            if ((r16 & 1) == 0) p.q_out[static_cast<size_t>(row) * (N / 2) + col / 2] = static_cast<uint8_t>(code | (other << 4));
+            if (r16 == 0) p.sf_out[static_cast<size_t>(row) * (N / 16) + nt] = static_cast<uint8_t>(s);
+          }
+        } else if constexpr (MODE == kBf16Out) {
+          if (row < M) p.yb[static_cast<size_t>(row) * p.ldy + col] = gpu::bf16_from_float(gpu::mul_rn(acc[t][g][r], p.alpha));
+        } else {
+          if (row < M) {
+            float* d = p.y + static_cast<size_t>(row) * p.ldy + col;
+            float v = gpu::mul_rn(acc[t][g][r], p.alpha);
+            if (p.accumulate) v = v + *d;
+            *d = v;
+          }
         }
       }
-    }
+  }
 }
 
 template <bool FP4, int MODE>
@@ -403,6 +484,7 @@ void launch_gemm(GemmArgs p, gpu::Stream s, const char* what) {
   if (p.N <= 0 || p.K <= 0 || p.N % 16 != 0 || p.K % 128 != 0)
     throw std::runtime_error(std::string(what) + ": N % 16 and K % 128 must be 0");
   const int M = p.M;
+  constexpr int tn = MODE == kSwiglu ? 1 : 2;  // the kernel's kTN
   for (int r0 = 0; r0 < M; r0 += kSlabRows) {
     GemmArgs q = p;
     q.M = std::min(kSlabRows, M - r0);
@@ -412,8 +494,8 @@ void launch_gemm(GemmArgs p, gpu::Stream s, const char* what) {
     if (p.yb) q.yb = p.yb + static_cast<size_t>(r0) * p.ldy;
     if (p.q_out) q.q_out = p.q_out + static_cast<size_t>(r0) * (p.N / 2);
     if (p.sf_out) q.sf_out = p.sf_out + static_cast<size_t>(r0) * (p.N / 16);
-    const dim3 grid((p.N / 16 + kWaves - 1) / kWaves, (q.M + kBR - 1) / kBR);
-    launch_kernel(what, prefill_gemm_kernel<FP4, MODE>, grid, dim3(kWaves * 32), 0, s, q);
+    const unsigned cb = (p.N / 16 + kWaves * tn - 1) / (kWaves * tn), rb = (q.M + kBR - 1) / kBR;
+    launch_kernel(what, prefill_gemm_kernel<FP4, MODE>, dim3(rb, cb), dim3(kWaves * 32), 0, s, q);
   }
 }
 
@@ -435,6 +517,77 @@ __global__ void __launch_bounds__(96) narrow_bf16_kernel(const InT* __restrict__
   }
   if (col < N) ya[static_cast<size_t>(row) * N + col] = acc;
   else yb[static_cast<size_t>(row) * N + col - N] = acc;
+}
+
+// The same sums, row-blocked: a block holds 16 rows x 96 outputs (two groups of 96 threads, 8 rows per thread); x
+// staged in LDS (rounded to BF16 as above), weights read 16 bytes at a time. Each output still adds its terms one
+// FMA at a time with K ascending, so every bit equals narrow_bf16_kernel's.
+constexpr int kNarrowRows = 8, kNarrowKC = 256;
+template <typename InT>
+__global__ void __launch_bounds__(192) narrow_bf16_rows_kernel(const InT* __restrict__ x, int M,
+                                                               const gpu::bf16* __restrict__ wa,
+                                                               const gpu::bf16* __restrict__ wb, float* __restrict__ ya,
+                                                               float* __restrict__ yb, int N, int K) {
+  __shared__ __attribute__((aligned(16))) float XN[2 * kNarrowRows][kNarrowKC];
+  const int tid = threadIdx.x, col = tid % 96, grp = tid / 96;
+  const int r0 = blockIdx.x * 2 * kNarrowRows;
+  const gpu::bf16* wr = col < N ? wa + static_cast<size_t>(col) * K : wb + static_cast<size_t>(col - N) * K;
+  float acc[kNarrowRows];
+#pragma unroll
+  for (int r = 0; r < kNarrowRows; ++r) acc[r] = 0.f;
+  for (int k0 = 0; k0 < K; k0 += kNarrowKC) {
+    const int kc = min(kNarrowKC, K - k0);
+    for (int i = tid; i < 2 * kNarrowRows * kc; i += 192) {
+      const int r = i / kc, k = i - r * kc, row = r0 + r;
+      XN[r][k] = row < M ? bf16_round(static_cast<float>(x[static_cast<size_t>(row) * K + k0 + k])) : 0.f;
+    }
+    __syncthreads();
+    for (int kk = 0; kk < kc; kk += 8) {
+      const v4u wv = *(const v4u*)(wr + k0 + kk);
+      float wf[8];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        wf[2 * e] = __uint_as_float(wv[e] << 16);
+        wf[2 * e + 1] = __uint_as_float(wv[e] & 0xFFFF0000u);
+      }
+#pragma unroll
+      for (int r = 0; r < kNarrowRows; ++r) {
+        const float4 x0 = *(const float4*)&XN[grp * kNarrowRows + r][kk];
+        const float4 x1 = *(const float4*)&XN[grp * kNarrowRows + r][kk + 4];
+        float a = acc[r];
+        a = fmaf(x0.x, wf[0], a); a = fmaf(x0.y, wf[1], a); a = fmaf(x0.z, wf[2], a); a = fmaf(x0.w, wf[3], a);
+        a = fmaf(x1.x, wf[4], a); a = fmaf(x1.y, wf[5], a); a = fmaf(x1.z, wf[6], a); a = fmaf(x1.w, wf[7], a);
+        acc[r] = a;
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int r = 0; r < kNarrowRows; ++r) {
+    const int row = r0 + grp * kNarrowRows + r;
+    if (row < M) {
+      if (col < N) ya[static_cast<size_t>(row) * N + col] = acc[r];
+      else yb[static_cast<size_t>(row) * N + col - N] = acc[r];
+    }
+  }
+}
+
+template <typename InT>
+void launch_narrow(const char* what, const InT* x, int M, const gpu::bf16* wa, const gpu::bf16* wb, float* ya,
+                   float* yb, int N, int K, gpu::Stream s) {
+  if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
+  const bool rows = (reinterpret_cast<uintptr_t>(wa) % 16 == 0) &&
+                    (reinterpret_cast<uintptr_t>(wb) % 16 == 0);
+  for (int r0 = 0; r0 < M; r0 += kSlabRows) {
+    const int m = std::min(kSlabRows, M - r0);
+    const InT* xs = x + static_cast<size_t>(r0) * K;
+    float *a = ya + static_cast<size_t>(r0) * N, *b = yb + static_cast<size_t>(r0) * N;
+    if (rows)
+      launch_kernel(what, narrow_bf16_rows_kernel<InT>, dim3((m + 2 * kNarrowRows - 1) / (2 * kNarrowRows)), dim3(192),
+                    0, s, xs, m, wa, wb, a, b, N, K);
+    else
+      launch_kernel(what, narrow_bf16_kernel<InT>, dim3(m), dim3(96), 0, s, xs, m, wa, wb, a, b, N, K);
+  }
 }
 
 int grid_for(size_t n) { return static_cast<int>(std::min<size_t>((n + 255) / 256, 48 * 64)); }
@@ -525,20 +678,12 @@ void prefill_gemm_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8
 
 void narrow_bf16(const float* x, int M, const gpu::bf16* wa, const gpu::bf16* wb, float* ya, float* yb, int N, int K,
                  gpu::Stream s) {
-  if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
-  for (int r0 = 0; r0 < M; r0 += kSlabRows)
-    launch_kernel("narrow_bf16", narrow_bf16_kernel<float>, dim3(std::min(kSlabRows, M - r0)), dim3(96), 0, s,
-                  x + static_cast<size_t>(r0) * K, M - r0, wa, wb, ya + static_cast<size_t>(r0) * N,
-                  yb + static_cast<size_t>(r0) * N, N, K);
+  launch_narrow("narrow_bf16", x, M, wa, wb, ya, yb, N, K, s);
 }
 
 void narrow_bf16_bf16in(const gpu::bf16* x, int M, const gpu::bf16* wa, const gpu::bf16* wb, float* ya, float* yb,
                         int N, int K, gpu::Stream s) {
-  if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
-  for (int r0 = 0; r0 < M; r0 += kSlabRows)
-    launch_kernel("narrow_bf16_bf16in", narrow_bf16_kernel<gpu::bf16>, dim3(std::min(kSlabRows, M - r0)), dim3(96), 0,
-                  s, x + static_cast<size_t>(r0) * K, M - r0, wa, wb, ya + static_cast<size_t>(r0) * N,
-                  yb + static_cast<size_t>(r0) * N, N, K);
+  launch_narrow("narrow_bf16_bf16in", x, M, wa, wb, ya, yb, N, K, s);
 }
 
 void prefill_swiglu_nvfp4(const uint8_t* xq, const uint8_t* xs, int M, const uint8_t* gate, float alpha_gate,
