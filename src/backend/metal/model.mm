@@ -394,6 +394,7 @@ void Model::to_q4(Lin& l) {
 }
 
 void Model::reset() {
+  q_->sync();  // a commit still running may write the states the host clears here
   for (Layer& L : layers_) {
     if (L.attn) continue;
     std::memset(L.conv_state.host<uint8_t>(), 0, [L.conv_state.buf length]);
@@ -1611,8 +1612,9 @@ bool row_topk(const float* lg, int V, int k, const std::vector<int>& banned, flo
 }  // namespace
 
 int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out,
-                     const SpecSampling* smp) {
+                     const SpecSampling* smp, bool defer) {
   if (!has_draft()) fail("speculate: no drafter loaded");
+  if (pend_n_) fail("speculate: the last deferred step is not committed");
   if (B < 2 || B > dblock_ || B > 15 || B > vmax_) fail("speculate: block length out of range");
   if (banned.size() > 8) fail("speculate: more than 8 banned ids");
   if (pos + B > max_ctx_) fail("speculate: context exceeds max_ctx");
@@ -1704,13 +1706,11 @@ int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& ba
   const int n = a + 1;
   for (int i = 0; i < a; ++i) out[i] = rows[i + 1];
   out[a] = next;
-  commit(n, pos);
-  if (sh_on_) {  // the history grows by the anchor and the accepted drafts (the next anchor joins next step)
-    uint32_t h[16];
-    h[0] = anchor;
-    for (int i = 0; i + 1 < n; ++i) h[i + 1] = out[i];
-    sh_observe(h, n, pos);
-  }
+  pend_n_ = n;
+  pend_pos_ = pos;
+  pend_h_[0] = anchor;  // the history grows by the anchor and the accepted drafts (the next anchor joins next step)
+  for (int i = 0; i + 1 < n; ++i) pend_h_[i + 1] = out[i];
+  if (!defer) spec_commit(n);
   const auto t3 = clk::now();
   spec_s[0] += std::chrono::duration<double>(t1 - t0).count();
   spec_s[1] += std::chrono::duration<double>(t2 - t1).count();
@@ -1718,6 +1718,184 @@ int Model::speculate(uint32_t anchor, int pos, int B, const std::vector<int>& ba
   ++spec_steps;
   spec_tokens += n;
   return n;
+}
+
+void Model::spec_commit(int k) {
+  if (pend_n_ == 0) fail("spec_commit: no speculate step to commit");
+  if (k < 1 || k > pend_n_) fail("spec_commit: row count out of range");
+  pend_n_ = 0;
+  commit(k, pend_pos_);
+  sh_observe(pend_h_, k, pend_pos_);
+}
+
+void Model::sh_get(ShHost& h) const {
+  h.ctx = sh_ctx_, h.n = sh_n_, h.wpos = sh_wpos_, h.wn = sh_wn_, h.novel = sh_novel_, h.full = sh_full_;
+  h.win = sh_win_;
+}
+
+void Model::sh_set(const ShHost& h) {
+  sh_ctx_ = h.ctx, sh_n_ = h.n, sh_wpos_ = h.wpos, sh_wn_ = h.wn, sh_novel_ = h.novel, sh_full_ = h.full;
+  sh_win_ = h.win;
+  if (sh_win_.size() != size_t(sh_W_)) sh_win_.assign(size_t(sh_W_), 0);
+}
+
+namespace {
+size_t conv_bytes(const Layer& L) { return size_t(3) * L.qkv.N * 4; }
+}  // namespace
+
+size_t Model::slot_bytes() const {
+  size_t b = 0;
+  const size_t kvb = kv8_ ? 1 : 2;
+  for (const Layer& L : layers_) {
+    if (L.attn) b += 2 * size_t(pad64(max_ctx_)) * KV_ * D_ * kvb + (kv8_ ? 2 * size_t(pad64(max_ctx_)) * KV_ * 4 : 0);
+    else b += conv_bytes(L) + size_t(Hv_) * Dv_ * Dk_ * 4;
+  }
+  return b + dl_.size() * 2 * size_t(ring_) * dKV_ * 128 * 4 + size_t(V_);
+}
+
+size_t Model::snap_bytes() const {
+  size_t b = 0;
+  for (const Layer& L : layers_)
+    if (!L.attn) b += conv_bytes(L) + size_t(Hv_) * Dv_ * Dk_ * 4;
+  return b + dl_.size() * 2 * size_t(ring_) * dKV_ * 128 * 4 + size_t(V_);
+}
+
+void Model::slots_init(int n, int snaps) {
+  if (n < 1) fail("slots_init: at least one slot");
+  q_->sync();
+  nsnap_ = std::max(0, snaps);
+  slots_.assign(size_t(n), Slot{});
+  const size_t kvb = kv8_ ? 1 : 2, rows = size_t(pad64(max_ctx_));
+  const size_t ringb = size_t(ring_) * dKV_ * 128 * 4;
+  for (int s = 0; s < n; ++s) {
+    Slot& S = slots_[size_t(s)];
+    S.kc.resize(layers_.size()), S.vc.resize(layers_.size()), S.ks.resize(layers_.size()), S.vs.resize(layers_.size());
+    S.conv.resize(layers_.size()), S.S.resize(layers_.size());
+    S.dkc.resize(dl_.size()), S.dvc.resize(dl_.size());
+    S.snaps.resize(size_t(nsnap_));
+    for (size_t i = 0; i < layers_.size(); ++i) {
+      const Layer& L = layers_[i];
+      if (L.attn) {
+        S.kc[i] = s ? q_->alloc(rows * KV_ * D_ * kvb) : L.kc;
+        S.vc[i] = s ? q_->alloc(rows * KV_ * D_ * kvb) : L.vc;
+        if (kv8_) {
+          S.ks[i] = s ? q_->alloc(rows * KV_ * 4) : L.ks;
+          S.vs[i] = s ? q_->alloc(rows * KV_ * 4) : L.vs;
+        }
+      } else {
+        S.conv[i] = s ? q_->alloc(conv_bytes(L)) : L.conv_state;
+        S.S[i] = s ? q_->alloc(size_t(Hv_) * Dv_ * Dk_ * 4) : L.S;
+      }
+    }
+    for (size_t l = 0; l < dl_.size(); ++l) {
+      S.dkc[l] = s ? q_->alloc(ringb) : dl_[l].kc;
+      S.dvc[l] = s ? q_->alloc(ringb) : dl_[l].vc;
+    }
+    if (sh_on_) {
+      S.mask = s ? q_->alloc((size_t(V_) + 15) / 16 * 16) : sh_mask_;
+      if (s) std::memcpy(S.mask.host<uint8_t>(), sh_fixed_.data(), size_t(V_));
+    }
+    S.sh.win.assign(size_t(sh_W_), 0);
+  }
+  cur_ = 0;
+  sh_get(slots_[0].sh);
+}
+
+void Model::use_slot(int s) {
+  if (s < 0 || s >= slots()) fail("use_slot: no such slot");
+  if (s == cur_) return;
+  if (pend_n_) fail("use_slot: a deferred speculate step is not committed");
+  sh_get(slots_[size_t(cur_)].sh);
+  cur_ = s;
+  Slot& S = slots_[size_t(s)];
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    Layer& L = layers_[i];
+    if (L.attn) {
+      L.kc = S.kc[i], L.vc = S.vc[i];
+      if (kv8_) L.ks = S.ks[i], L.vs = S.vs[i];
+    } else {
+      L.conv_state = S.conv[i], L.S = S.S[i];
+    }
+  }
+  for (size_t l = 0; l < dl_.size(); ++l) dl_[l].kc = S.dkc[l], dl_[l].vc = S.dvc[l];
+  if (sh_on_) sh_mask_ = S.mask;
+  sh_set(S.sh);
+}
+
+void Model::copy_kv(int src, int rows) {
+  if (src < 0 || src >= slots() || rows < 0 || rows > max_ctx_) fail("copy_kv: bad slot or row count");
+  if (src == cur_ || rows == 0) return;
+  const Slot& S = slots_[size_t(src)];
+  const size_t kvb = kv8_ ? 1 : 2;
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    const Layer& L = layers_[i];
+    if (!L.attn) continue;
+    q_->copy(S.kc[i], L.kc, size_t(rows) * KV_ * D_ * kvb);
+    q_->copy(S.vc[i], L.vc, size_t(rows) * KV_ * D_ * kvb);
+    if (kv8_) {
+      q_->copy(S.ks[i], L.ks, size_t(rows) * KV_ * 4);
+      q_->copy(S.vs[i], L.vs, size_t(rows) * KV_ * 4);
+    }
+  }
+}
+
+void Model::snap_save(int k) {
+  if (k < 0 || k >= nsnap_) fail("snap_save: no such snapshot");
+  if (pend_n_) fail("snap_save: a deferred speculate step is not committed");
+  Snap& P = slots_[size_t(cur_)].snaps[size_t(k)];
+  if (P.gdn.empty()) {
+    size_t g = 0;
+    for (const Layer& L : layers_)
+      if (!L.attn) g += conv_bytes(L) + size_t(Hv_) * Dv_ * Dk_ * 4;
+    P.gdn = q_->alloc(g);
+    if (!dl_.empty()) P.ring = q_->alloc(dl_.size() * 2 * size_t(ring_) * dKV_ * 128 * 4);
+  }
+  size_t o = 0;
+  for (const Layer& L : layers_) {
+    if (L.attn) continue;
+    q_->copy(L.conv_state, P.gdn.at(o), conv_bytes(L));
+    o += conv_bytes(L);
+    q_->copy(L.S, P.gdn.at(o), size_t(Hv_) * Dv_ * Dk_ * 4);
+    o += size_t(Hv_) * Dv_ * Dk_ * 4;
+  }
+  const size_t ringb = size_t(ring_) * dKV_ * 128 * 4;
+  o = 0;
+  for (const DraftLayer& L : dl_) {
+    q_->copy(L.kc, P.ring.at(o), ringb);
+    q_->copy(L.vc, P.ring.at(o + ringb), ringb);
+    o += 2 * ringb;
+  }
+  q_->flush();
+  // the mask is written by the host only (sh_observe), after every draft step that read it has finished
+  if (sh_on_) P.mask.assign(sh_mask_.host<uint8_t>(), sh_mask_.host<uint8_t>() + V_);
+  sh_get(P.sh);
+}
+
+void Model::snap_load(int src, int k) {
+  if (src < 0 || src >= slots() || k < 0 || k >= nsnap_) fail("snap_load: no such snapshot");
+  if (pend_n_) fail("snap_load: a deferred speculate step is not committed");
+  const Snap& P = slots_[size_t(src)].snaps[size_t(k)];
+  if (P.gdn.empty()) fail("snap_load: the snapshot was never saved");
+  q_->sync();  // nothing still running reads the mask the host overwrites below
+  size_t o = 0;
+  for (const Layer& L : layers_) {
+    if (L.attn) continue;
+    q_->copy(P.gdn.at(o), L.conv_state, conv_bytes(L));
+    o += conv_bytes(L);
+    q_->copy(P.gdn.at(o), L.S, size_t(Hv_) * Dv_ * Dk_ * 4);
+    o += size_t(Hv_) * Dv_ * Dk_ * 4;
+  }
+  const size_t ringb = size_t(ring_) * dKV_ * 128 * 4;
+  o = 0;
+  for (const DraftLayer& L : dl_) {
+    q_->copy(P.ring.at(o), L.kc, ringb);
+    q_->copy(P.ring.at(o + ringb), L.vc, ringb);
+    o += 2 * ringb;
+  }
+  if (sh_on_) {
+    std::memcpy(sh_mask_.host<uint8_t>(), P.mask.data(), size_t(V_));
+    sh_set(P.sh);
+  }
 }
 
 }  // namespace ragon::metal

@@ -87,6 +87,16 @@ void Queue::wait_for(id<MTLCommandBuffer> b) {
   flushed.erase(flushed.begin(), flushed.begin() + long(n));
 }
 
+void Queue::copy(View src, View dst, size_t bytes) {
+  if (bytes == 0) return;
+  if (enc) [enc endEncoding];
+  enc = nil;
+  if (!cb) cb = [q commandBuffer];
+  id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+  [b copyFromBuffer:src.buf sourceOffset:src.off toBuffer:dst.buf destinationOffset:dst.off size:bytes];
+  [b endEncoding];
+}
+
 double Queue::sync() {
   if (enc) [enc endEncoding];
   enc = nil;

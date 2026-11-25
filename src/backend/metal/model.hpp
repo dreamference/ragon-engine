@@ -127,8 +127,27 @@ class Model {
   long sh_sparse_steps = 0, sh_full_steps = 0, sh_fallbacks = 0;
   bool has_draft() const { return !dl_.empty(); }
   int draft_block() const { return dblock_; }
+  // defer: the accepted rows are not committed yet; spec_commit(k) then commits the first k of the n rows (1 <= k
+  // <= n), so a request that stops inside the block leaves the model's sequence at exactly the tokens it kept.
   int speculate(uint32_t anchor, int pos, int B, const std::vector<int>& banned, uint32_t* out,
-                const SpecSampling* sampling = nullptr);
+                const SpecSampling* sampling = nullptr, bool defer = false);
+  void spec_commit(int k);
+  void spec_drop() { pend_n_ = 0; }  // a failed request: the deferred step is never committed
+  // Session slots (eng-metal-sessions-1): slots_init(n, snaps) after the drafter and the sparse head gives the model
+  // n independent sequences, each with its own attention KV cache, GDN conv and recurrent state, drafter K/V ring and
+  // sparse-head context (slot 0 is the state load() made). use_slot(s) points every later forward at slot s.
+  // A snapshot holds a slot's position-free state at one position (GDN, drafter ring, sparse head): the KV cache is
+  // indexed by position, so a slot's rows [0, pos) and its snapshot at pos restore that sequence exactly, in place
+  // or in another slot (fork: copy_kv the prefix rows, then snap_load). Copies are GPU blits ordered with the work.
+  void slots_init(int n, int snaps);
+  int slots() const { return int(slots_.size()); }
+  int slot() const { return cur_; }
+  int snaps() const { return nsnap_; }
+  void use_slot(int s);
+  void copy_kv(int src, int rows);   // slot src's KV rows [0, rows) into the current slot
+  void snap_save(int k);             // the current slot's state into its snapshot k
+  void snap_load(int src, int k);    // slot src's snapshot k into the current slot
+  size_t slot_bytes() const, snap_bytes() const;
   double spec_s[3] = {0, 0, 0};  // host seconds in the draft, the verify and the accept (commit encoding included)
   long spec_steps = 0, spec_tokens = 0;
   // RAGON_METAL_PROF=1: sync after each block and add its GPU seconds to prof[0..3] = attention, GDN, MLP, head;
@@ -181,6 +200,28 @@ class Model {
   double sh_hi_ = 0.15, sh_lo_ = 0.08;
   bool sh_verbose_ = false;
   void commit(int n, int pos0);
+  int pend_n_ = 0, pend_pos_ = 0;  // a deferred speculate step: its rows and the history they add
+  uint32_t pend_h_[16] = {};
+  struct ShHost {  // the sparse head's host state of one sequence
+    int ctx = 0, n = 0, wpos = 0, wn = 0, novel = 0;
+    bool full = true;
+    std::vector<uint8_t> win;
+  };
+  void sh_get(ShHost& h) const;
+  void sh_set(const ShHost& h);
+  struct Snap {
+    View gdn, ring;  // every GDN layer's conv state and S, every drafter layer's K/V ring, packed
+    std::vector<uint8_t> mask;
+    ShHost sh;
+  };
+  struct Slot {
+    std::vector<View> kc, vc, ks, vs, conv, S, dkc, dvc;  // by layer index (empty where the layer has none)
+    View mask;
+    ShHost sh;
+    std::vector<Snap> snaps;
+  };
+  std::vector<Slot> slots_;
+  int cur_ = 0, nsnap_ = 0;
   void copy_rows(View src, View dst, int rows, int cols, int lds, int ldd);
   Checkpoint dck_;
   std::vector<DraftLayer> dl_;

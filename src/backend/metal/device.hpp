@@ -61,6 +61,9 @@ struct Queue {
   // Ends the encoder, commits and waits; returns the GPU time of the buffer in seconds (with flushed buffers before
   // it: from the first one's start to the last one's end).
   double sync();
+  // Encodes a GPU copy of bytes from src to dst into the current command buffer (a blit pass between the compute
+  // encoders, ordered with them; multiples of 4 bytes). Nothing runs before the next flush() or sync().
+  void copy(View src, View dst, size_t bytes);
 };
 
 // Sets buffers 0..n-1 from views and the trailing argument struct (if any) with setBytes.
