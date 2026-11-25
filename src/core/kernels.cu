@@ -732,7 +732,15 @@ __global__ void __launch_bounds__(attn_rows_threads(ROWS, Q8))
                               SeqPtrs<const uint64_t> pg, KvQ8 q8) {
   pdl_begin();  // first statement: see launch.cuh
   int sq = 0;
+#if defined(RAGON_BACKEND_HIP) && defined(__linux__)
+  // TheRock's AMDGPU backend (7.14.1 and 10.0.0rc4, gfx1151, Linux) miscompiles the search loop
+  // below: when it runs to the last sequence the exit sets sq to 0 while sq + 1 stays n, so the
+  // last sequence's blocks read sequence 0's rows, keys and pages. A branchless count of the
+  // block starts at or below this block gives the same index and compiles correctly.
+  for (int i = 1; i < kMaxSeqs; ++i) sq += (i < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[i]) ? 1 : 0;
+#else
   while (sq + 1 < b.n && static_cast<int>(blockIdx.x) >= blocks.blk0[sq + 1]) ++sq;
+#endif
   constexpr int D = kMmaD;
   const size_t r0 = b.row0[sq];
   attention_mma_body<ROWS, TK, NS, BULK, false, 0, Q8>(q + r0 * Hq * D, kc.p[sq], vc.p[sq], seq_pos(b, sq),
