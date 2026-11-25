@@ -179,8 +179,8 @@ inline std::string refuse_kv_pool(const MemoryPlan& p, int max_context, size_t b
   std::ostringstream o;
   if (budget > 0) {
     o << "the memory budget of " << gb(budget) << " (--memory-budget-gb) does not hold the model and one conversation: "
-      << "weights, " << p.session_count << " sessions' fixed part, scratch and the prefix KV store take "
-      << gb(p.total() - p.kv_pool) << " of it, which leaves the KV page pool " << p.kv_pool_pages << " pages ("
+      << "weights, " << p.session_count << " sessions' fixed part, scratch and the prefix KV store alone need "
+      << gb(p.total() - p.kv_pool) << ", so the KV page pool gets " << p.kv_pool_pages << " pages ("
       << p.kv_pool_pages * kKvPageTokens << " positions), fewer than one conversation at --max-context " << max_context
       << " needs (" << need << " pages). Use a smaller --max-context, fewer --sessions, or a larger --memory-budget-gb.";
     return o.str();
