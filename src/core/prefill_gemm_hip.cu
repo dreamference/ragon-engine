@@ -321,9 +321,11 @@ __device__ __forceinline__ void mma_tile(const hf* XS, u32 r16, int kk, const v1
 }
 
 // Activation staging in two halves: the raw codes of a chunk into registers (issued before the previous chunk's
-// WMMAs), then decoded into LDS. Item i of a chunk: row i / (kc / 8), 8 values from K offset 8 (i % (kc / 8)).
+// WMMAs), then decoded into LDS. An item is 32 values of a row (16 bytes of FP4 codes and two scales, or 32 bytes of
+// FP8): item i of a chunk is row i / (kc / 32), K offset 32 (i % (kc / 32)). Wide loads: the loads, not the decode,
+// are what staging costs.
 template <int W>
-constexpr int kStageItems = kBR * (kKC / 8) / (W * 32);
+constexpr int kStageItems = kBR * (kKC / 32) / (W * 32);
 
 // Waves per block: the NVFP4 plain GEMM (the down projection's shape) gains from 16 (activation staging per output
 // halved); SwiGLU and FP8 lose with it.
@@ -331,22 +333,22 @@ template <bool FP4, int MODE>
 constexpr int waves_of() { return FP4 && MODE == kPlain ? 16 : kWaves; }
 
 template <bool FP4, int W>
-__device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, int kc, u32 tid, u32 (&a)[kStageItems<W>],
-                                           u32 (&b)[kStageItems<W>]) {
-  const int per_row = kc / 8, K = p.K;
+__device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, int kc, u32 tid,
+                                           v4u (&a)[kStageItems<W>][2], u32 (&b)[kStageItems<W>]) {
+  const int per_row = kc / 32, K = p.K;
 #pragma unroll
   for (int j = 0; j < kStageItems<W>; ++j) {
     const int i = static_cast<int>(tid) + j * W * 32;
-    a[j] = 0, b[j] = 0;
+    a[j][0] = a[j][1] = v4u{0, 0, 0, 0}, b[j] = 0;
     if (i < kBR * per_row) {
-      const int r = i / per_row, c8 = i - r * per_row, row = m0 + r, k = k0 + c8 * 8;
+      const int r = i / per_row, c32 = i - r * per_row, row = m0 + r, k = k0 + c32 * 32;
       if (row < p.M) {
         if constexpr (FP4) {
-          a[j] = *(const u32*)(p.xq + static_cast<size_t>(row) * (K / 2) + k / 2);
-          b[j] = p.xs[static_cast<size_t>(row) * (K / 16) + k / 16];
+          a[j][0] = *(const v4u*)(p.xq + static_cast<size_t>(row) * (K / 2) + k / 2);
+          b[j] = *(const uint16_t*)(p.xs + static_cast<size_t>(row) * (K / 16) + k / 16);
         } else {
-          const uint2 c = *(const uint2*)(p.xq + static_cast<size_t>(row) * K + k);
-          a[j] = c.x, b[j] = c.y;
+          const v4u* src = (const v4u*)(p.xq + static_cast<size_t>(row) * K + k);
+          a[j][0] = src[0], a[j][1] = src[1];
         }
       }
     }
@@ -354,26 +356,30 @@ __device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, in
 }
 
 template <bool FP4, int W>
-__device__ __forceinline__ void stage_store(const GemmArgs& p, int m0, int kc, u32 tid, const u32 (&a)[kStageItems<W>],
-                                            const u32 (&b)[kStageItems<W>], hf* XS) {
-  const int per_row = kc / 8;
+__device__ __forceinline__ void stage_store(const GemmArgs& p, int m0, int kc, u32 tid,
+                                            const v4u (&a)[kStageItems<W>][2], const u32 (&b)[kStageItems<W>], hf* XS) {
+  const int per_row = kc / 32;
 #pragma unroll
   for (int j = 0; j < kStageItems<W>; ++j) {
     const int i = static_cast<int>(tid) + j * W * 32;
     if (i < kBR * per_row) {
-      const int r = i / per_row, c8 = i - r * per_row;
-      v4u v = {0, 0, 0, 0};
-      if (m0 + r < p.M) {
-        v2h o[4];
-        if constexpr (FP4) {
-          dec_fp4(a[j], e4m3_h2(b[j]), o);
-        } else {
-          dec_fp8(a[j], o);
-          dec_fp8(b[j], o + 2);
+      const int r = i / per_row, c32 = i - r * per_row;
+      const bool in = m0 + r < p.M;
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {  // the item's four 8-value groups
+        v4u v = {0, 0, 0, 0};
+        if (in) {
+          v2h o[4];
+          if constexpr (FP4) {
+            dec_fp4(a[j][0][g], e4m3_h2((b[j] >> (8 * (g >> 1))) & 0xFF), o);
+          } else {
+            dec_fp8(a[j][g >> 1][(g & 1) * 2], o);
+            dec_fp8(a[j][g >> 1][(g & 1) * 2 + 1], o + 2);
+          }
+          v = v4u{as_u(o[0]), as_u(o[1]), as_u(o[2]), as_u(o[3])};
         }
-        v = v4u{as_u(o[0]), as_u(o[1]), as_u(o[2]), as_u(o[3])};
+        *(v4u*)(XS + r * kXSt + c32 * 32 + g * 8) = v;
       }
-      *(v4u*)(XS + r * kXSt + c8 * 8) = v;
     }
   }
 }
@@ -404,7 +410,8 @@ __global__ void __launch_bounds__((waves_of<FP4, MODE>() * 32)) prefill_gemm_ker
   const u32 nt2 = kSw ? nt : nt + 1;
 
   v8f acc[kTN][4] = {}, acc2[4] = {};
-  u32 sa[kStageItems<W>], sb[kStageItems<W>];
+  v4u sa[kStageItems<W>][2];
+  u32 sb[kStageItems<W>];
   stage_load<FP4, W>(p, m0, 0, min(kKC, K), tid, sa, sb);
   WRaw<FP4> wn[2] = {};
   if (valid) {
