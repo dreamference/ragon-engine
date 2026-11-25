@@ -75,10 +75,23 @@ __global__ void __launch_bounds__(32)
   const int h = hv / (HV / H);
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
   const float scale = rsqrtf(static_cast<float>(kGdnDk));
-  for (int t = 0; t < M; ++t) {
+  // Token t + 1's inputs are loaded while token t computes: the one wave of a block has nothing else to hide the
+  // global latency behind, and a token's loads do not depend on the state. Data movement only.
+  float4 q4n{}, k4n{};
+  float gn = 0.f, bn = 0.f, vn = 0.f;
+  auto fetch = [&](int t) {
     const InT* row = mixed + static_cast<size_t>(t) * C;
-    const float4 q4 = elem::load4(row + h * kGdnDk, lane);
-    const float4 k4 = elem::load4(row + H * kGdnDk + h * kGdnDk, lane);
+    q4n = elem::load4(row + h * kGdnDk, lane);
+    k4n = elem::load4(row + H * kGdnDk + h * kGdnDk, lane);
+    vn = elem::load(row + 2 * H * kGdnDk + hv * kGdnDv + v);
+    gn = g[t * HV + hv];
+    bn = beta[t * HV + hv];
+  };
+  if (M > 0) fetch(0);
+  for (int t = 0; t < M; ++t) {
+    const float4 q4 = q4n, k4 = k4n;
+    const float gt = gn, b = bn, vv = vn;
+    if (t + 1 < M) fetch(t + 1);
     float qn = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
     float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
 #pragma unroll
@@ -91,9 +104,7 @@ __global__ void __launch_bounds__(32)
     qs[lane * 4] = q4.x * qr, qs[lane * 4 + 1] = q4.y * qr, qs[lane * 4 + 2] = q4.z * qr, qs[lane * 4 + 3] = q4.w * qr;
     ks[lane * 4] = k4.x * kr, ks[lane * 4 + 1] = k4.y * kr, ks[lane * 4 + 2] = k4.z * kr, ks[lane * 4 + 3] = k4.w * kr;
     __syncwarp();
-    const float decay = __expf(g[t * HV + hv]);
-    const float b = beta[t * HV + hv];
-    const float vv = elem::load(row + 2 * H * kGdnDk + hv * kGdnDv + v);
+    const float decay = __expf(gt);
     float kv = 0.f;
 #pragma unroll
     for (int k = 0; k < kGdnDk; ++k) {
@@ -101,6 +112,9 @@ __global__ void __launch_bounds__(32)
       kv = fmaf(S[k], ks[k], kv);
     }
     const float d = (vv - kv) * b;
+    // ks again from LDS, not kept in registers from the loop above: S (128) and ks (128) together overflow the 256
+    // VGPRs and spill to scratch inside the token loop. A compiler fence only; the same arithmetic.
+    asm volatile("" ::: "memory");
     float o = 0.f;
 #pragma unroll
     for (int k = 0; k < kGdnDk; ++k) {
