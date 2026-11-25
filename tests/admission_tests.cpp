@@ -160,11 +160,80 @@ void paged_auto_size() {
   check(choose(kNodeB, kScratchBytes, {}).sessions == 3, "flat unchanged");
 }
 
+// --memory-budget-gb (the entry node tier): the plan's total stays within the budget whatever MemAvailable says; without
+// a budget (0) every number is the one before it.
+void memory_budget() {
+  const ragon::ModelConfig c = qwen();
+  const KvPlanInputs entry{true, size_t(2048) << 20, -1};  // the entry tier's 2 GB prefix KV store
+  const size_t scratch = kScratchBytes + kEngineFixedBytes;
+  const size_t b48 = size_t(48e9), b30 = size_t(30e9);
+  // Windows (MemAvailable unknown): 2 x 131,072 within 48 GB starts, the pool filling what the budget leaves.
+  const StartPlan w = start_plan(c, kWeights, scratch, true, 2, 131072, -1, kReserve, entry, b48);
+  std::printf("budget 48 GB, MemAvailable unknown: 2 x 131072, planned %s, pool %s; %s\n", gb(w.plan.total()).c_str(),
+              describe_kv_pool(w.plan).c_str(), w.refusal.c_str());
+  check(w.refusal.empty(), "48 GB: two sessions at 131,072 start");
+  check(w.plan.total() <= b48 && b48 - w.plan.total() < 2 * kv_page_bytes(c), "48 GB: the pool fills the budget");
+  check(w.plan.kv_pool_pages >= kv_pages_one_conversation(w.plan, 131072), "48 GB: one conversation fits");
+  check(paged_sessions_fit(w.plan, 2, 131072), "48 GB: the given sessions fit");
+  const StartPlan none = start_plan(c, kWeights, scratch, true, 2, 131072, -1, kReserve, entry);
+  check(none.plan.kv_pool_pages == 2L * 2048 && w.plan.kv_pool_pages < none.plan.kv_pool_pages,
+        "without the budget the pool is every session's context");
+  // On a 128 GB box (node-b's MemAvailable) the budget binds; on a host shorter than the budget the host does.
+  const StartPlan nb = start_plan(c, kWeights, scratch, true, 2, 131072, kNodeB, kReserve, entry, b48);
+  check(nb.refusal.empty() && nb.plan.kv_pool_pages == w.plan.kv_pool_pages, "128 GB box with 48 GB: the budget's pool");
+  const long short_host = 16384 + 22383 + 6016 + 2048 + 1024 + 9000;  // reserve, weights, scratch, store, fixed, 9 GB
+  const StartPlan sh = start_plan(c, kWeights, scratch, true, 2, 131072, short_host, kReserve, entry, b48);
+  check(sh.plan.kv_pool_pages < w.plan.kv_pool_pages && sh.refusal.empty(), "a host below the budget sizes the pool");
+  // 30 GB: the model, the store and the scratch leave no conversation's pages; refused with the budget named.
+  const StartPlan r = start_plan(c, kWeights, scratch, true, 2, 131072, -1, kReserve, entry, b30);
+  std::printf("budget 30 GB: %s\n", r.refusal.c_str());
+  check(r.refusal.find("--memory-budget-gb") != std::string::npos && r.refusal.find("30.0 GB") != std::string::npos,
+        "30 GB: refused, naming the budget");
+  check(start_plan(c, kWeights, scratch, true, 2, 131072, kNodeB, kReserve, entry, b30).refusal.find(
+            "--memory-budget-gb") != std::string::npos,
+        "30 GB on a 128 GB box: the budget's refusal");
+  // Host short too: the host's wording when the host alone refuses.
+  check(start_plan(c, kWeights, scratch, true, 2, 131072, 40000, kReserve, entry, b30).refusal.find(
+            "--memory-budget-gb") == std::string::npos,
+        "the host's refusal when the host alone is short");
+  // An explicit --kv-pool-mb and the flat slots: a plan above the budget is refused.
+  check(start_plan(c, kWeights, scratch, true, 2, 131072, -1, kReserve, {true, size_t(2048) << 20, 20000}, b48)
+                .refusal.find("more than its memory budget") != std::string::npos,
+        "--kv-pool-mb above the budget: refused");
+  check(start_plan(c, kWeights, scratch, true, 2, 262144, -1, kReserve, {}, b48).refusal.find(
+            "more than its memory budget") != std::string::npos,
+        "flat 2 x 262,144 above 48 GB: refused");
+  check(start_plan(c, kWeights, scratch, true, 1, 32768, -1, kReserve, {}, b48).refusal.empty(), "flat, small: starts");
+  // Auto-size by the budget alone: a start with nothing given is sized (MemAvailable unknown, or no reserve).
+  for (long reserve : {kReserve, 0L}) {
+    const SizeChoice a = choose_size(c, kWeights, scratch, true, -1, reserve, 262144, std::nullopt, std::nullopt, true,
+                                     entry, b48);
+    const StartPlan ap = start_plan(c, kWeights, scratch, true, a.sessions, a.max_context, -1, reserve, entry, b48);
+    std::printf("budget 48 GB, reserve %ld, nothing given: %d x %d, planned %s\n", reserve, a.sessions, a.max_context,
+                gb(ap.plan.total()).c_str());
+    check(a.sized && ap.refusal.empty() && ap.plan.total() <= b48, "auto-size by the budget: chosen and within it");
+  }
+  // No budget: the same plan, the same refusal, the same --plan-only line as before (no memory_budget_bytes).
+  const KvPlanInputs paged{true, 0, -1};
+  const StartPlan a0 = start_plan(c, kWeights, kScratchBytes, true, 4, 262144, kNodeB, kReserve, paged);
+  const StartPlan a1 = start_plan(c, kWeights, kScratchBytes, true, 4, 262144, kNodeB, kReserve, paged, 0);
+  check(a0.plan.total() == a1.plan.total() && a0.plan.kv_pool_pages == a1.plan.kv_pool_pages, "budget 0: no change");
+  check(plan_json(4, 4, 262144, a0.plan, true, kReserve).find("memory_budget") == std::string::npos,
+        "no budget: the --plan-only line as before");
+  const auto j = nlohmann::json::parse(plan_json(2, 2, 131072, w.plan, true, kReserve, b48));
+  check(j["memory_budget_bytes"].get<size_t>() == b48 && j["planned_bytes"].get<size_t>() <= b48,
+        "--plan-only: the budget and a plan within it");
+  // A large budget on node-b changes nothing: the host binds.
+  const StartPlan big = start_plan(c, kWeights, kScratchBytes, true, 4, 262144, kNodeB, kReserve, paged, size_t(500e9));
+  check(big.plan.kv_pool_pages == a0.plan.kv_pool_pages && big.refusal.empty(), "500 GB budget on node-b: the host's pool");
+}
+
 }  // namespace
 
 int main() {
   plan_only();
   paged_auto_size();
+  memory_budget();
   if (failures) {
     std::printf("%d check(s) failed\n", failures);
     return 1;

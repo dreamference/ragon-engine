@@ -20,6 +20,11 @@
 // session's fixed part only (state, snap, drafter ring, history) and the pool once. The pool's size is what MemAvailable
 // leaves after the rest of the plan, the prefix KV store's budget and --host-reserve-mb, at most what every session at
 // --max-context could map; or --kv-pool-mb, refused at start when the plan with it does not fit.
+// Memory budget (--memory-budget-gb N, the entry node tier; plan-entry-level-node §1): the plan's total (weights,
+// sessions, scratch and the measured terms, the prefix KV store, the page pool) stays within N GB (10^9 bytes) whatever
+// MemAvailable says: the pool sized from the plan takes no more than the budget leaves, auto-size judges by it (on its
+// own when MemAvailable is unknown, as on Windows), and a start whose model, store and one conversation do not fit is
+// refused. Without it nothing here changes. A 128 GB machine run with N = 48 holds the engine state of a 64 GB one.
 // Host-only arithmetic, tested in ragon-api-tests and ragon-kv-pool-tests.
 #pragma once
 
@@ -127,10 +132,12 @@ inline MemoryPlan plan_memory(const ModelConfig& c, size_t weight_bytes, int ses
 // P4b: sizes the plan's KV page pool (p from plan_memory with kv_pages). pool_mb >= 0 (--kv-pool-mb): that many MB of
 // pages; else what MemAvailable (avail_mb) leaves after the plan, `other_bytes` (the prefix KV store's arena, which
 // the engine allocates before the pool; P4f: the plan counts it as `store` from here) and reserve_mb; with nothing to
-// judge by (avail_mb < 0, or no reserve) every session's max_context. Never more pages than sessions x max_context
-// positions need, never fewer than 0. Returns the pages.
+// judge by (avail_mb < 0, or no reserve) every session's max_context. With a memory budget (`budget` bytes,
+// --memory-budget-gb; 0: none) a pool sized from the plan also takes no more than the budget leaves after the rest of
+// the plan, whether MemAvailable is known or not. Never more pages than sessions x max_context positions need, never
+// fewer than 0. Returns the pages.
 inline long plan_kv_pool(MemoryPlan& p, const ModelConfig& c, int max_context, long avail_mb, long reserve_mb,
-                         size_t other_bytes, long pool_mb) {
+                         size_t other_bytes, long pool_mb, size_t budget = 0) {
   const size_t page = kv_page_bytes(c), per = page + kKvPageOverheadBytes;
   const long cap = long(p.session_count) * kv_pages_for(max_context);
   p.store = other_bytes;
@@ -140,6 +147,10 @@ inline long plan_kv_pool(MemoryPlan& p, const ModelConfig& c, int max_context, l
   } else if (avail_mb >= 0 && reserve_mb > 0) {
     const size_t have = size_t(avail_mb) << 20, keep = p.total() + (size_t(reserve_mb) << 20) + page;
     pages = have > keep ? static_cast<long>((have - keep) / per) : 0;
+  }
+  if (pool_mb < 0 && budget > 0) {
+    const size_t keep = p.total() + page;
+    pages = std::min(pages, budget > keep ? static_cast<long>((budget - keep) / per) : 0L);
   }
   pages = std::max(0L, std::min(pages, cap));
   p.kv_pool_pages = pages;
@@ -156,13 +167,41 @@ inline long plan_kv_pool(MemoryPlan& p, const ModelConfig& c, int max_context, l
 inline long kv_pages_one_conversation(const MemoryPlan& p, int max_context) {
   return std::min(kv_pages_for(max_context) + 2, long(p.session_count) * kv_pages_for(max_context));
 }
-inline std::string refuse_kv_pool(const MemoryPlan& p, int max_context) {
+// With a memory budget (`budget` bytes) that sized the pool, the line names the budget instead of the host.
+inline std::string gb(size_t bytes) {
+  char b[32];
+  std::snprintf(b, sizeof b, "%.1f GB", bytes / 1e9);
+  return b;
+}
+inline std::string refuse_kv_pool(const MemoryPlan& p, int max_context, size_t budget = 0) {
   const long need = kv_pages_one_conversation(p, max_context);
   if (p.kv_pool_pages >= need) return "";
   std::ostringstream o;
+  if (budget > 0) {
+    o << "the memory budget of " << gb(budget) << " (--memory-budget-gb) does not hold the model and one conversation: "
+      << "weights, " << p.session_count << " sessions' fixed part, scratch and the prefix KV store take "
+      << gb(p.total() - p.kv_pool) << " of it, which leaves the KV page pool " << p.kv_pool_pages << " pages ("
+      << p.kv_pool_pages * kKvPageTokens << " positions), fewer than one conversation at --max-context " << max_context
+      << " needs (" << need << " pages). Use a smaller --max-context, fewer --sessions, or a larger --memory-budget-gb.";
+    return o.str();
+  }
   o << "the KV page pool would hold " << p.kv_pool_pages << " pages (" << p.kv_pool_pages * kKvPageTokens
     << " positions), fewer than one conversation at --max-context " << max_context << " needs (" << need
     << " pages). Use a smaller --max-context, fewer --sessions, or stop what else holds the memory.";
+  return o.str();
+}
+
+// Why the plan does not fit the memory budget (`budget` bytes, --memory-budget-gb); empty when it does or with none.
+inline std::string refuse_budget(const MemoryPlan& p, size_t budget) {
+  if (budget == 0 || p.total() <= budget) return "";
+  std::ostringstream o;
+  o << "ragon-serve would need " << gb(p.total()) << " (weights " << gb(p.weights) << ", " << p.session_count
+    << " sessions x " << gb(p.per_session) << ", scratch " << gb(p.scratch);
+  if (p.kv_pool) o << ", KV page pool " << gb(p.kv_pool);
+  if (p.store) o << ", prefix KV store " << gb(p.store);
+  o << "), more than its memory budget of " << gb(budget) << " (--memory-budget-gb): short by "
+    << ((p.total() - budget) >> 20) << " MB. Use fewer --sessions, a smaller --max-context, or a larger "
+    << "--memory-budget-gb.";
   return o.str();
 }
 
@@ -185,12 +224,6 @@ inline long mem_available_mb(const std::string& path = "/proc/meminfo") {
     if (key == "MemAvailable:") return kb / 1024;
   }
   return -1;
-}
-
-inline std::string gb(size_t bytes) {
-  char b[32];
-  std::snprintf(b, sizeof b, "%.1f GB", bytes / 1e9);
-  return b;
 }
 
 // Why the plan cannot start on a host with `avail_mb` available and `reserve_mb` to keep; empty when it can.
@@ -220,33 +253,50 @@ struct KvPlanInputs {
 
 // The start's plan and why it is refused (empty when it starts), the one computation the start check, auto-size and
 // --plan-only share: plan_memory, with --kv-pages the pool (plan_kv_pool) and its floor (refuse_kv_pool, only for a
-// pool sized from a known MemAvailable), then refuse_start. With `reserve_mb` <= 0 nothing is judged.
+// pool sized from a known MemAvailable or a memory budget), then refuse_budget and refuse_start. With `reserve_mb` <= 0
+// the host is not judged. `budget` (bytes, --memory-budget-gb; 0: none) caps the plan's total whatever the host has:
+// the pool sized from the plan takes no more than it leaves, and a plan above it is refused.
 struct StartPlan {
   MemoryPlan plan;
   std::string refusal;
 };
 inline StartPlan start_plan(const ModelConfig& c, size_t weight_bytes, size_t scratch, bool drafter, int sessions,
-                            int max_context, long avail_mb, long reserve_mb, const KvPlanInputs& kv = {}) {
+                            int max_context, long avail_mb, long reserve_mb, const KvPlanInputs& kv = {},
+                            size_t budget = 0) {
   StartPlan s{plan_memory(c, weight_bytes, sessions, max_context, drafter, kv.on, scratch), {}};
+  const bool host = reserve_mb > 0 && avail_mb >= 0;
   if (kv.on) {
-    plan_kv_pool(s.plan, c, max_context, reserve_mb > 0 ? avail_mb : -1, reserve_mb, kv.store_bytes, kv.pool_mb);
-    if (kv.pool_mb < 0 && reserve_mb > 0 && avail_mb >= 0) s.refusal = refuse_kv_pool(s.plan, max_context);
+    plan_kv_pool(s.plan, c, max_context, reserve_mb > 0 ? avail_mb : -1, reserve_mb, kv.store_bytes, kv.pool_mb, budget);
+    if (kv.pool_mb < 0 && (host || budget > 0)) {
+      // The budget's wording only when the budget is what keeps the pool short (the host alone would not).
+      bool by_budget = budget > 0;
+      if (by_budget && host) {
+        MemoryPlan h = s.plan;
+        plan_kv_pool(h, c, max_context, avail_mb, reserve_mb, kv.store_bytes, kv.pool_mb);
+        by_budget = refuse_kv_pool(h, max_context).empty();
+      }
+      s.refusal = refuse_kv_pool(s.plan, max_context, by_budget ? budget : 0);
+    }
   }
+  if (s.refusal.empty()) s.refusal = refuse_budget(s.plan, budget);
   if (s.refusal.empty() && reserve_mb > 0) s.refusal = refuse_start(s.plan, avail_mb, reserve_mb);
   return s;
 }
 
 // --plan-only's line (read by Ragon's pre-load check): what runs and the plan's bytes, the page pool and the prefix KV
 // store included (P4f; scratch_bytes holds the measured terms beside the weights, sessions, pool and store).
-// sessions, batch, max_context and planned_bytes are the contract; the pool's fields and the reserve are additive.
+// sessions, batch, max_context and planned_bytes are the contract; the pool's fields and the reserve are additive, and
+// memory_budget_bytes is there only with a memory budget (--memory-budget-gb).
 inline std::string plan_json(int sessions, int batch, int max_context, const MemoryPlan& p, bool kv_pages,
-                             long reserve_mb) {
+                             long reserve_mb, size_t budget = 0) {
   std::ostringstream o;
   o << "{\"sessions\":" << sessions << ",\"batch\":" << std::min(batch, sessions) << ",\"max_context\":" << max_context
     << ",\"planned_bytes\":" << p.total() << ",\"kv_pages\":" << (kv_pages ? "true" : "false")
     << ",\"kv_pool_bytes\":" << p.kv_pool << ",\"kv_pool_pages\":" << p.kv_pool_pages
     << ",\"kv_store_bytes\":" << p.store << ",\"scratch_bytes\":" << p.scratch
-    << ",\"host_reserve_bytes\":" << (size_t(std::max(0L, reserve_mb)) << 20) << "}";
+    << ",\"host_reserve_bytes\":" << (size_t(std::max(0L, reserve_mb)) << 20);
+  if (budget > 0) o << ",\"memory_budget_bytes\":" << budget;
+  o << "}";
   return o.str();
 }
 
@@ -303,22 +353,26 @@ struct SizeChoice {
 // off, MemAvailable unknown (`avail_mb` < 0) or no reserve to keep (`reserve_mb` <= 0), the defaults fill in.
 // With `kv` on (--kv-pages) "fits" is the paged plan's: start_plan does not refuse it and paged_sessions_fit holds, with
 // kPagedFitShare for given sessions and the full pool (kAutoPagedFitShare) for sessions chosen here.
+// A memory budget (`budget` bytes, --memory-budget-gb) is judged by the same plan, and sizes the start on its own when
+// MemAvailable is unknown or there is no reserve.
 inline SizeChoice choose_size(const ModelConfig& c, size_t weight_bytes, size_t scratch, bool drafter, long avail_mb,
                               long reserve_mb, int full_context, std::optional<int> sessions,
-                              std::optional<int> max_context, bool auto_size = true, const KvPlanInputs& kv = {}) {
+                              std::optional<int> max_context, bool auto_size = true, const KvPlanInputs& kv = {},
+                              size_t budget = 0) {
   SizeChoice s;
   s.sessions_auto = !sessions;
   s.context_auto = !max_context;
-  if (!auto_size || avail_mb < 0 || reserve_mb <= 0 || (sessions && max_context)) {
+  const bool judged = (avail_mb >= 0 && reserve_mb > 0) || budget > 0;
+  if (!auto_size || !judged || (sessions && max_context)) {
     s.sessions = sessions.value_or(kDefaultSessions);
     s.max_context = max_context.value_or(kDefaultContext);
     s.sessions_auto = s.context_auto = false;
-    s.sized = auto_size && avail_mb >= 0 && reserve_mb > 0;
+    s.sized = auto_size && judged;
     return s;
   }
   s.sized = true;
   auto fits = [&](int n, int ctx) {
-    const StartPlan p = start_plan(c, weight_bytes, scratch, drafter, n, ctx, avail_mb, reserve_mb, kv);
+    const StartPlan p = start_plan(c, weight_bytes, scratch, drafter, n, ctx, avail_mb, reserve_mb, kv, budget);
     return p.refusal.empty() &&
            (!kv.on || paged_sessions_fit(p.plan, n, ctx, sessions ? kPagedFitShare : kAutoPagedFitShare));
   };

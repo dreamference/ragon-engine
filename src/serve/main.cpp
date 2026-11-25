@@ -8,7 +8,7 @@
 //              [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N]
 //              [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on|off] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N]
 //              [--auto-size 1|0] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed]
-//              [--kv-pool-mb N | --kv-flat]
+//              [--kv-pool-mb N | --kv-flat] [--memory-budget-gb N]
 //              [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N]
 //
 // --sessions N (default: chosen at start, --auto-size below; 2 without it; M4 §1) keeps N resident sessions, each with
@@ -104,6 +104,13 @@
 // would leave less than the first of MemAvailable, and answers a generation request HTTP 503 (code host_memory_low)
 // while MemAvailable is below the second. 0 switches either off. Neither changes what an admitted request computes.
 //
+// --memory-budget-gb N (default 0, none; RAGON_MEMORY_BUDGET_GB overrides; the entry node tier, at most 48 on a 64 GB
+// machine): the start plan's total (weights, sessions, scratch and the measured terms, the prefix KV store and the page
+// pool) stays within N GB (10^9 bytes) whatever MemAvailable says. The pool takes no more than the budget leaves, auto-
+// size chooses by it (on its own where MemAvailable is unknown, as on Windows), and a start whose model, store and one
+// conversation at --max-context do not fit it is refused (exit 3) with a line that names the budget. One start line
+// gives the budget, the plan and the resulting pool; --plan-only adds memory_budget_bytes. Without it nothing changes.
+//
 // --drafter ID=DIR (repeatable) and --drafter-routes FILE (MULTI_DRAFTER §5): resident drafters beside `--draft DIR`,
 // which is `general` (`--drafter general=DIR` says the same). All are loaded at start, counted by the start plan, and
 // must share general's shape. The routes file is the workload table, {"work":"work","ask":"ask","*":"general"}; without
@@ -139,6 +146,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -2524,6 +2532,7 @@ int main(int argc, char** argv) try {
   static_assert(ragon::serve::kAutoSessionsCap <= ragon::kernels::kMaxSeqs, "auto-size never picks more than a batch");
   bool kv_pages = true;  // the page pool by default (P4e, BATCHING §5.3); --kv-flat the flat slots
   long kv_pool_mb = -1;  // P4b: -1, the pool from the memory plan
+  double memory_budget_gb = 0;  // --memory-budget-gb: the plan's total at most this many GB (10^9 bytes); 0: none
   bool plan_only = false;  // print the start plan as one JSON line and exit 0 before anything is allocated
   int attn_prefetch = 2, keepalive_seconds = 15, sessions = 0, batch = 0, contended = 256, side_prefill = 40, side_share = -1;
   // --sessions, --max-context and --batch as given; what is not given is chosen at start (--auto-size).
@@ -2606,6 +2615,7 @@ int main(int argc, char** argv) try {
     } else if (a == "--prefill-max-hold") prefill_max_hold = std::stod(next());
     else if (a == "--floor-side-chunk") floor_side_chunk = std::stoi(next());
     else if (a == "--host-reserve-mb") host_reserve_mb = std::stol(next());
+    else if (a == "--memory-budget-gb") memory_budget_gb = std::stod(next());
     else if (a == "--admit-reserve-mb") admit_reserve_mb = std::stol(next());
     else if (a == "--auto-size") auto_size = std::stol(next());
     else if (a == "--fair-pairing") fair_pairing = std::stol(next());
@@ -2635,7 +2645,7 @@ int main(int argc, char** argv) try {
     }
   }
   if (model_dir.empty()) {
-    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-off-wide 0|1] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N] [--sparse-head-batch N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
+    std::cerr << "usage: ragon-serve --model DIR [--host H] [--port P] [--served-model-name N] [--max-context N] [--draft DIR [--drafter ID=DIR ...] [--drafter-routes FILE] [--draft-block N] [--tree N] [--draft-off-below X] [--draft-off-wide 0|1] [--draft-head sparse|full [--sparse-head-dir DIR] [--sparse-head-dynamic N] [--sparse-head-batch N]]] [--pretokenizer production|checkpoint] [--prefix-checkpoints N] [--prefix-kv-mb N] [--keepalive-seconds N] [--sessions N] [--session-protect-seconds S] [--batch N] [--prefill-chunk-contended N] [--side-prefill N] [--side-share N] [--fair-pairing 1|0] [--decode-floor F|on] [--prefill-max-hold S] [--floor-side-chunk N] [--host-reserve-mb N] [--admit-reserve-mb N] [--auto-size 1|0] [--plan-only] [--draft-bf16] [--repetition-detection P,p,R,K|off] [--repetition-report incomplete|completed] [--kv-pool-mb N | --kv-flat] [--memory-budget-gb N] [--fanout-plain-above N] [--fanout-gang-above N] [--fanout-default on|off] [--fanout-draft-block N] [--vision on|off] [--vision-max-pixels N] [--vision-cache-mb N] [--jpeg-decoder gpu|cpu] [--lora-library DIR [--lora-paths NAME=DIR,...] [--max-loras-per-batch N] [--max-loaded-loras N]] [--api-key KEY | --api-key-file F]\n";
     return 2;
   }
   for (auto [flag, v] : {std::pair<const char*, std::optional<int>>{"--sessions", sessions_arg},
@@ -2807,6 +2817,19 @@ int main(int argc, char** argv) try {
   if (side_share < 0) side_share = decode_floor > 0 ? 0 : 16;
   // P4b: the engine reads RAGON_KV_PAGES itself; the plan must agree with it.
   if (const char* e = std::getenv("RAGON_KV_PAGES")) kv_pages = std::atoi(e) != 0;
+  if (const char* e = std::getenv("RAGON_MEMORY_BUDGET_GB")) {
+    try {
+      memory_budget_gb = std::stod(e);
+    } catch (const std::exception&) {
+      std::cerr << "RAGON_MEMORY_BUDGET_GB must be a number\n";
+      return 2;
+    }
+  }
+  if (!(memory_budget_gb >= 0)) {
+    std::cerr << "--memory-budget-gb must be a number of GB, at least 0 (0: no budget)\n";
+    return 2;
+  }
+  const size_t memory_budget = static_cast<size_t>(std::llround(memory_budget_gb * 1e9));
   if (kv_pool_mb >= 0 && !kv_pages) {
     std::cerr << "--kv-pool-mb needs the page pool, not --kv-flat or RAGON_KV_PAGES=0\n";
     return 2;
@@ -2844,14 +2867,23 @@ int main(int argc, char** argv) try {
       kv.store_bytes = size_t(store_mb) << 20;
     }
     const as::SizeChoice size = as::choose_size(cfg, weights, scratch, !draft_dir.empty(), avail, host_reserve_mb,
-                                                full_context, sessions_arg, max_context_arg, auto_size != 0, kv);
+                                                full_context, sessions_arg, max_context_arg, auto_size != 0, kv,
+                                                memory_budget);
     sessions = size.sessions;
     max_context = size.max_context;
     batch = batch_arg.value_or(size.sessions_auto ? sessions : as::kDefaultBatch);
     const as::StartPlan start = as::start_plan(cfg, weights, scratch, !draft_dir.empty(), sessions, max_context, avail,
-                                               host_reserve_mb, kv);
+                                               host_reserve_mb, kv, memory_budget);
     plan = start.plan;
     const as::MemoryPlan& mp = plan;
+    if (memory_budget > 0)
+      std::cerr << "memory budget: " << as::gb(memory_budget) << " (" << (std::getenv("RAGON_MEMORY_BUDGET_GB")
+                                                                          ? "RAGON_MEMORY_BUDGET_GB"
+                                                                          : "--memory-budget-gb")
+                << "), planned " << as::gb(mp.total()) << " of it: weights and scratch " << as::gb(mp.weights + mp.scratch)
+                << ", " << sessions << " sessions x " << as::gb(mp.per_session)
+                << (mp.store ? ", prefix KV store " + as::gb(mp.store) : std::string())
+                << (kv_pages ? ", KV page pool " + as::describe_kv_pool(mp) : std::string()) << "\n";
     if (!start.refusal.empty()) {
       std::cerr << "ragon-serve: refused to start: " << start.refusal << "\n";
       return 3;
@@ -2883,7 +2915,8 @@ int main(int argc, char** argv) try {
               << as::gb(mp.total()) << "; requests refused below " << admit_reserve_mb << " MB\n";
   }
   if (plan_only) {  // the host-safety check of the launcher asks for this before it loads (BATCHING §5.6)
-    std::cout << ragon::serve::plan_json(sessions, batch, max_context, plan, kv_pages, host_reserve_mb) << "\n";
+    std::cout << ragon::serve::plan_json(sessions, batch, max_context, plan, kv_pages, host_reserve_mb, memory_budget)
+              << "\n";
     return 0;
   }
   opts.max_context = max_context;
