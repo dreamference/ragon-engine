@@ -525,6 +525,28 @@ int main() {
     std::vector<float> got = download(out, M * rowf);
     ok &= cuda_ok() && std::memcmp(got.data(), per.data(), got.size() * 4) == 0;
     report("attention_rows_seqs with FP8 reads, three sequences, against attention_rows per sequence", ok);
+    // The same three sequences over BF16 keys and values, with and without the bulk tiles: every
+    // sequence, the last one included, must match attention_rows on its own rows.
+    for (int bulk = 0; bulk < 2; ++bulk) {
+      const k::KvQ8 bf{};
+      k::set_attention_bulk(bulk != 0);
+      std::vector<float> perb(size_t(M) * rowf);
+      for (int i = 0; i < 3; ++i) {
+        k::attention_rows(dq + sb.row0[i] * rowf, kp, vp, pos[i], rows[i], Hq, Hkv, D, scratch, out, nullptr, 0, nullptr,
+                          dt[i], bf);
+        const std::vector<float> o = download(out, rows[i] * rowf);
+        std::memcpy(&perb[sb.row0[i] * rowf], o.data(), o.size() * 4);
+      }
+      k::attention_rows_seqs(dq, kc, vc, sb, Hq, Hkv, D, scratch, out, nullptr, 0, pg, bf);
+      const std::vector<float> gotb = download(out, M * rowf);
+      bool okb = cuda_ok();
+      for (int i = 0; i < 3; ++i)
+        okb &= std::memcmp(&gotb[sb.row0[i] * rowf], &perb[sb.row0[i] * rowf], rows[i] * rowf * 4) == 0;
+      report(bulk ? "attention_rows_seqs with BF16 reads and bulk tiles, three sequences, against attention_rows"
+                  : "attention_rows_seqs with BF16 reads, three sequences, against attention_rows per sequence",
+             okb);
+    }
+    k::set_attention_bulk(false);
     // The cascade: sequences 0 and 1 a group whose keys below the cut (on the tile grid, under both positions) are shared.
     k::SeqGroups g;
     g.n = 1;
