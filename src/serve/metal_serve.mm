@@ -220,13 +220,15 @@ struct Job {
 };
 
 struct Specials {
-  int think_end = -1, im_end = -1, newline = -1, blank_line = -1;
+  int think_end = -1, im_start = -1, im_end = -1, newline = -1, blank_line = -1;
 };
 
 class Engine {
  public:
   Engine(Model& m, const Tokenizer& tok, Specials sp, int max_ctx, int chunk, bool ignore_eos, int spec_block)
       : m_(m), tok_(tok), sp_(sp), max_ctx_(max_ctx), chunk_(chunk), spec_block_(m.has_draft() ? spec_block : 0) {
+    sl_.resize(size_t(std::max(1, m.slots())));
+    for (Slot& s : sl_) s.snap_pos.assign(size_t(m.snaps()), -1), s.snap_used.assign(size_t(m.snaps()), 0);
     stop_ids_ = m.eos_ids;
     if (sp.im_end >= 0 && std::find(stop_ids_.begin(), stop_ids_.end(), sp.im_end) == stop_ids_.end())
       stop_ids_.push_back(sp.im_end);
@@ -256,7 +258,8 @@ class Engine {
         try {
           run(*j);
         } catch (const std::exception& e) {
-          fed_.clear();  // the model's sequence is unknown now
+          m_.spec_drop();
+          forget(cs_, 0);  // the slot's sequence is unknown now
           std::fprintf(stderr, "request failed: %s\n", e.what());
           j->sink.error(e.what(), "server_error");
         }
@@ -295,17 +298,85 @@ class Engine {
       return;
     }
     std::vector<uint32_t> ids(j.prompt.begin(), j.prompt.end());
-    size_t reuse = 0;
-    if (!fed_.empty() && fed_.size() < ids.size() && std::equal(fed_.begin(), fed_.end(), ids.begin())) reuse = fed_.size();
+    // The start (eng-metal-sessions-1): the session slot whose sequence the prompt extends, or the latest snapshot
+    // at or below the longest common prefix with any slot (restored in place, or copied into another slot: a fork),
+    // or a new sequence. The prompt always feeds at least one token. Snapshots are taken where the prompt starts
+    // feeding (the branch point of later forks), where its last turn header starts and where it ends.
     const double tp = now_s();
+    int bs = -1, bk = -1;  // slot, snapshot (-1: the slot's sequence itself)
+    size_t reuse = 0;
+    for (size_t s = 0; s < sl_.size(); ++s) {
+      const std::vector<uint32_t>& f = sl_[s].fed;
+      size_t L = 0;
+      const size_t lim = std::min(f.size(), ids.size() - 1);
+      while (L < lim && f[L] == ids[L]) ++L;
+      if (!f.empty() && L == f.size() && (L > reuse || (L == reuse && bk >= 0))) bs = int(s), bk = -1, reuse = L;
+      for (size_t k = 0; k < sl_[s].snap_pos.size(); ++k) {
+        const int p = sl_[s].snap_pos[k];
+        if (p > 0 && size_t(p) <= L && size_t(p) > reuse) bs = int(s), bk = int(k), reuse = size_t(p);
+      }
+    }
+    int ts = bs;  // the slot that runs the request
+    if (bs < 0 || bk >= 0) {  // a new sequence or a snapshot: an empty slot, else the one used longest ago
+      ts = -1;
+      for (size_t s = 0; s < sl_.size() && ts < 0; ++s)
+        if (sl_[s].fed.empty() && std::all_of(sl_[s].snap_pos.begin(), sl_[s].snap_pos.end(), [](int p) { return p < 0; }))
+          ts = int(s);
+      if (ts < 0) {
+        ts = 0;
+        for (size_t s = 1; s < sl_.size(); ++s)
+          if (sl_[s].used < sl_[size_t(ts)].used) ts = int(s);
+      }
+    }
+    cs_ = ts;
+    m_.use_slot(ts);
+    Slot& slot = sl_[size_t(ts)];
+    slot.used = ++tick_;
+    std::vector<uint32_t>& fed_ = slot.fed;
+    const char* how = "new";
+    double copy_s = 0;
+    if (bs >= 0 && bk < 0) {
+      how = "extend";
+      forget(ts, int(reuse));
+      if (m_.snaps() > 0) save_snap(int(reuse));
+    } else if (bs >= 0) {
+      const double tc = now_s();
+      if (ts != bs) {
+        how = "fork";
+        forget(ts, 0);
+        m_.copy_kv(bs, int(reuse));
+      } else {
+        how = "restore";
+        forget(ts, int(reuse));
+      }
+      m_.snap_load(bs, bk);
+      sl_[size_t(bs)].snap_used[size_t(bk)] = ++tick_;
+      copy_s = now_s() - tc;
+    } else {
+      forget(ts, 0);
+    }
     fed_.clear();
+    // A snapshot also where the last turn header starts: the next request re-renders this turn's answer (its
+    // thinking dropped), so its common prefix with this prompt ends inside the header, short of P.
+    int mid = P;
+    if (m_.snaps() > 0 && sp_.im_start >= 0)
+      for (int i = P - 1; i > int(reuse) && i >= P - 64; --i)
+        if (ids[size_t(i)] == uint32_t(sp_.im_start)) {
+          mid = i;
+          break;
+        }
     if (reuse) {
-      for (int s = int(reuse); s < P; s += chunk_) m_.forward(ids.data() + s, std::min(chunk_, P - s), s, false);
+      feed(ids.data(), int(reuse), mid);
     } else {
       m_.reset();
-      m_.prefill(ids.data(), P);
+      m_.prefill(ids.data(), mid);
+    }
+    if (mid < P) {
+      save_snap(mid);
+      feed(ids.data(), mid, P);
     }
     fed_ = ids;
+    if (m_.snaps() > 0 && size_t(P) > reuse) save_snap(P);
     const double prefill_s = now_s() - tp;
 
     const int ctx_left = max_ctx_ - P;
@@ -382,8 +453,8 @@ class Engine {
     if (spec) {
       // Speculative decode: the drafter drafts spec_block_ rows from the last token, the target verifies them in
       // one forward; greedy keeps the longest matching prefix plus the target's own next token (the same ids as
-      // plain greedy decode), sampling accepts by the standard rule (Model::speculate). The accepted inputs are committed, so fed_ holds every row the model
-      // has taken, including drafted rows past a stop.
+      // plain greedy decode), sampling accepts by the standard rule (Model::speculate). Only the rows up to a stop are
+      // committed, so fed_ holds exactly the rows the model has taken.
       uint32_t buf[16];
       bool more = accept(t);
       while (more) {
@@ -397,18 +468,24 @@ class Engine {
           more = accept(t);
           continue;
         }
-        const int n = m_.speculate(uint32_t(t), pos, spec_block_, banned_, buf, sampled);
+        // deferred commit: a stop inside the block commits only the rows up to it, so the sequence the slot keeps
+        // is the prompt and the kept tokens (the next turn's prompt extends it)
+        const int n = m_.speculate(uint32_t(t), pos, spec_block_, banned_, buf, sampled, true);
         if (n < 0) {
           fed_.clear();
           throw ragon::NonFiniteLogits();
         }
-        fed_.push_back(uint32_t(t));
-        for (int i = 0; i + 1 < n; ++i) fed_.push_back(buf[i]);
-        ++steps;
+        const uint32_t anchor = uint32_t(t);
+        int k = n;
         for (int i = 0; i < n && more; ++i) {
           t = int(buf[i]);
           more = accept(t);
+          if (!more) k = i + 1;
         }
+        m_.spec_commit(k);
+        fed_.push_back(anchor);
+        for (int i = 0; i + 1 < k; ++i) fed_.push_back(buf[i]);
+        ++steps;
       }
     } else if (gpu_greedy) {
       // The GPU picks each next id itself (Model::greedy_step), two steps in flight: step k feeds the token
@@ -476,10 +553,10 @@ class Engine {
                     double(m_.spec_tokens - spec_tokens0) / double(ns));
     std::fprintf(stderr,
                  "[%s] prompt %d reused %zu prefill %d tok in %.3f s (%.0f tok/s) | out %d (reasoning %d) steps %d%s in "
-                 "%.3f s = %.2f tok/s | finish %s\n",
+                 "%.3f s = %.2f tok/s | finish %s | slot %d %s%s\n",
                  j.route.c_str(), P, reuse, P - int(reuse), prefill_s, prefill_s > 0 ? (P - reuse) / prefill_s : 0.0,
                  produced, reasoning, steps, spec_note, decode_s, produced > 0 ? produced / decode_s : 0.0,
-                 finish.c_str());
+                 finish.c_str(), ts, how, copy_note(copy_s).c_str());
     std::fflush(stderr);
     j.sink.done(finish, P, produced, int(reuse), reasoning);
   }
@@ -489,7 +566,56 @@ class Engine {
   Specials sp_;
   int max_ctx_, chunk_, spec_block_;
   std::vector<int> stop_ids_, banned_;
-  std::vector<uint32_t> fed_;  // the sequence in the model (prompt and the tokens fed after it)
+  // ids[from, to) into the model at their positions, chunk_ tokens a forward. A piece shorter than the matmul path's
+  // 64 rows (a new turn, a fork's instruction) runs as 8-row forwards: the 2..8-row GEMV reads each weight once for
+  // 8 rows, the GEMV over 9..63 rows once a row (RAGON_METAL_FEED8=0: one forward).
+  void feed(const uint32_t* ids, int from, int to) {
+    for (int s = from; s < to;) {
+      int n = std::min(chunk_, to - s);
+      if (feed8_ && n > 8 && n < 64) n = 8;
+      m_.forward(ids + s, n, s, false);
+      s += n;
+    }
+  }
+  const bool feed8_ = !std::getenv("RAGON_METAL_FEED8") || std::atoi(std::getenv("RAGON_METAL_FEED8")) != 0;
+  // A session slot: the sequence in the model's slot (prompt and the tokens fed after it) and the positions of its
+  // snapshots (-1: none).
+  struct Slot {
+    std::vector<uint32_t> fed;
+    std::vector<int> snap_pos;
+    std::vector<long> snap_used;
+    long used = 0;
+  };
+  std::vector<Slot> sl_;
+  int cs_ = 0;  // the slot of the running request
+  long tick_ = 0;
+  // Slot s writes from position from on: its snapshots past from no longer hold (from 0: none does).
+  void forget(int s, int from) {
+    Slot& sl = sl_[size_t(s)];
+    if (from == 0) sl.fed.clear();
+    for (int& p : sl.snap_pos)
+      if (p > from || from == 0) p = -1;
+  }
+  // The current slot's state at pos into a free snapshot, else the one used longest ago.
+  void save_snap(int pos) {
+    Slot& sl = sl_[size_t(cs_)];
+    size_t k = 0;
+    long best = LONG_MAX;
+    for (size_t i = 0; i < sl.snap_pos.size(); ++i) {
+      if (sl.snap_pos[i] == pos) return;  // already there
+      const long u = sl.snap_pos[i] < 0 ? -1 : sl.snap_used[i];
+      if (u < best) best = u, k = i;
+    }
+    m_.snap_save(int(k));
+    sl.snap_pos[k] = pos;
+    sl.snap_used[k] = ++tick_;
+  }
+  static std::string copy_note(double s) {
+    if (s <= 0) return "";
+    char b[48];
+    std::snprintf(b, sizeof b, " (state copy %.1f ms)", s * 1e3);
+    return b;
+  }
   std::vector<float> row_;
   std::mutex mu_;
   std::condition_variable cv_;
@@ -798,7 +924,7 @@ int usage() {
                "usage: ragon-serve --model DIR [--host 127.0.0.1] [--port 8000] [--served-model-name NAME] "
                "[--max-context N] [--chunk C] [--keepalive-seconds N] [--repetition-detection P,p,R,K|off] "
                "[--repetition-report incomplete|completed] [--api-key KEY] [--pretokenizer production|checkpoint] "
-               "[--draft DIR [--spec-block N] [--sparse-head-dir DIR]]\n");
+               "[--draft DIR [--spec-block N] [--sparse-head-dir DIR]] [--sessions N]\n");
   return 2;
 }
 
@@ -809,7 +935,7 @@ int main(int argc, char** argv) {
     std::string model_dir, host = "127.0.0.1", name, pretokenizer = "production", repetition_arg, report = "incomplete";
     std::string api_key = std::getenv("RAGON_API_KEY") ? std::getenv("RAGON_API_KEY") : "";
     std::string draft_dir, sparse_head_dir;
-    int port = 8000, max_ctx = 65536, chunk = 2048, keepalive_s = 15, spec_block = 0;
+    int port = 8000, max_ctx = 65536, chunk = 2048, keepalive_s = 15, spec_block = 0, sessions = 1;
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
       auto next = [&]() -> std::string {
@@ -833,9 +959,10 @@ int main(int argc, char** argv) {
       else if (a == "--draft") draft_dir = next();
       else if (a == "--spec-block") spec_block = std::atoi(next().c_str());
       else if (a == "--sparse-head-dir") sparse_head_dir = next();
+      else if (a == "--sessions") sessions = std::atoi(next().c_str());
       else return usage();
     }
-    if (model_dir.empty() || max_ctx < 2 || chunk < 1 || (report != "incomplete" && report != "completed") ||
+    if (model_dir.empty() || max_ctx < 2 || chunk < 1 || sessions < 1 || sessions > 16 || (report != "incomplete" && report != "completed") ||
         (pretokenizer != "production" && pretokenizer != "checkpoint"))
       return usage();
     while (model_dir.size() > 1 && model_dir.back() == '/') model_dir.pop_back();
@@ -863,6 +990,7 @@ int main(int argc, char** argv) {
     S.tok = &tok;
     Specials sp;
     sp.think_end = tok.token_id("</think>");
+    sp.im_start = tok.token_id("<|im_start|>");
     sp.im_end = tok.token_id("<|im_end|>");
     if (const auto one = tok.encode("\n"); one.size() == 1) sp.newline = one[0];
     if (const auto two = tok.encode("\n\n"); two.size() == 1) sp.blank_line = two[0];
@@ -884,6 +1012,13 @@ int main(int argc, char** argv) {
       m.sparse_head_load(sparse_head_dir.empty() ? draft_dir + "/sparse-head" : sparse_head_dir);
       std::fprintf(stderr, "metal serve: drafter %s, block %d\n", draft_dir.c_str(), spec_block);
     }
+    // Session slots: each has its own KV cache and recurrent state (no re-read when conversations alternate), and
+    // RAGON_METAL_SNAPSHOTS (default 4) snapshots of its recurrent state, for forks and re-rendered histories.
+    const char* sn = std::getenv("RAGON_METAL_SNAPSHOTS");
+    const int snaps = sn ? std::max(0, std::atoi(sn)) : 4;
+    m.slots_init(sessions, snaps);
+    std::fprintf(stderr, "metal serve: %d session slot%s of %.2f GiB, %d snapshots of %.0f MiB a slot\n", sessions,
+                 sessions == 1 ? "" : "s", double(m.slot_bytes()) / (1 << 30), snaps, double(m.snap_bytes()) / (1 << 20));
     Engine engine(m, tok, sp, max_ctx, chunk, ignore_eos, spec_block);
     S.engine = &engine;
 
