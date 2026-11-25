@@ -1401,6 +1401,16 @@ void Engine::save_checkpoint(int pos, uint64_t epoch, const StateSlot* from, boo
       k.used = ++ckpt_clock_;
       return;
     }
+  // Past checkpoint_limit only soft entries are saved, one per conversation: a later one on the same prefix (the
+  // next turn's snap, the next branch point) takes the earlier one's slot, so a long conversation does not walk its
+  // turn ends through the store and evict what other prompts resume from.
+  if (soft && pos > opts_.checkpoint_limit)
+    for (size_t i = 0; i < ckpts_.size(); ++i)
+      if (ckpts_[i].soft && ckpts_[i].pos > opts_.checkpoint_limit && ckpts_[i].pos < pos &&
+          ckpts_[i].scope == s_->scope && std::equal(ckpts_[i].tokens.begin(), ckpts_[i].tokens.end(), s_->history.begin())) {
+        ckpts_.erase(ckpts_.begin() + i);
+        break;
+      }
   int slot = -1;
   std::vector<bool> used(ckpt_slots_.size(), false);
   for (const Checkpoint& k : ckpts_) used[k.slot] = true;
@@ -2214,7 +2224,8 @@ Engine::ResumePlan Engine::plan_resume(const Session& self, const std::vector<in
   const int window = plan.window = draft_ ? std::max(0, L - draft_->config().sliding_window) : 0;
   std::vector<uint64_t>& prefix_hash = plan.prefix_hash;  // of prompt[0, i), for the store's lookups and LRU stamps
   if (!ckpts_.empty()) {
-    const int n = std::min(L, opts_.checkpoint_limit);
+    // The whole prompt: a soft entry (a resumed snap, a branch point) may sit past checkpoint_limit.
+    const int n = L;
     prefix_hash.resize(n + 1);
     prefix_hash[0] = kFnvBasis;
     for (int i = 0; i < n; ++i) prefix_hash[i + 1] = fnv_step(prefix_hash[i], prompt[i]);
@@ -2463,9 +2474,11 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   // The pass below rewrites the snap this prompt resumes from. A prompt that extends a long one leaves that point behind
   // for good, and the other forks of the same context would resume at the store's last entry, thousands of tokens back
   // (the store fills from the start of a prompt): when the snap is a chunk or more past that entry, it joins the store.
-  // Taken for every such prompt, since the next fork may arrive a moment after this one.
-  if (!from_kv && plan.src_from == &s_->snap && branch_checkpoints_ && !ckpt_slots_.empty() && reuse > 0 &&
-      reuse <= opts_.checkpoint_limit) {
+  // Taken for every such prompt, since the next fork may arrive a moment after this one, and at any position: past
+  // checkpoint_limit the other forks of a 100K context (or the next one after an idle spell) re-read 87K tokens from
+  // the store's last chunk multiple otherwise (eng-fork-idle-fix-1: 114 s on GB10). It takes one of the store's slots,
+  // as any soft entry does, so the memory is the same.
+  if (!from_kv && plan.src_from == &s_->snap && branch_checkpoints_ && !ckpt_slots_.empty() && reuse > 0) {
     int furthest = 0;
     for (const Checkpoint& k : ckpts_)
       if (k.pos <= reuse && k.pos > furthest && ckpt_match(k, prompt, prefix_hash, s_->scope)) furthest = k.pos;
@@ -2487,7 +2500,8 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
   }
 
   // Chunk ends: every prefill_chunk tokens, and the checkpoint positions (the end of each of the first
-  // two messages, and chunk multiples up to checkpoint_limit), where the state is kept for later prompts.
+  // two messages, and chunk multiples up to checkpoint_limit, the branch point anywhere), where the state is kept
+  // for later prompts.
   // Every kept state sits at a multiple of kResumeAlign: the prefill DeltaNet runs in 32-token chunks at
   // absolute positions, so a prompt resumed there computes exactly what a prefill from scratch does.
   auto align = [](int p) { return p - p % kResumeAlign; };
@@ -2503,7 +2517,7 @@ Engine::PrefillCursor Engine::begin_prefill(const std::vector<int>& prompt, bool
       }
     for (int b = opts_.prefill_chunk; b < std::min(L, opts_.checkpoint_limit + 1); b += opts_.prefill_chunk)
       cur.bounds.push_back(b);
-    if (branch_at > reuse && branch_at < L && branch_at <= opts_.checkpoint_limit) at.push_back(branch_at);
+    if (branch_at > reuse && branch_at < L) at.push_back(branch_at);  // at any position, as the resumed snap above
     // RAGON_CKPT_TRIM=1 (BACKLOG 34, measured before any default): no chunk-multiple checkpoint past both the branch
     // point and the message ends. Those positions serve only this conversation, whose own snap covers its next turn,
     // and each one cuts a chunk short off the 2,048-token grid that the other bounds shift (one more pass).

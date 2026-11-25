@@ -97,8 +97,9 @@ struct EngineOptions {
   // not. RAGON_DRAFT_OFF_WIDE=0/1 overrides it.
   bool draft_off_wide = false;
   // Prefix checkpoints: DeltaNet and conv states kept at chosen prompt positions (the end of the first two
-  // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit), so a later
-  // prompt that shares the prefix resumes there. Each costs ~157 MB; 0 turns them off.
+  // messages, i.e. after `boundary_token`, and multiples of prefill_chunk up to checkpoint_limit; a fork's branch point
+  // and the snap a fork resumes at any position), so a later prompt that shares the prefix resumes there. Each costs
+  // ~157 MB; 0 turns them off.
   int prefix_checkpoints = 8;
   int boundary_token = -1;  // <|im_end|>
   int checkpoint_limit = 32768;
@@ -1016,7 +1017,8 @@ class Engine {
   std::vector<int> layer_slot_;  // layer -> index into a session's kcache/vcache or gdn/conv
   int n_linear_ = 0;             // DeltaNet layers
   // The checkpoint store (M4 §1), shared by the sessions and owning its identity: each entry is the state
-  // after exactly `tokens` (a prompt prefix of at most checkpoint_limit ids), found by a hash of the prefix
+  // after exactly `tokens` (a prompt prefix: at most checkpoint_limit ids, or any length for a soft entry, i.e. a
+  // resumed snap or a branch point), found by a hash of the prefix
   // and confirmed by comparing the ids. It outlives the history it was taken from; resuming from it also
   // needs the prefix's KV, which the target session holds or copies from another session.
   // Each entry's last use: its save, or a prefill whose prompt resumes from it or extends its prefix.

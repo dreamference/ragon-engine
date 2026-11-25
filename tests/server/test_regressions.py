@@ -136,6 +136,36 @@ def test_used_checkpoint_store_still_saves(server):
 
 
 @pytest.mark.slow
+def test_later_fork_past_checkpoint_limit_resumes_at_branch_point(server):
+    """Ours (GB10 fork after idle at 100K, 2026-11-25: 114 s against SGLang's 0.76 s).
+
+    The bug: the first fork of a long context moves the session that holds its state on, and the state at the
+    branch point was kept only up to checkpoint_limit (32,768 tokens), so every later fork of a 100K context
+    re-read everything past the store's last chunk multiple (87K tokens). Check: after a first fork that moves on
+    the session holding a 36,000-token prefix and a second fork that branches there, a third fork of the prefix
+    reuses more than 34,816 tokens and answers as cold; with no session left holding the prefix's KV it falls back
+    and still answers as cold."""
+    base = prompt_of_length(server, 36000)
+    # Longer than the second fork's history, so that session's drafter ring reaches back to the branch point.
+    fork_c = base + "\n\nclass ThirdFork:\n" + code_text(24)
+    evict(server)
+    first = greedy_completion(server, base, max_tokens=8)["choices"][0]["text"]
+    # Continues the session holding base, with a suffix long enough to move its kept state on past base.
+    greedy_completion(server, base + first + "\n\n" + code_text(120) + "def first_fork(y):\n")
+    # A new session, keeping the branch point; its suffix is long enough that its own snap lies past the branch.
+    greedy_completion(server, base + "\n\nclass SecondFork:\n" + code_text(8))
+    warm = greedy_completion(server, fork_c)
+    assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] > 34816, "the branch point past 32,768 was not kept"
+    evict(server)
+    no_donor = greedy_completion(server, fork_c)
+    evict(server)
+    cold = greedy_completion(server, fork_c)
+    assert warm["choices"][0]["text"] == cold["choices"][0]["text"]
+    assert no_donor["choices"][0]["text"] == cold["choices"][0]["text"]
+    assert not degenerate(cold["choices"][0]["text"])
+
+
+@pytest.mark.slow
 def test_growing_conversation_warm_equals_cold(server):
     """vllm#60174, vllm#43559, vllm#53912, sglang#41351, vllm#58894.
 
