@@ -44,7 +44,7 @@ constexpr int kTileK = 64;           // K per weight tile
 constexpr int kKC = 256;             // K per LDS chunk
 constexpr int kXSt = kKC + 16;       // LDS row stride (halves)
 constexpr int kBR = 64;              // rows per block (four 16-row WMMA groups)
-constexpr int kWaves = 8;            // waves per block, one 16-column weight tile each
+constexpr int kWaves = 8;            // waves per block (16 in the NVFP4 plain GEMM, see waves_of)
 constexpr int kSlabRows = 2048;      // rows per launch (TDR)
 
 // ---- Conversions ----
@@ -322,15 +322,21 @@ __device__ __forceinline__ void mma_tile(const hf* XS, u32 r16, int kk, const v1
 
 // Activation staging in two halves: the raw codes of a chunk into registers (issued before the previous chunk's
 // WMMAs), then decoded into LDS. Item i of a chunk: row i / (kc / 8), 8 values from K offset 8 (i % (kc / 8)).
-constexpr int kStageItems = kBR * (kKC / 8) / (kWaves * 32);
+template <int W>
+constexpr int kStageItems = kBR * (kKC / 8) / (W * 32);
 
-template <bool FP4>
-__device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, int kc, u32 tid, u32 (&a)[kStageItems],
-                                           u32 (&b)[kStageItems]) {
+// Waves per block: the NVFP4 plain GEMM (the down projection's shape) gains from 16 (activation staging per output
+// halved); SwiGLU and FP8 lose with it.
+template <bool FP4, int MODE>
+constexpr int waves_of() { return FP4 && MODE == kPlain ? 16 : kWaves; }
+
+template <bool FP4, int W>
+__device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, int kc, u32 tid, u32 (&a)[kStageItems<W>],
+                                           u32 (&b)[kStageItems<W>]) {
   const int per_row = kc / 8, K = p.K;
 #pragma unroll
-  for (int j = 0; j < kStageItems; ++j) {
-    const int i = static_cast<int>(tid) + j * kWaves * 32;
+  for (int j = 0; j < kStageItems<W>; ++j) {
+    const int i = static_cast<int>(tid) + j * W * 32;
     a[j] = 0, b[j] = 0;
     if (i < kBR * per_row) {
       const int r = i / per_row, c8 = i - r * per_row, row = m0 + r, k = k0 + c8 * 8;
@@ -347,13 +353,13 @@ __device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, in
   }
 }
 
-template <bool FP4>
-__device__ __forceinline__ void stage_store(const GemmArgs& p, int m0, int kc, u32 tid, const u32 (&a)[kStageItems],
-                                            const u32 (&b)[kStageItems], hf* XS) {
+template <bool FP4, int W>
+__device__ __forceinline__ void stage_store(const GemmArgs& p, int m0, int kc, u32 tid, const u32 (&a)[kStageItems<W>],
+                                            const u32 (&b)[kStageItems<W>], hf* XS) {
   const int per_row = kc / 8;
 #pragma unroll
-  for (int j = 0; j < kStageItems; ++j) {
-    const int i = static_cast<int>(tid) + j * kWaves * 32;
+  for (int j = 0; j < kStageItems<W>; ++j) {
+    const int i = static_cast<int>(tid) + j * W * 32;
     if (i < kBR * per_row) {
       const int r = i / per_row, c8 = i - r * per_row;
       v4u v = {0, 0, 0, 0};
@@ -372,21 +378,22 @@ __device__ __forceinline__ void stage_store(const GemmArgs& p, int m0, int kc, u
   }
 }
 
-// A block: 64 rows x 8 waves. Each wave holds two 16-column weight tiles (SwiGLU: the gate's and the up projection's
+// A block: 64 rows x W waves. Each wave holds two 16-column weight tiles (SwiGLU: the gate's and the up projection's
 // tile of its 16 columns; otherwise two adjacent column tiles) and feeds every A fragment it reads from LDS to both.
 // The activations of a 256-K chunk are decoded to FP16 into LDS (rows past M as zeros); the next chunk's codes are
 // loaded into registers while this chunk's WMMAs run, and the next 64-K weight tiles' bytes while this tile's are
 // decoded and used. Row blocks run fastest in the grid (blockIdx.x), so the blocks resident together read the same
 // weight tiles. K ascends and nothing is split: each output is the plain WMMA chain over K.
 template <bool FP4, int MODE>
-__global__ void __launch_bounds__(kWaves * 32) prefill_gemm_kernel(GemmArgs p) {
+__global__ void __launch_bounds__((waves_of<FP4, MODE>() * 32)) prefill_gemm_kernel(GemmArgs p) {
+  constexpr int W = waves_of<FP4, MODE>();
   __shared__ __attribute__((aligned(16))) hf XS[kBR * kXSt];
   constexpr bool kSw = MODE == kSwiglu;
   constexpr int kTN = kSw ? 1 : 2;  // output tiles per wave
   const u32 tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, half = lane >> 4, r16 = lane & 15;
   const int N = p.N, K = p.K, M = p.M;
   const u32 ntiles = N / 16;
-  const u32 nt = (blockIdx.y * kWaves + wave) * kTN;
+  const u32 nt = (blockIdx.y * W + wave) * kTN;
   const bool valid = nt < ntiles;              // wave-uniform
   const bool second = kSw || nt + 1 < ntiles;  // the second weight tile (always there in SwiGLU)
   const int m0 = blockIdx.x * kBR;
@@ -397,8 +404,8 @@ __global__ void __launch_bounds__(kWaves * 32) prefill_gemm_kernel(GemmArgs p) {
   const u32 nt2 = kSw ? nt : nt + 1;
 
   v8f acc[kTN][4] = {}, acc2[4] = {};
-  u32 sa[kStageItems], sb[kStageItems];
-  stage_load<FP4>(p, m0, 0, min(kKC, K), tid, sa, sb);
+  u32 sa[kStageItems<W>], sb[kStageItems<W>];
+  stage_load<FP4, W>(p, m0, 0, min(kKC, K), tid, sa, sb);
   WRaw<FP4> wn[2] = {};
   if (valid) {
     weight_load<FP4>(p.w, sc1, nt, r16, half, wn[0]);
@@ -406,9 +413,9 @@ __global__ void __launch_bounds__(kWaves * 32) prefill_gemm_kernel(GemmArgs p) {
   }
   for (int k0 = 0; k0 < K; k0 += kKC) {
     const int kc = min(kKC, K - k0);
-    stage_store<FP4>(p, m0, kc, tid, sa, sb, XS);
+    stage_store<FP4, W>(p, m0, kc, tid, sa, sb, XS);
     __syncthreads();
-    if (k0 + kKC < K) stage_load<FP4>(p, m0, k0 + kKC, min(kKC, K - k0 - kKC), tid, sa, sb);
+    if (k0 + kKC < K) stage_load<FP4, W>(p, m0, k0 + kKC, min(kKC, K - k0 - kKC), tid, sa, sb);
     if (valid) {
       for (int kk = 0; kk < kc; kk += kTileK) {
         const WRaw<FP4> wc0 = wn[0], wc1 = wn[1];
@@ -485,6 +492,7 @@ void launch_gemm(GemmArgs p, gpu::Stream s, const char* what) {
     throw std::runtime_error(std::string(what) + ": N % 16 and K % 128 must be 0");
   const int M = p.M;
   constexpr int tn = MODE == kSwiglu ? 1 : 2;  // the kernel's kTN
+  constexpr int W = waves_of<FP4, MODE>();
   for (int r0 = 0; r0 < M; r0 += kSlabRows) {
     GemmArgs q = p;
     q.M = std::min(kSlabRows, M - r0);
@@ -494,8 +502,8 @@ void launch_gemm(GemmArgs p, gpu::Stream s, const char* what) {
     if (p.yb) q.yb = p.yb + static_cast<size_t>(r0) * p.ldy;
     if (p.q_out) q.q_out = p.q_out + static_cast<size_t>(r0) * (p.N / 2);
     if (p.sf_out) q.sf_out = p.sf_out + static_cast<size_t>(r0) * (p.N / 16);
-    const unsigned cb = (p.N / 16 + kWaves * tn - 1) / (kWaves * tn), rb = (q.M + kBR - 1) / kBR;
-    launch_kernel(what, prefill_gemm_kernel<FP4, MODE>, dim3(rb, cb), dim3(kWaves * 32), 0, s, q);
+    const unsigned cb = (p.N / 16 + W * tn - 1) / (W * tn), rb = (q.M + kBR - 1) / kBR;
+    launch_kernel(what, prefill_gemm_kernel<FP4, MODE>, dim3(rb, cb), dim3(W * 32), 0, s, q);
   }
 }
 
