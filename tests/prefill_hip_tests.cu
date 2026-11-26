@@ -899,27 +899,30 @@ void time_gemm_bf16() {
 // the weights stay in cache), timed: a warm-up, then the mean of five launches.
 void time_prefill() {
   const int M = 2048;
-  struct Shape { const char* name; int kind, N, K; };  // kind 0 swiglu, 1 nvfp4, 2 fp8, 3 narrow
+  struct Shape { const char* name; int kind, N, K; };  // kind 0 swiglu, 1 nvfp4, 2 fp8, 3 narrow, 4 narrow fp32 in
   const Shape shapes[] = {{"swiglu", 0, 17408, 5120}, {"swiglu", 0, 256, 5120}, {"nvfp4_down", 1, 5120, 17408},
                           {"nvfp4_down", 1, 256, 17408}, {"fp8", 2, 10240, 5120}, {"fp8", 2, 256, 5120},
-                          {"narrow", 3, 48, 5120}};
+                          {"narrow", 3, 48, 5120}, {"narrow_f32", 4, 48, 5120}};
   for (const auto& sh : shapes) {
     const int N = sh.N, Kd = sh.K;
-    const size_t wbytes = sh.kind == 2 ? K::tiled_bytes_fp8(N, Kd) : sh.kind == 3 ? size_t(N) * Kd * 2 : K::tiled_bytes_nvfp4(N, Kd);
+    const size_t wbytes = sh.kind == 2 ? K::tiled_bytes_fp8(N, Kd) : sh.kind >= 3 ? size_t(N) * Kd * 2 : K::tiled_bytes_nvfp4(N, Kd);
     auto* w = ragon::test::alloc<uint8_t>(wbytes);
     auto* w2 = ragon::test::alloc<uint8_t>(wbytes);
-    auto* xq = ragon::test::alloc<uint8_t>(size_t(M) * Kd * 2);
+    const size_t xbytes = size_t(M) * Kd * (sh.kind == 4 ? 4 : 2);
+    auto* xq = ragon::test::alloc<uint8_t>(xbytes);
     auto* xs = ragon::test::alloc<uint8_t>(size_t(M) * Kd / 16);
     auto* y = ragon::test::alloc<float>(size_t(M) * N);
     auto* y2 = ragon::test::alloc<float>(size_t(M) * N);
     auto* q = ragon::test::alloc<uint8_t>(size_t(M) * N / 2);
     auto* sf = ragon::test::alloc<uint8_t>(size_t(M) * N / 16);
     (void)hipMemset(w, 0x22, wbytes), (void)hipMemset(w2, 0x22, wbytes);
-    (void)hipMemset(xq, 0x22, size_t(M) * Kd * 2), (void)hipMemset(xs, 0x22, size_t(M) * Kd / 16);
+    (void)hipMemset(xq, 0x22, xbytes), (void)hipMemset(xs, 0x22, size_t(M) * Kd / 16);
     auto run = [&] {
       if (sh.kind == 0) K::prefill_swiglu_nvfp4(xq, xs, M, w, 0.01f, w2, 0.01f, N, Kd, 0.01f, q, sf, nullptr, nullptr, nullptr);
       else if (sh.kind == 1) K::prefill_gemm_nvfp4(xq, xs, M, w, 0.01f, y, N, N, Kd, false, nullptr, nullptr);
       else if (sh.kind == 2) K::prefill_gemm_fp8(xq, M, w, 0.01f, y, N, N, Kd, false, nullptr);
+      else if (sh.kind == 4) K::narrow_bf16(reinterpret_cast<const float*>(xq), M, reinterpret_cast<const gpu::bf16*>(w),
+                                            reinterpret_cast<const gpu::bf16*>(w2), y, y2, N, Kd, nullptr);
       else K::narrow_bf16_bf16in(reinterpret_cast<const gpu::bf16*>(xq), M, reinterpret_cast<const gpu::bf16*>(w),
                                  reinterpret_cast<const gpu::bf16*>(w2), y, y2, N, Kd, nullptr);
     };
@@ -929,7 +932,7 @@ void time_prefill() {
     for (int i = 0; i < 5; ++i) run();
     const float ms = t.stop() / 5;
     const char* err = ragon::test::sync_error();
-    const double flop = 2.0 * M * N * Kd * (sh.kind == 0 ? 2 : sh.kind == 3 ? 2 : 1);
+    const double flop = 2.0 * M * N * Kd * (sh.kind == 0 ? 2 : sh.kind >= 3 ? 2 : 1);
     std::printf("bench %s M=%d N=%d K=%d: %.3f ms %.1f TFLOPS%s%s\n", sh.name, M, N, Kd, ms,
                 flop / (ms * 1e9), err ? " error " : "", err ? err : "");
     for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xq), static_cast<void*>(xs),

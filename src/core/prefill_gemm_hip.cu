@@ -514,94 +514,97 @@ void launch_gemm(GemmArgs p, gpu::Stream s, const char* what) {
   }
 }
 
-// Narrow BF16 matrices (the DeltaNet a and b projections, 2 x 48 rows): one thread per output, K ascending, one
-// FMA per term (x rounded to BF16 as production's activations; BF16 x read as it is). A row's result does not
-// depend on M.
+// Narrow BF16 matrices (the DeltaNet a and b projections, 2 x 48 rows) on WMMA BF16 x BF16 into FP32: a block holds
+// 16 rows x 96 outputs (six 16-column tiles), its four waves a quarter of K each, K ascending within a quarter; the
+// quarters are added in wave order through LDS. x is rounded to BF16 as production's activations (BF16 x read as it
+// is), so every product is exact in FP32 and the result agrees with an FMA chain to rounding. A row's result does not
+// depend on M. For 2048 rows: BF16 x 0.80 -> 0.13 ms, FP32 x (the engine) about 1.3 -> 0.30 ms against the
+// row-blocked FMA kernel it replaces (LDS-bound), measured 2026-11-26 on gfx1151.
+constexpr int kNarrowWaves = 4, kNarrowTiles = 6;
 template <typename InT>
-__global__ void __launch_bounds__(96) narrow_bf16_kernel(const InT* __restrict__ x, int M, const gpu::bf16* __restrict__ wa,
-                                                         const gpu::bf16* __restrict__ wb, float* __restrict__ ya,
-                                                         float* __restrict__ yb, int N, int K) {
-  const int row = blockIdx.x, col = threadIdx.x;
-  if (row >= M || col >= 2 * N) return;
-  const InT* xr = x + static_cast<size_t>(row) * K;
-  const gpu::bf16* wr = col < N ? wa + static_cast<size_t>(col) * K : wb + static_cast<size_t>(col - N) * K;
-  float acc = 0.f;
-  for (int k = 0; k < K; ++k) {
-    const float xv = bf16_round(static_cast<float>(xr[k]));
-    acc = fmaf(xv, __bfloat162float(wr[k]), acc);
+__device__ __forceinline__ v16s narrow_a(const InT* p) {
+  v16s a;
+  if constexpr (sizeof(InT) == 2) {
+    a = *reinterpret_cast<const v16s*>(p);
+  } else {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float4 v = reinterpret_cast<const float4*>(p)[q];
+      a[4 * q] = __builtin_bit_cast(short, __float2bfloat16(v.x));
+      a[4 * q + 1] = __builtin_bit_cast(short, __float2bfloat16(v.y));
+      a[4 * q + 2] = __builtin_bit_cast(short, __float2bfloat16(v.z));
+      a[4 * q + 3] = __builtin_bit_cast(short, __float2bfloat16(v.w));
+    }
   }
-  if (col < N) ya[static_cast<size_t>(row) * N + col] = acc;
-  else yb[static_cast<size_t>(row) * N + col - N] = acc;
+  return a;
 }
-
-// The same sums, row-blocked: a block holds 16 rows x 96 outputs (two groups of 96 threads, 8 rows per thread); x
-// staged in LDS (rounded to BF16 as above), weights read 16 bytes at a time. Each output still adds its terms one
-// FMA at a time with K ascending, so every bit equals narrow_bf16_kernel's.
-constexpr int kNarrowRows = 8, kNarrowKC = 256;
-template <typename InT>
-__global__ void __launch_bounds__(192) narrow_bf16_rows_kernel(const InT* __restrict__ x, int M,
-                                                               const gpu::bf16* __restrict__ wa,
-                                                               const gpu::bf16* __restrict__ wb, float* __restrict__ ya,
-                                                               float* __restrict__ yb, int N, int K) {
-  __shared__ __attribute__((aligned(16))) float XN[2 * kNarrowRows][kNarrowKC];
-  const int tid = threadIdx.x, col = tid % 96, grp = tid / 96;
-  const int r0 = blockIdx.x * 2 * kNarrowRows;
-  const gpu::bf16* wr = col < N ? wa + static_cast<size_t>(col) * K : wb + static_cast<size_t>(col - N) * K;
-  float acc[kNarrowRows];
+template <typename InT, bool kAligned>
+__global__ void __launch_bounds__(kNarrowWaves * 32) narrow_bf16_kernel(const InT* __restrict__ x, int M,
+                                                                        const gpu::bf16* __restrict__ wa,
+                                                                        const gpu::bf16* __restrict__ wb,
+                                                                        float* __restrict__ ya, float* __restrict__ yb,
+                                                                        int N, int K) {
+  __shared__ float red[kNarrowWaves - 1][16][16 * kNarrowTiles];
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, half = lane >> 4, r16 = lane & 15;
+  const int r0 = blockIdx.x * 16, row = r0 + r16;
+  const bool rowok = row < M;
+  const InT* xr = x + static_cast<size_t>(rowok ? row : 0) * K;
+  const short* wr[kNarrowTiles];
 #pragma unroll
-  for (int r = 0; r < kNarrowRows; ++r) acc[r] = 0.f;
-  for (int k0 = 0; k0 < K; k0 += kNarrowKC) {
-    const int kc = min(kNarrowKC, K - k0);
-    for (int i = tid; i < 2 * kNarrowRows * kc; i += 192) {
-      const int r = i / kc, k = i - r * kc, row = r0 + r;
-      XN[r][k] = row < M ? bf16_round(static_cast<float>(x[static_cast<size_t>(row) * K + k0 + k])) : 0.f;
-    }
-    __syncthreads();
-    for (int kk = 0; kk < kc; kk += 8) {
-      const v4u wv = *(const v4u*)(wr + k0 + kk);
-      float wf[8];
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        wf[2 * e] = __uint_as_float(wv[e] << 16);
-        wf[2 * e + 1] = __uint_as_float(wv[e] & 0xFFFF0000u);
-      }
-#pragma unroll
-      for (int r = 0; r < kNarrowRows; ++r) {
-        const float4 x0 = *(const float4*)&XN[grp * kNarrowRows + r][kk];
-        const float4 x1 = *(const float4*)&XN[grp * kNarrowRows + r][kk + 4];
-        float a = acc[r];
-        a = fmaf(x0.x, wf[0], a); a = fmaf(x0.y, wf[1], a); a = fmaf(x0.z, wf[2], a); a = fmaf(x0.w, wf[3], a);
-        a = fmaf(x1.x, wf[4], a); a = fmaf(x1.y, wf[5], a); a = fmaf(x1.z, wf[6], a); a = fmaf(x1.w, wf[7], a);
-        acc[r] = a;
-      }
-    }
-    __syncthreads();
+  for (int t = 0; t < kNarrowTiles; ++t) {
+    const int col = t * 16 + r16;
+    wr[t] = reinterpret_cast<const short*>(col < N ? wa + static_cast<size_t>(col) * K : wb + static_cast<size_t>(col - N) * K);
   }
+  const int kq = K / kNarrowWaves, k0 = wave * kq;
+  v8f acc[kNarrowTiles] = {};
+#pragma unroll 2
+  for (int k = k0; k < k0 + kq; k += 16) {
+    v16s a = narrow_a(xr + k);
+    if (!rowok) a = v16s{};
 #pragma unroll
-  for (int r = 0; r < kNarrowRows; ++r) {
-    const int row = r0 + grp * kNarrowRows + r;
-    if (row < M) {
-      if (col < N) ya[static_cast<size_t>(row) * N + col] = acc[r];
-      else yb[static_cast<size_t>(row) * N + col - N] = acc[r];
+    for (int t = 0; t < kNarrowTiles; ++t) {
+      v16s b;
+      if constexpr (kAligned) b = *reinterpret_cast<const v16s*>(wr[t] + k);
+      else __builtin_memcpy(&b, wr[t] + k, sizeof b);
+      acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[t]);
     }
   }
+  // acc[t][r]: row r0 + 2 r + half, column 16 t + r16.
+  if (wave > 0)
+#pragma unroll
+    for (int t = 0; t < kNarrowTiles; ++t)
+#pragma unroll
+      for (int r = 0; r < 8; ++r) red[wave - 1][2 * r + half][16 * t + r16] = acc[t][r];
+  __syncthreads();
+  if (wave > 0) return;
+#pragma unroll
+  for (int t = 0; t < kNarrowTiles; ++t)
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      const int rr = 2 * r + half, out = r0 + rr, col = 16 * t + r16;
+      float v = acc[t][r];
+#pragma unroll
+      for (int w = 0; w < kNarrowWaves - 1; ++w) v += red[w][rr][col];
+      if (out < M) {
+        if (col < N) ya[static_cast<size_t>(out) * N + col] = v;
+        else yb[static_cast<size_t>(out) * N + col - N] = v;
+      }
+    }
 }
 
 template <typename InT>
 void launch_narrow(const char* what, const InT* x, int M, const gpu::bf16* wa, const gpu::bf16* wb, float* ya,
                    float* yb, int N, int K, gpu::Stream s) {
-  if (2 * N != 96 || K % 16 != 0) throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 16 == 0");
-  const bool rows = (reinterpret_cast<uintptr_t>(wa) % 16 == 0) &&
-                    (reinterpret_cast<uintptr_t>(wb) % 16 == 0);
+  if (2 * N != 16 * kNarrowTiles || K % (16 * kNarrowWaves) != 0)
+    throw std::runtime_error("narrow_bf16: built for two 48-row matrices, K % 64 == 0");
+  const bool aligned = (reinterpret_cast<uintptr_t>(wa) % 16 == 0) && (reinterpret_cast<uintptr_t>(wb) % 16 == 0);
   for (int r0 = 0; r0 < M; r0 += kSlabRows) {
     const int m = std::min(kSlabRows, M - r0);
     const InT* xs = x + static_cast<size_t>(r0) * K;
     float *a = ya + static_cast<size_t>(r0) * N, *b = yb + static_cast<size_t>(r0) * N;
-    if (rows)
-      launch_kernel(what, narrow_bf16_rows_kernel<InT>, dim3((m + 2 * kNarrowRows - 1) / (2 * kNarrowRows)), dim3(192),
-                    0, s, xs, m, wa, wb, a, b, N, K);
-    else
-      launch_kernel(what, narrow_bf16_kernel<InT>, dim3(m), dim3(96), 0, s, xs, m, wa, wb, a, b, N, K);
+    const dim3 grid((m + 15) / 16), block(kNarrowWaves * 32);
+    if (aligned) launch_kernel(what, narrow_bf16_kernel<InT, true>, grid, block, 0, s, xs, m, wa, wb, a, b, N, K);
+    else launch_kernel(what, narrow_bf16_kernel<InT, false>, grid, block, 0, s, xs, m, wa, wb, a, b, N, K);
   }
 }
 
