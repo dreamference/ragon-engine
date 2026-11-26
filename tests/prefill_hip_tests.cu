@@ -699,11 +699,21 @@ bool test_gdn_recurrent_prefill() {
   K::gdn_recurrent_prefill(dm, dg, db, s_pre, o_pre, at, H, HV, 0, nullptr);
   bool ok = true;
 #ifdef RAGON_BACKEND_HIP
-  // The hip form is the decode recurrence token by token: bit for bit.
-  const bool eq = same_dev(o_ref, o_one, O) && same_dev(s_ref, s_one, SS);
-  std::printf("gdn_recurrent_prefill (%d tokens, %d-token launches) identical to gdn_recurrent: %s\n", M, 1024,
-              eq ? "yes ok" : "NO FAIL");
-  ok &= eq;
+  {
+    // The hip form holds the state k-major and sums in another order than the decode recurrence: it agrees to
+    // rounding, the output and the final state.
+    const std::vector<float> a = download(o_ref, O), b = download(o_one, O);
+    double worst = 0;
+    for (size_t i = 0; i < O; ++i) worst = std::max(worst, std::fabs(double(a[i]) - b[i]) / (1e-3 + std::fabs(a[i])));
+    const std::vector<float> sa = download(s_ref, SS), sb = download(s_one, SS);
+    double sworst = 0;
+    for (size_t i = 0; i < SS; ++i)
+      sworst = std::max(sworst, std::fabs(double(sa[i]) - sb[i]) / (1e-3 + std::fabs(sa[i])));
+    const bool eq = worst < 2e-2 && sworst < 2e-2;
+    std::printf("gdn_recurrent_prefill vs gdn_recurrent: worst rel %.3g, state %.3g: %s\n", worst, sworst,
+                eq ? "ok" : "FAIL");
+    ok &= eq;
+  }
 #else
   {
     const std::vector<float> a = download(o_ref, O), b = download(o_one, O);
@@ -924,6 +934,24 @@ void time_prefill() {
                 flop / (ms * 1e9), err ? " error " : "", err ? err : "");
     for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xq), static_cast<void*>(xs),
                     static_cast<void*>(y), static_cast<void*>(y2), static_cast<void*>(q), static_cast<void*>(sf)})
+      ragon::test::free_bytes(p);
+  }
+  {  // the DeltaNet recurrence over the slab, BF16 in and out as the engine runs it (16 key, 48 value heads)
+    const int H = 16, HV = 48;
+    const GdnIn in = gdn_inputs(M, H, HV, 5);
+    gpu::bf16* dm = upload_bf16(in.mixed);
+    float *dg = upload(in.g), *db = upload(in.beta), *st = upload(in.state);
+    auto* o = ragon::test::alloc<gpu::bf16>(size_t(M) * HV * 128);
+    auto run = [&] { K::gdn_recurrent_prefill_bf16(dm, dg, db, st, o, M, H, HV, 0, nullptr, nullptr, 0); };
+    run();
+    ragon::test::Timer t;
+    t.start();
+    for (int i = 0; i < 5; ++i) run();
+    const float ms = t.stop() / 5;
+    const char* err = ragon::test::sync_error();
+    std::printf("bench gdn_recurrent M=%d HV=%d: %.3f ms%s%s\n", M, HV, ms, err ? " error " : "", err ? err : "");
+    for (void* p : {static_cast<void*>(dm), static_cast<void*>(dg), static_cast<void*>(db), static_cast<void*>(st),
+                    static_cast<void*>(o)})
       ragon::test::free_bytes(p);
   }
 }

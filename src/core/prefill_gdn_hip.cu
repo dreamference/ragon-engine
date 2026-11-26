@@ -1,10 +1,11 @@
-// The GDN prefill kernels for the hip backend (W1, correctness first; prefill_gdn.cu is the cuda form).
+// The GDN prefill kernels for the hip backend (prefill_gdn.cu is the cuda form).
 //
 // The conv is prefill_gdn.cu's, unchanged but for the launch. The recurrence is the token-sequential delta
-// rule of kernels.cu (gdn_recurrent_rows: the same per-token arithmetic, one 32-lane wave per 32 value
-// columns of a head), not the cuda form's 32-token chunks on mma.sync tensor cores: it has no chunked form, so
-// its result never depends on how a prompt is split (a stronger invariance than the chunk-end one cuda keeps),
-// and over FP32 inputs it is gdn_recurrent bit for bit. Against the cuda chunked form it agrees to tolerance.
+// rule of kernels.cu (gdn_recurrent_rows: the same per-token updates, one 32-lane wave per 32 value columns of a
+// head), not the cuda form's 32-token chunks on mma.sync tensor cores: it has no chunked form, so its result never
+// depends on how a prompt is split (a stronger invariance than the chunk-end one cuda keeps). The state is held
+// k-major (see gdn_prefill_kernel), so its sums run in another order than gdn_recurrent's: the two agree to
+// rounding, not bit for bit, as the cuda chunked form does.
 // A launch takes at most kSlab tokens and carries the state through global memory (FP32, exact), so no single
 // kernel runs long whatever the prompt length (the Windows display-timeout limit).
 #include "core/kernels.cuh"
@@ -60,30 +61,71 @@ __global__ void conv_window_kernel(const InT* __restrict__ in, const float* stat
   for (int j = 0; j < 3; ++j) out[c * 3 + j] = s[j];
 }
 
-// Tokens 0 .. M - 1 of a slab (the pointers already at its first token), the state read from and written back
-// to `state` (and also to `state_copy` when given). The loop body is gdn_recurrent_rows over InT/OutT.
+// The k-major form: lane l of the wave holds rows 4 l .. 4 l + 3 of the state for the wave's 32 value columns, so a
+// lane's own q / k elements (its load4) are all it reads of them. The column sums kv and o are its four products
+// added, then a reduce-scatter across the 32 lanes (lane c ends with column c); d goes back to every lane through LDS
+// (8 broadcast reads per token instead of the v-major form's 96). The sums are in a different order from
+// gdn_recurrent's, so agreement is to rounding, not bit for bit. Measured 2026-11-26 on gfx1151 (2048 tokens, 48
+// heads): 3.9 ms the v-major form, 2.9 ms this one over __shfl_xor (ds_bpermute), 2.3 ms with the lane exchange below.
+//
+// x from lane ^ W without LDS: DPP row_xmask within a row of 16 lanes, permlanex16 across the two rows (wave32).
+template <int W>
+__device__ __forceinline__ float xor_lane(float x) {
+  const int i = __float_as_int(x);
+  if constexpr (W == 16)
+    return __int_as_float(__builtin_amdgcn_permlanex16(i, i, 0x76543210u, 0xfedcba98u, false, false));
+  else
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, i, 0x160 | W, 0xf, 0xf, false));
+}
+
+template <int W>
+__device__ __forceinline__ float xor_sum(float x) {
+  x += xor_lane<W>(x);
+  if constexpr (W > 1) x = xor_sum<W / 2>(x);
+  return x;
+}
+
+template <int W>
+__device__ __forceinline__ void reduce_scatter_step(float (&p)[32], int lane) {
+  const bool hi = lane & W;
+#pragma unroll
+  for (int i = 0; i < W; ++i) {
+    const float keep = hi ? p[W + i] : p[i], send = hi ? p[i] : p[W + i];
+    p[i] = keep + xor_lane<W>(send);
+  }
+  if constexpr (W > 1) reduce_scatter_step<W / 2>(p, lane);
+}
+
+__device__ __forceinline__ float reduce_scatter32(float (&p)[32], int lane) {
+  reduce_scatter_step<16>(p, lane);
+  return p[0];
+}
+
 template <typename InT, typename OutT>
 __global__ void __launch_bounds__(32)
-    gdn_prefill_seq_kernel(const InT* __restrict__ mixed, const float* __restrict__ g, const float* __restrict__ beta,
-                           float* state, float* state_copy, OutT* __restrict__ out, int M, int H, int HV) {
-  __shared__ float qs[kGdnDk], ks[kGdnDk];
-  const int hv = blockIdx.x / 4, part = blockIdx.x % 4, lane = threadIdx.x, v = part * 32 + lane;
+    gdn_prefill_kernel(const InT* __restrict__ mixed, const float* __restrict__ g, const float* __restrict__ beta,
+                          float* state, float* state_copy, OutT* __restrict__ out, int M, int H, int HV) {
+  __shared__ __align__(16) float ds[32];
+  const int hv = blockIdx.x / 4, part = blockIdx.x % 4, lane = threadIdx.x, v0 = part * 32;
   float* st = state + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
-  float S[kGdnDk];
+  float S[4][32];
 #pragma unroll
-  for (int k = 0; k < kGdnDk; ++k) S[k] = st[k * kGdnDv + v];
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int c = 0; c < 32; c += 4) {
+      const float4 x = *reinterpret_cast<const float4*>(st + (4 * lane + j) * kGdnDv + v0 + c);
+      S[j][c] = x.x, S[j][c + 1] = x.y, S[j][c + 2] = x.z, S[j][c + 3] = x.w;
+    }
   const int h = hv / (HV / H);
   const int C = 2 * H * kGdnDk + HV * kGdnDv;
   const float scale = rsqrtf(static_cast<float>(kGdnDk));
-  // Token t + 1's inputs are loaded while token t computes: the one wave of a block has nothing else to hide the
-  // global latency behind, and a token's loads do not depend on the state. Data movement only.
   float4 q4n{}, k4n{};
   float gn = 0.f, bn = 0.f, vn = 0.f;
   auto fetch = [&](int t) {
     const InT* row = mixed + static_cast<size_t>(t) * C;
     q4n = elem::load4(row + h * kGdnDk, lane);
     k4n = elem::load4(row + H * kGdnDk + h * kGdnDk, lane);
-    vn = elem::load(row + 2 * H * kGdnDk + hv * kGdnDv + v);
+    vn = elem::load(row + 2 * H * kGdnDk + hv * kGdnDv + v0 + lane);
     gn = g[t * HV + hv];
     bn = beta[t * HV + hv];
   };
@@ -94,41 +136,44 @@ __global__ void __launch_bounds__(32)
     if (t + 1 < M) fetch(t + 1);
     float qn = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
     float kn = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      qn += __shfl_xor_sync(gpu::kWarpMask, qn, o);
-      kn += __shfl_xor_sync(gpu::kWarpMask, kn, o);
-    }
+    qn = xor_sum<16>(qn), kn = xor_sum<16>(kn);
     const float qr = rsqrtf(qn + 1e-6f) * scale, kr = rsqrtf(kn + 1e-6f);
-    __syncwarp();
-    qs[lane * 4] = q4.x * qr, qs[lane * 4 + 1] = q4.y * qr, qs[lane * 4 + 2] = q4.z * qr, qs[lane * 4 + 3] = q4.w * qr;
-    ks[lane * 4] = k4.x * kr, ks[lane * 4 + 1] = k4.y * kr, ks[lane * 4 + 2] = k4.z * kr, ks[lane * 4 + 3] = k4.w * kr;
-    __syncwarp();
+    const float kk[4] = {k4.x * kr, k4.y * kr, k4.z * kr, k4.w * kr};
+    const float qq[4] = {q4.x * qr, q4.y * qr, q4.z * qr, q4.w * qr};
     const float decay = __expf(gt);
-    float kv = 0.f;
+    float p[32];
 #pragma unroll
-    for (int k = 0; k < kGdnDk; ++k) {
-      S[k] *= decay;
-      kv = fmaf(S[k], ks[k], kv);
+    for (int c = 0; c < 32; ++c) {
+      S[0][c] *= decay, S[1][c] *= decay, S[2][c] *= decay, S[3][c] *= decay;
+      p[c] = fmaf(S[3][c], kk[3], fmaf(S[2][c], kk[2], fmaf(S[1][c], kk[1], S[0][c] * kk[0])));
     }
-    const float d = (vv - kv) * b;
-    // ks again from LDS, not kept in registers from the loop above: S (128) and ks (128) together overflow the 256
-    // VGPRs and spill to scratch inside the token loop. A compiler fence only; the same arithmetic.
-    asm volatile("" ::: "memory");
-    float o = 0.f;
+    const float d = (vv - reduce_scatter32(p, lane)) * b;
+    __syncwarp();
+    ds[lane] = d;
+    __syncwarp();
 #pragma unroll
-    for (int k = 0; k < kGdnDk; ++k) {
-      S[k] = fmaf(d, ks[k], S[k]);
-      o = fmaf(S[k], qs[k], o);
+    for (int c = 0; c < 32; c += 4) {
+      const float4 d4 = *reinterpret_cast<const float4*>(ds + c);
+      const float dc[4] = {d4.x, d4.y, d4.z, d4.w};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) S[j][c + e] = fmaf(dc[e], kk[j], S[j][c + e]);
+        p[c + e] = fmaf(S[3][c + e], qq[3], fmaf(S[2][c + e], qq[2], fmaf(S[1][c + e], qq[1], S[0][c + e] * qq[0])));
+      }
     }
-    elem::store(out + static_cast<size_t>(t) * HV * kGdnDv + hv * kGdnDv + v, o);
+    elem::store(out + static_cast<size_t>(t) * HV * kGdnDv + hv * kGdnDv + v0 + lane, reduce_scatter32(p, lane));
   }
 #pragma unroll
-  for (int k = 0; k < kGdnDk; ++k) st[k * kGdnDv + v] = S[k];
-  if (state_copy == nullptr) return;
-  float* sc = state_copy + static_cast<size_t>(hv) * kGdnDk * kGdnDv;
+  for (int j = 0; j < 4; ++j)
 #pragma unroll
-  for (int k = 0; k < kGdnDk; ++k) sc[k * kGdnDv + v] = S[k];
+    for (int c = 0; c < 32; c += 4) {
+      const float4 x = make_float4(S[j][c], S[j][c + 1], S[j][c + 2], S[j][c + 3]);
+      *reinterpret_cast<float4*>(st + (4 * lane + j) * kGdnDv + v0 + c) = x;
+      if (state_copy)
+        *reinterpret_cast<float4*>(state_copy + static_cast<size_t>(hv) * kGdnDk * kGdnDv + (4 * lane + j) * kGdnDv +
+                                   v0 + c) = x;
+    }
 }
 
 template <typename InT, typename OutT>
@@ -151,11 +196,11 @@ void seq_range(const InT* mixed, const float* g, const float* beta, float* state
                int HV, float* copy_at_end, gpu::Stream s) {
   const size_t C = 2 * static_cast<size_t>(H) * kGdnDk + static_cast<size_t>(HV) * kGdnDv;
   if (t0 == t1 && copy_at_end)  // an empty range: the state copied as it stands
-    launch_kernel("gdn_recurrent_prefill", gdn_prefill_seq_kernel<InT, OutT>, dim3(HV * 4), dim3(32), 0, s, mixed, g,
+    launch_kernel("gdn_recurrent_prefill", gdn_prefill_kernel<InT, OutT>, dim3(HV * 4), dim3(32), 0, s, mixed, g,
                   beta, state, copy_at_end, out, 0, H, HV);
   for (int t = t0; t < t1; t += kSlab) {
     const int n = std::min(kSlab, t1 - t);
-    launch_kernel("gdn_recurrent_prefill", gdn_prefill_seq_kernel<InT, OutT>, dim3(HV * 4), dim3(32), 0, s,
+    launch_kernel("gdn_recurrent_prefill", gdn_prefill_kernel<InT, OutT>, dim3(HV * 4), dim3(32), 0, s,
                   mixed + static_cast<size_t>(t) * C, g + static_cast<size_t>(t) * HV,
                   beta + static_cast<size_t>(t) * HV, state, t + n == t1 ? copy_at_end : nullptr,
                   out + static_cast<size_t>(t) * HV * kGdnDv, n, H, HV);
