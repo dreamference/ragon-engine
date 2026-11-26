@@ -44,7 +44,7 @@ constexpr int kTileK = 64;           // K per weight tile
 constexpr int kKC = 256;             // K per LDS chunk
 constexpr int kXSt = kKC + 16;       // LDS row stride (halves)
 constexpr int kBR = 64;              // rows per block (four 16-row WMMA groups)
-constexpr int kWaves = 8;            // waves per block (16 in the NVFP4 plain GEMM, see waves_of)
+constexpr int kWaves = 8;            // waves per block (16 in the NVFP4 GEMMs, see waves_of)
 constexpr int kSlabRows = 2048;      // rows per launch (TDR)
 
 // ---- Conversions ----
@@ -327,10 +327,10 @@ __device__ __forceinline__ void mma_tile(const hf* XS, u32 r16, int kk, const v1
 template <int W>
 constexpr int kStageItems = kBR * (kKC / 32) / (W * 32);
 
-// Waves per block: the NVFP4 plain GEMM (the down projection's shape) gains from 16 (activation staging per output
-// halved); SwiGLU and FP8 lose with it.
+// Waves per block: both NVFP4 GEMMs (the down projection and the SwiGLU gate/up) gain from 16, as activation staging
+// per output is halved (SwiGLU gate/up -3 % at 2048 rows, measured 2026-11-26); the FP8 GEMM loses with it.
 template <bool FP4, int MODE>
-constexpr int waves_of() { return FP4 && MODE == kPlain ? 16 : kWaves; }
+constexpr int waves_of() { return FP4 ? 16 : kWaves; }
 
 template <bool FP4, int W>
 __device__ __forceinline__ void stage_load(const GemmArgs& p, int m0, int k0, int kc, u32 tid,
