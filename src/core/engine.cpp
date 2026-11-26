@@ -1748,9 +1748,17 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
     // The prefill path quantizes the norm's output for the projections that follow; the DeltaNet's a and b
     // projections (BF16) also read it in FP32.
     // (FP32 too wherever the projections' input scales differ, so the others can quantize it themselves.)
+    // When in_qkv and in_z share the quantization, a and b are the only readers of the FP32 norm, and narrow_bf16
+    // rounds it to BF16 first: the norm then goes out in BF16 (into xn_'s storage), which narrow_bf16_bf16in reads
+    // to the same bytes for half the traffic.
+    const bool xn_b16 = !L.full && !bf16_gdn && !pre_normed && quantized_ && !lora_on && !L.in_qkv.fp4 &&
+                        !L.in_z.fp4 && L.in_z.in_scale == L.in_qkv.in_scale;
     const bool xn_half =
         pre_normed ? true
         : bf16_gdn ? false
+        : xn_b16   ? (kernels::rmsnorm_quant_bf16(h_, L.input_norm, xn_bf16_, M, H, c.eps, false, L.in_qkv.in_scale,
+                                                  xq_, xsf_, stream_),
+                      set_xq(L.in_qkv.in_scale, false), true)
         : L.full   ? norm_rows(h_, L.input_norm, xn_, M, L.q.in_scale, L.q.fp4,
                                lora_on || L.k.in_scale != L.q.in_scale || L.v.in_scale != L.q.in_scale)
                    : norm_rows(h_, L.input_norm, xn_, M, L.in_qkv.in_scale, L.in_qkv.fp4, true);
@@ -2064,7 +2072,8 @@ void Engine::forward_rows(const int* ids, int M, Pass pass, int keep_at, std::sp
         kernels::l2_prefetch_weights(L.out.w, L.out.fp4, L.out.table != nullptr, L.out.N, L.out.K, hint_gdn,
                                      stream_);
       if (quantized_) {  // tensor cores, row-invariant for any M
-        kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
+        if (xn_b16) kernels::narrow_bf16_bf16in(xn_bf16_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
+        else kernels::narrow_bf16(xn_, M, L.in_a.w, L.in_b.w, a_, b_, L.in_a.N, L.in_a.K, stream_);
       } else if (L.in_a.N == L.in_b.N) {  // both in one launch
         kernels::bf16_rows(xn_, M, L.in_a.w, a_, L.in_a.N, L.in_a.K, stream_, L.in_b.w, b_);
       } else {
