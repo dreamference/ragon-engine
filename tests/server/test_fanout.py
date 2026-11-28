@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from conftest import stream_chat_parts
-from test_regressions import NO_THINK, code_text, greedy_chat
+from test_regressions import NO_THINK, code_text, evict, greedy_chat, resident_sessions
 
 
 def question(tag, lines=40):
@@ -144,3 +144,56 @@ def test_many_forks_with_their_own_questions_answer_as_alone(server):
     for t in threads:
         t.join()
     assert together == alone
+
+
+def metric(server, name):
+    """A counter or gauge from /metrics, None when the server does not export it."""
+    status, text = server.request("/metrics")
+    for line in text.splitlines() if status == 200 else []:
+        if line.startswith(name + " ") or line.startswith(name + "{"):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+def test_other_threads_that_share_a_session_prefix_fork_it(server):
+    """TRUE_FORK, fork admission: requests of other threads (the thread-id header, as Codex sends it) that extend an
+    idle session's prompt start as forks of that session, at once and side by side: none re-reads the prefix, none
+    moves the session on under the others, the session's own thread still continues it, and each answers as alone."""
+    status, models = server.request("/v1/models")
+    if "session-fork" not in (models["data"][0].get("features") or []):
+        pytest.skip("the server has no fork admission (no 'session-fork' feature in /v1/models)")
+    sessions = resident_sessions(server)
+    if sessions < 3:
+        pytest.skip(f"{sessions} sessions: forks need slots beside their parent's")
+    k = min(4, sessions - 1)
+    ids = LONG_IDS[:12000]
+    branches = [ids + [7200 + 5 * i, 7201 + 5 * i, 7202 + 5 * i] for i in range(k)]
+    alone = []
+    for b in branches:
+        evict(server)
+        alone.append(completion(server, b, 16)["choices"][0]["text"])
+    evict(server)
+    parent = server.post("/v1/completions", {"prompt": ids, "max_tokens": 8, "temperature": 0},
+                         headers={"thread-id": "fork-parent"})
+    assert parent["choices"][0]["finish_reason"]
+    before = metric(server, "ragon:session_forks_total")
+    assert before is not None, "no ragon:session_forks_total in /metrics"
+    out = [None] * k
+
+    def one(i):
+        out[i] = server.post("/v1/completions", {"prompt": branches[i], "max_tokens": 16, "temperature": 0},
+                             headers={"thread-id": f"fork-branch-{i}"})
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(k)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert metric(server, "ragon:session_forks_total") - before >= k, "a branch did not start as a fork"
+    for i in range(k):
+        assert out[i]["usage"]["prompt_tokens_details"]["cached_tokens"] >= len(ids), f"branch {i} re-read the prefix"
+    assert [o["choices"][0]["text"] for o in out] == alone
+    # The parent's thread continues its session, which no branch moved on.
+    again = server.post("/v1/completions", {"prompt": ids + [7300, 7301], "max_tokens": 4, "temperature": 0},
+                        headers={"thread-id": "fork-parent"})
+    assert again["usage"]["prompt_tokens_details"]["cached_tokens"] >= len(ids)

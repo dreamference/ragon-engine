@@ -24,11 +24,11 @@ class Server:
         self.model = None
         self.max_model_len = 0
 
-    def request(self, path, body=None, method=None):
+    def request(self, path, body=None, method=None, headers=None):
         """Returns (status, parsed JSON or text). HTTP errors are returned, not raised."""
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, method=method,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 status, raw = r.status, r.read()
@@ -40,8 +40,8 @@ class Server:
         except ValueError:
             return status, text
 
-    def post(self, path, body):
-        status, out = self.request(path, body)
+    def post(self, path, body, headers=None):
+        status, out = self.request(path, body, headers=headers)
         assert status == 200, f"{path} answered {status}: {out}"
         return out
 

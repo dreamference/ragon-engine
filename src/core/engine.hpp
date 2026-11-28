@@ -382,6 +382,9 @@ class Engine {
   int drafters() const { return static_cast<int>(drafters_.size()); }
   const std::string& drafter_id(int i) const { return drafter_ids_.at(i); }
   int session_drafter(int i) const { return sessions_.at(i).drafter; }
+  // Session i's key (empty: bound without one) and the length of its history (its prompt and what it generated).
+  const std::string& session_key(int i) const { return sessions_.at(i).key; }
+  int session_history(int i) const { return static_cast<int>(sessions_.at(i).history.size()); }
   bool can_speculate(const SamplingParams& p) const;
   // `row_logits`, when given, receives the raw logits each returned token was chosen from: one row of
   // config().vocab floats per returned token, in the same order (the verify's rows, which the
@@ -495,6 +498,12 @@ class Engine {
   // Share scopes (P4c, X-Ragon-Share-Scope): only a session of the request's scope is bound or reused from (0 is the
   // unscoped requests' scope, separate from every other).
   int match_session(const std::vector<int>& prompt, const std::string& key, uint64_t scope = 0) const;
+  // TRUE_FORK, fork admission: the idle session a new request could fork (fork_session) instead of re-reading the
+  // prefix, or -1. Among the resident sessions of the request's scope and drafter that are not busy and that the
+  // prompt extends (as match_session binds them), the one with the longest common prefix; never the request's own
+  // thread (a session bound with the request's non-empty key), which it continues instead.
+  int fork_source(const std::vector<int>& prompt, const std::string& key, uint64_t scope, int drafter,
+                  const std::vector<bool>& busy) const;
   // A slot for a new session: one never used, else the least recently used one that is neither in `pinned`
   // nor protected; -1 when there is none (the request waits). Protected: a session bound with a key (an
   // agent's thread) whose last request ran less than protect_seconds ago (M4 §7 question 6). The policy is

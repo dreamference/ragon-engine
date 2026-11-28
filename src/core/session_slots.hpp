@@ -54,4 +54,63 @@ inline int new_session_slot(const std::vector<SlotState>& slots, double protect_
   return s;
 }
 
+// TRUE_FORK, fork admission: which queued requests fork an idle resident session into a slot of their own
+// (Engine::fork_session, then a prefill of their own suffix only, which is what continuing the session in place
+// computes) instead of moving that session on. Without it the first of k branches of one context continues the
+// session that holds the context, the others wait for it and then find only checkpoints: they re-read the context
+// (39 s per branch at 100K, eng-fork-vs-sglang-1). Only where a request runs changes, never what it computes.
+//
+// For each source session f: the request that continues f in place is the thread f is bound with (its owner) when it
+// is queued, else the last queued request that continues f and is not another thread's; every other request whose
+// source is f forks it. A request bound with another thread's key always forks (the owner's next turn, or its next
+// branch, comes back to f). The continuer of f, and every other request that would continue f in place, yields while
+// a fork of f waits (so f is not moved on before its branches start), for at most kForkYieldSeconds of that fork's
+// wait. With a single slot nothing forks.
+constexpr double kForkYieldSeconds = 30;
+
+enum class ForkAdmit { kPlain, kFork, kYield };
+
+// One queued request as the policy sees it.
+struct ForkQuery {
+  int source = -1;         // the idle session it could fork (Engine::fork_source), -1 none
+  int continues = -1;      // the session it continues in place (Engine::match_session), -1 a new session
+  bool owner = false;      // it is the thread `continues` is bound with (both keyed with the same key)
+  bool other_key = false;  // it and `source` are bound with keys, different ones
+  double waited_s = 0;     // seconds it has been queued
+};
+
+inline std::vector<ForkAdmit> fork_admit(const std::vector<ForkQuery>& q, int sessions) {
+  const size_t n = q.size();
+  std::vector<ForkAdmit> out(n, ForkAdmit::kPlain);
+  if (sessions < 2) return out;
+  auto wants = [&](size_t k, int f) { return q[k].source == f || q[k].continues == f; };
+  for (size_t j = 0; j < n; ++j) {
+    const int f = q[j].source;
+    if (f < 0 || q[j].owner) continue;
+    if (q[j].other_key) {
+      out[j] = ForkAdmit::kFork;
+      continue;
+    }
+    // Not another thread's: it forks unless it is f's continuer (no owner queued, and the last such request).
+    bool continuer = true;
+    for (size_t k = 0; k < n && continuer; ++k) {
+      if (k == j) continue;
+      if (q[k].owner && q[k].continues == f) continuer = false;
+      if (k > j && wants(k, f) && !q[k].owner && !q[k].other_key) continuer = false;
+    }
+    if (!continuer) out[j] = ForkAdmit::kFork;
+  }
+  for (size_t j = 0; j < n; ++j) {
+    if (out[j] == ForkAdmit::kFork) continue;
+    const int f = q[j].continues >= 0 ? q[j].continues : q[j].source;
+    if (f < 0) continue;
+    for (size_t k = 0; k < n; ++k)
+      if (out[k] == ForkAdmit::kFork && q[k].source == f && q[k].waited_s < kForkYieldSeconds) {
+        out[j] = ForkAdmit::kYield;
+        break;
+      }
+  }
+  return out;
+}
+
 }  // namespace ragon

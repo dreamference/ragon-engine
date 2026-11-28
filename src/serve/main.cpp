@@ -175,6 +175,17 @@ namespace {
 using proxygen::HTTPMessage;
 using proxygen::ResponseBuilder;
 
+// TRUE_FORK: fork admission (Scheduler::pick, core/session_slots.hpp's fork_admit), the thread-id header as a
+// request's session key when its body names none, and /v1/models' "session-fork" feature. RAGON_FORK_ADMISSION=0
+// turns all three off (the scheduler as before, for A/B runs).
+bool fork_admission_on() {
+  static const bool on = [] {
+    const char* e = std::getenv("RAGON_FORK_ADMISSION");
+    return !e || *e != '0';
+  }();
+  return on;
+}
+
 // Prometheus counters under SGLang's names (the ones bench/replay/replay.py reads).
 struct Metrics {
   std::mutex mu;
@@ -211,6 +222,7 @@ struct Metrics {
   int sessions = 0, sessions_resident = 0;
   double session_evictions = 0, protect_seconds = 0;
   double session_protect_lifts = 0;  // new sessions that took a protected slot after waiting the window
+  double session_forks = 0;  // TRUE_FORK: new requests admitted as a fork of an idle session (fork admission)
   // P4b (--kv-pages): the KV page pool's pages and free pages, and the requests ended by its last resort.
   int kv_pages_total = 0, kv_pages_free = 0;
   double kv_pool_exhausted = 0, kv_evictions = 0;
@@ -286,6 +298,8 @@ struct Metrics {
     counter("ragon:session_evictions_total", session_evictions, "Resident sessions replaced by a new session.");
     counter("ragon:session_protect_lifts_total", session_protect_lifts,
             "New sessions that took a protected slot after waiting the protection window.");
+    counter("ragon:session_forks_total", session_forks,
+            "New requests admitted as a fork of an idle session that shares their prefix (no re-read of it).");
     counter("ragon:prefill_chunks_interleaved_total", prefill_chunks_interleaved,
             "Prefill chunks run between another request's decode steps.");
     counter("ragon:batched_steps_total", batched_steps,
@@ -401,6 +415,9 @@ struct Job {
   // BATCHING P4d, a request's other choices (`n`): each starts as a fork of this job's session when its prompt is done.
   std::vector<Job> forks;
   bool fork = false;
+  // TRUE_FORK, fork admission: the idle session this job's session starts as a fork of (Engine::fork_session) before
+  // its prefill, -1 none (pick() sets it at every admission).
+  int fork_from = -1;
   // Structured output: makes the request's matcher (each choice its own); empty when it asks for no constraint.
   std::function<std::shared_ptr<TokenConstraint>()> constraint;  // one of those: never continues a session (the identical prompt would wait for its parent)
 };
@@ -561,17 +578,41 @@ class Scheduler {
       if (match[j] >= 0) pinned[match[j]] = true;
     }
     const auto now = std::chrono::steady_clock::now();
+    // TRUE_FORK, fork admission (core/session_slots.hpp's fork_admit): a request that shares an idle session's prefix
+    // but is not that session's continuation starts as a fork of it in a slot of its own, so the session is not moved
+    // on under its other branches; its continuation waits for them a while. The fork's source is pinned like a match.
+    std::vector<ForkQuery> fq(queue_.size());
+    for (size_t j = 0; fork_admission_ && j < queue_.size(); ++j) {
+      const Job& q = queue_[j];
+      if (q.fork) continue;
+      const std::string& key = q.req.session_key;
+      ForkQuery& f = fq[j];
+      f.continues = match[j];
+      f.source = eng.fork_source(q.prompt, key, q.req.share_scope, q.req.drafter, busy);
+      f.owner = match[j] >= 0 && !key.empty() && eng.session_key(match[j]) == key;
+      f.other_key = f.source >= 0 && !key.empty() && !eng.session_key(f.source).empty();
+      f.waited_s = std::chrono::duration<double>(now - q.received).count();
+    }
+    const std::vector<ForkAdmit> admit =
+        fork_admission_ ? fork_admit(fq, eng.sessions()) : std::vector<ForkAdmit>(queue_.size(), ForkAdmit::kPlain);
+    for (size_t j = 0; j < queue_.size(); ++j)
+      if (admit[j] == ForkAdmit::kFork) pinned[fq[j].source] = true;
     std::vector<SlotState> slots;  // taken at the first new session's job
     for (size_t j = 0; j < queue_.size(); ++j) {
       bool lifted = false;
-      int s = match[j];
+      if (admit[j] == ForkAdmit::kYield) continue;  // its session's forks start first
+      const int from = admit[j] == ForkAdmit::kFork ? fq[j].source : -1;
+      int s = from >= 0 ? -1 : match[j];
       if (s >= 0 && busy[s]) continue;
       const bool fresh = s < 0;
       if (fresh) {
         if (slots.empty()) slots = eng.slot_states();
         std::vector<bool> ahead = busy;  // the running requests' sessions and those the jobs ahead of this one continue
-        for (size_t k = 0; k < j; ++k)
+        for (size_t k = 0; k < j; ++k) {
           if (match[k] >= 0) ahead[match[k]] = true;
+          if (admit[k] == ForkAdmit::kFork) ahead[fq[k].source] = true;
+        }
+        if (from >= 0) ahead[from] = true;  // never the slot it forks
         const double waited = std::chrono::duration<double>(now - queue_[j].received).count();
         s = new_session_slot(slots, protect_seconds_, waited, pinned, ahead, &lifted);
       }
@@ -579,7 +620,7 @@ class Scheduler {
       if (eng.kv_paged() && eng.kv_admit_pages(queue_[j].prompt.size()) <= eng.kv_pages_total()) {
         // (A prompt whose pages the whole pool could never hold is admitted to be answered at once: start().)
         bool evicted = false;
-        if (!kv_admit_room(s, queue_[j], &evicted)) {
+        if (!(from >= 0 ? kv_fork_room(s, from, queue_[j], &evicted) : kv_admit_room(s, queue_[j], &evicted))) {
           kv_wait_ = true;
           // An eviction emptied sessions the other jobs' matches above may name: look again from the start.
           if (evicted) return false;
@@ -597,6 +638,7 @@ class Scheduler {
       out = std::move(queue_[j]);
       out.session = s;
       out.fresh = fresh;
+      out.fork_from = from;
       out.lora_slot = lslot;
       out.lora_upload = upload;
       queue_.erase(queue_.begin() + j);
@@ -682,6 +724,7 @@ class Scheduler {
       r->drafter_changed =
           eng.activate_session(j.session, j.req.session_key, j.fresh, j.req.share_scope, j.lora_slot, j.req.drafter);
       try {
+        if (j.fork_from >= 0) fork_into(j);
         r->cur = eng.begin_prefill(j.prompt, false, j.images.empty() ? nullptr : &j.images);
       } catch (const KvPoolExhausted&) {
         // P4c: admission's count was short after all (begin_prefill changed nothing). While nothing runs nothing else
@@ -717,6 +760,20 @@ class Scheduler {
     ctx_.metrics.running = static_cast<int>(running_.size());
     ctx_.metrics.sessions_resident = eng.sessions_resident();
     ctx_.metrics.session_evictions = static_cast<double>(eng.session_evictions());
+  }
+
+  // TRUE_FORK, fork admission: the admitted job's session (active, fresh) becomes a fork of session j.fork_from, which
+  // pick() left idle; begin_prefill then reads only what its prompt adds. KvPoolExhausted with nothing changed when the
+  // pool is short (start() then makes room and prefills it plainly, or requeues it).
+  void fork_into(Job& j) {
+    Engine& eng = *ctx_.engine;
+    const int from = j.fork_from;
+    j.fork_from = -1;  // a retry after a short pool prefills plainly
+    eng.fork_session(from);
+    std::fprintf(stderr, "session %d: forked from session %d at %d tokens (a prompt of %zu)\n", j.session, from,
+                 eng.session_history(from), j.prompt.size());
+    std::lock_guard<std::mutex> m(ctx_.metrics.mu);
+    ctx_.metrics.session_forks += 1;
   }
 
   // BATCHING P4d: the request's other choices start now, each a fork of its session: no prefill, the prompt's logits
@@ -1259,6 +1316,17 @@ class Scheduler {
         },
         s, src, evicted);
   }
+  // Room for job j's admission in session s as a fork of session `from` (fork admission): the pages the fork takes
+  // (Engine::kv_fork_need) and those its prompt adds past the parent's history.
+  bool kv_fork_room(int s, int from, const Job& j, bool* evicted = nullptr) {
+    Engine& eng = *ctx_.engine;
+    Engine::KvSource src;
+    src.donor = from;
+    const int grow = std::max(0, eng.kv_admit_pages(j.prompt.size()) -
+                                     eng.kv_admit_pages(static_cast<size_t>(eng.session_history(from))));
+    return kv_make_room([&](const Engine::KvGone* gone, bool) { return eng.kv_fork_need(from, s, gone) + grow; }, s,
+                        src, evicted);
+  }
   // Whether r's next decode step has its KV pages (Engine::kv_step_need), making room as kv_make_room does.
   bool kv_room(Running& r) {
     Engine& eng = *ctx_.engine;
@@ -1718,6 +1786,7 @@ class Scheduler {
 
   ServerContext& ctx_;
   double protect_seconds_;
+  bool fork_admission_ = fork_admission_on();
   int batch_, contended_, side_share_;
   bool fair_pairing_;  // --fair-pairing: partners by fewest recent decode passes (serve/pairing.hpp)
   int fanout_plain_above_;  // --fanout-plain-above: fanout_plain(), 0 for never
@@ -1837,6 +1906,8 @@ class Handler : public proxygen::RequestHandler {
     method_ = headers->getMethodString();
     path_ = headers->getPath();
     share_scope_ = share_scope_of(headers->getHeaders().getSingleOrEmpty("X-Ragon-Share-Scope"));
+    // TRUE_FORK: a Codex client names its thread in this header (the gate drops prompt_cache_key from the body).
+    thread_key_ = fork_admission_on() ? headers->getHeaders().getSingleOrEmpty("thread-id") : std::string();
     authorization_ = headers->getHeaders().getSingleOrEmpty("Authorization");
     ex_->downstream = downstream_;
     ex_->evb = folly::EventBaseManager::get()->getEventBase();
@@ -1890,6 +1961,8 @@ class Handler : public proxygen::RequestHandler {
       json model = {{"id", ctx_.model_name}, {"object", "model"}, {"created", std::time(nullptr)},
                     {"owned_by", "ragon-engine"}, {"root", ctx_.model_name},
                     {"max_model_len", ctx_.engine->max_context()}};
+      // TRUE_FORK: requests that share an idle session's prefix start as a fork of it (no re-read of the prefix).
+      if (fork_admission_on()) model["features"] = json::array({"session-fork"});
       json data = json::array({model});
       if (ctx_.lora_lib) {  // each loaded adapter as base+name (LORA §4), after the base the launcher reads first
         std::lock_guard<std::mutex> l(ctx_.lora_mu);
@@ -2039,6 +2112,7 @@ class Handler : public proxygen::RequestHandler {
       json body = json::parse(text);
       job.req = parse_request(body, chat, ctx_.vision);
       job.req.share_scope = share_scope_;
+      if (job.req.session_key.empty()) job.req.session_key = thread_key_;
       job.lora = resolve_adapter(job.req);
       choose_drafter(job);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
@@ -2334,6 +2408,7 @@ class Handler : public proxygen::RequestHandler {
       if (auto buf = body_.move()) text = buf->moveToFbString().toStdString();
       job.req = parse_responses_request(json::parse(text), ctx_.vision);
       job.req.share_scope = share_scope_;
+      if (job.req.session_key.empty()) job.req.session_key = thread_key_;
       job.lora = resolve_adapter(job.req);
       choose_drafter(job);
       job.req.repetition = resolve_repetition(job.req, ctx_.repetition);
@@ -2481,6 +2556,7 @@ class Handler : public proxygen::RequestHandler {
   }
 
   uint64_t share_scope_ = 0;  // X-Ragon-Share-Scope (P4c, share_scope_of)
+  std::string thread_key_;    // the thread-id header (TRUE_FORK): the session key when the body names none
   std::string authorization_;  // the Authorization header (the adapter routes' key)
   folly::IOBufQueue body_{folly::IOBufQueue::cacheChainLength()};
   bool too_large_ = false;

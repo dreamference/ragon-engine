@@ -7,6 +7,10 @@
 
 namespace {
 
+using ragon::fork_admit;
+using ragon::ForkAdmit;
+using ragon::ForkQuery;
+using ragon::kForkYieldSeconds;
 using ragon::lru_slot;
 using ragon::new_session_slot;
 using ragon::protect_lift_due;
@@ -78,6 +82,44 @@ void lifting() {
   expect(new_session_slot(mixed, 30, 0, {}, {}, &lifted) == 1 && !lifted, "an expired protection needs no lift");
 }
 
+ForkQuery fq(int source, int continues, bool owner, bool other_key, double waited_s = 0) {
+  ForkQuery q;
+  q.source = source;
+  q.continues = continues;
+  q.owner = owner;
+  q.other_key = other_key;
+  q.waited_s = waited_s;
+  return q;
+}
+
+void fork_admission() {
+  using A = ForkAdmit;
+  // One slot: nothing to fork into, everything continues as before.
+  const std::vector<ForkQuery> two_keyless = {fq(0, 0, false, false), fq(0, 0, false, false)};
+  expect(fork_admit(two_keyless, 1) == std::vector<A>{A::kPlain, A::kPlain}, "one session: no fork admission");
+  // Keyless siblings of session 0: the earlier ones fork, the last continues and waits for them.
+  expect(fork_admit(two_keyless, 4) == std::vector<A>{A::kFork, A::kYield}, "keyless siblings: the last continues");
+  const std::vector<ForkQuery> four = {fq(0, 0, false, false), fq(0, 0, false, false), fq(0, 0, false, false),
+                                       fq(0, 0, false, false)};
+  expect(fork_admit(four, 4) == std::vector<A>{A::kFork, A::kFork, A::kFork, A::kYield}, "four siblings: three fork");
+  // A lone keyless continuation stays plain: nothing queued forks its session.
+  expect(fork_admit({fq(0, 0, false, false)}, 4) == std::vector<A>{A::kPlain}, "a lone continuation is plain");
+  // Another thread's request that shares the prefix forks at once, even alone.
+  expect(fork_admit({fq(2, -1, false, true)}, 4) == std::vector<A>{A::kFork}, "another key forks");
+  // The owner is queued: every keyless sibling forks and the owner yields to them.
+  const std::vector<ForkQuery> owned = {fq(0, 0, false, false), fq(0, 0, false, false), fq(-1, 0, true, false)};
+  expect(fork_admit(owned, 4) == std::vector<A>{A::kFork, A::kFork, A::kYield}, "a queued owner: all siblings fork");
+  // The yield ends once the forks have waited the window.
+  const std::vector<ForkQuery> stale = {fq(0, 0, false, false, kForkYieldSeconds), fq(-1, 0, true, false)};
+  expect(fork_admit(stale, 4) == std::vector<A>{A::kFork, A::kPlain}, "the yield expires after the window");
+  // An owner with nothing forking its session, and a request for another session, stay plain.
+  const std::vector<ForkQuery> other = {fq(-1, 0, true, false), fq(1, 1, false, false)};
+  expect(fork_admit(other, 4) == std::vector<A>{A::kPlain, A::kPlain}, "unrelated requests stay plain");
+  // A fork of session 0 does not make a continuation of session 1 yield.
+  const std::vector<ForkQuery> mixed = {fq(0, -1, false, true), fq(-1, 1, true, false)};
+  expect(fork_admit(mixed, 4) == std::vector<A>{A::kFork, A::kPlain}, "only the forked session's continuer yields");
+}
+
 }  // namespace
 
 int main() {
@@ -85,6 +127,7 @@ int main() {
   least_recently_used();
   protection();
   lifting();
+  fork_admission();
   if (failures == 0) std::printf("session slot tests: all passed\n");
   return failures == 0 ? 0 : 1;
 }

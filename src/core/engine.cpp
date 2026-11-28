@@ -766,6 +766,26 @@ int Engine::match_session(const std::vector<int>& prompt, const std::string& key
   return -1;
 }
 
+int Engine::fork_source(const std::vector<int>& prompt, const std::string& key, uint64_t scope, int drafter,
+                        const std::vector<bool>& busy) const {
+  int best = -1, best_lcp = 0;
+  for (size_t i = 0; i < sessions_.size(); ++i) {
+    const Session& s = sessions_[i];
+    if (!s.owned || s.history.empty() || s.prompt_len == 0 || s.scope != scope || s.drafter != drafter) continue;
+    if (i < busy.size() && busy[i]) continue;
+    if (!key.empty() && s.key == key) continue;  // its own thread: continued, not forked
+    const size_t n = std::min(s.history.size(), prompt.size());
+    size_t lcp = 0;
+    while (lcp < n && s.history[lcp] == prompt[lcp]) ++lcp;
+    if (static_cast<int>(lcp) < s.turn_start || lcp == 0) continue;
+    if (static_cast<int>(lcp) > best_lcp) {
+      best = static_cast<int>(i);
+      best_lcp = static_cast<int>(lcp);
+    }
+  }
+  return best;
+}
+
 int Engine::free_session(double protect_seconds, const std::vector<bool>& pinned) const {
   return lru_slot(slot_states(), protect_seconds, pinned);
 }
